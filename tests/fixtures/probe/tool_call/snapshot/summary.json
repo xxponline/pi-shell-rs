@@ -1,0 +1,79 @@
+{
+  "counts": {
+    "agent_end": 1,
+    "agent_settled": 1,
+    "agent_start": 1,
+    "extension_ui_request.notify": 1,
+    "message_end": 5,
+    "message_start": 5,
+    "message_update.text_delta": 23,
+    "message_update.text_end": 1,
+    "message_update.text_start": 1,
+    "message_update.thinking_delta": 36,
+    "message_update.thinking_end": 2,
+    "message_update.thinking_start": 2,
+    "message_update.toolcall_delta": 26,
+    "message_update.toolcall_end": 1,
+    "message_update.toolcall_start": 1,
+    "response.get_state": 1,
+    "response.prompt": 1,
+    "tool_execution_end": 1,
+    "tool_execution_start": 1,
+    "turn_end": 2,
+    "turn_start": 2
+  },
+  "failure": null,
+  "ok": true,
+  "recordCount": 117,
+  "steps": [
+    {
+      "detail": "response ok",
+      "ok": true,
+      "step": 0
+    },
+    {
+      "detail": "response ok",
+      "ok": true,
+      "step": 1
+    },
+    {
+      "detail": "saw tool_execution_end",
+      "ok": true,
+      "step": 2
+    },
+    {
+      "detail": "agent_settled",
+      "ok": true,
+      "step": 3
+    }
+  ],
+  "truncations": [
+    {
+      "cut": {
+        "originalChars": 34680,
+        "path": "/message/sections/agent_browser",
+        "truncatedTo": 4000
+      },
+      "dir": "in",
+      "seq": 6
+    },
+    {
+      "cut": {
+        "originalChars": 34680,
+        "path": "/message/sections/agent_browser",
+        "truncatedTo": 4000
+      },
+      "dir": "in",
+      "seq": 7
+    },
+    {
+      "cut": {
+        "originalChars": 34680,
+        "path": "/messages/0/sections/agent_browser",
+        "truncatedTo": 4000
+      },
+      "dir": "in",
+      "seq": 115
+    }
+  ]
+}

@@ -1,0 +1,69 @@
+{
+  "counts": {
+    "agent_end": 1,
+    "agent_settled": 1,
+    "agent_start": 1,
+    "extension_ui_request.notify": 1,
+    "message_end": 3,
+    "message_start": 3,
+    "message_update.text_delta": 2,
+    "message_update.text_end": 1,
+    "message_update.text_start": 1,
+    "message_update.thinking_delta": 15,
+    "message_update.thinking_end": 1,
+    "message_update.thinking_start": 1,
+    "response.get_state": 1,
+    "response.prompt": 1,
+    "turn_end": 1,
+    "turn_start": 1
+  },
+  "failure": null,
+  "ok": true,
+  "recordCount": 37,
+  "steps": [
+    {
+      "detail": "response ok",
+      "ok": true,
+      "step": 0
+    },
+    {
+      "detail": "response ok",
+      "ok": true,
+      "step": 1
+    },
+    {
+      "detail": "agent_settled",
+      "ok": true,
+      "step": 2
+    }
+  ],
+  "truncations": [
+    {
+      "cut": {
+        "originalChars": 34680,
+        "path": "/message/sections/agent_browser",
+        "truncatedTo": 4000
+      },
+      "dir": "in",
+      "seq": 6
+    },
+    {
+      "cut": {
+        "originalChars": 34680,
+        "path": "/message/sections/agent_browser",
+        "truncatedTo": 4000
+      },
+      "dir": "in",
+      "seq": 7
+    },
+    {
+      "cut": {
+        "originalChars": 34680,
+        "path": "/messages/0/sections/agent_browser",
+        "truncatedTo": 4000
+      },
+      "dir": "in",
+      "seq": 35
+    }
+  ]
+}

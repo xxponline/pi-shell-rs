@@ -400,34 +400,47 @@ extension_error { extensionPath, event, error }
 
 ---
 
-## 8. 已知缺口 / 待探针验证
+## 8. 缺口验证结果（探针实测，pi v1.5.0）
 
-基于类型定义写的这份笔记，**以下几点必须用真实 `pi-agent --mode rpc` 跑一遍验证**：
+以下由 `probe` 二进制对真实 `pi --mode rpc` 跑 8 个场景得出。原始 JSONL 见
+`probe-out/<scenario>/latest/`（未入库）；证据场景名标注在每条后。
 
-1. **`message_start` 的初始 message 到底包含什么**？（content_blocks 是空的？还是带 system 骨架？）
-2. **`toolcall_start` 的 wire 实际形状**：`id` / `toolName` 是否真的被提到顶层？`contentIndex` 还在不在？
-3. **`usage` 是每帧都发还是只在关键帧发**？（影响 UI 的 cost 显示频率）
-4. **`agent_end.messages` 是增量还是全量**？（决定 Rust 要不要自己记历史）
-5. **`entry_appended` 与 `message_start/message_end` 的先后关系**——会不会重复？
-6. **错误响应的 `error` 字段是人类可读字符串还是错误码**？
-7. **`bash_execution_update` 的 `id` 何时有值何时没有**？（对应 Rust 发起的 bash 还是 agent 内部的 bash？）
-8. **stderr 是否完全不出现**？（文档说"pi 在 RPC 模式下 stdout 全是 JSONL，不产生 ANSI"——需要实测确认没有意外的日志行混入）
+1. **✅ 已验证（text_only）—— `message_start` 对 system/user/assistant 三种消息都发**，不只是 assistant：
+   - `system`：`message.content` 是**空字符串 `""`**（真正的 system 内容在 `message.sections.*` 里，按段分块，如 `sections.agent_browser`）。
+   - `user` / `assistant`：`message.content` 是**空数组 `[]`**，后续靠 delta 填充。
+   - 一次 text turn 观察到 3 对 `message_start/message_end`（system、user、assistant），但只有 assistant 那段夹着 `message_update`。**Rust 端要按 role 过滤，不能把每个 message_start 都当成新 assistant 气泡**。
+2. **✅ 已验证（tool_call）—— `toolcall_start` 确实被展平到顶层**：wire 形状为
+   `{type:"message_update", usage, assistantMessageEvent:{type:"toolcall_start", contentIndex, id, toolName}}`。
+   `id`（如 `call_dabsq0p9k...`）和 `toolName`（如 `read`）都在 assistantMessageEvent 顶层，`contentIndex` 保留。
+3. **✅ 已验证（text_only）—— `usage` 每帧都带**（26/26 条 message_update 都有 usage），但生成早期全为 0。可以每帧覆盖。
+4. **✅ 已验证（text_only）—— `agent_end.messages` 是本 run 的全量消息数组**（一次单轮对话为 3 条：system/user/assistant），**不是增量**。跨 run 的完整历史仍需 Rust 自己累积或用 `get_messages`/`get_entries`。字段为 `{type, messages, willRetry}`。
+5. **⚠️ 未触发 —— `entry_appended`**：8 个场景（含工具、compaction、steer、follow_up）都没观察到该事件。它可能只在从磁盘恢复/追加历史条目时发，而不是普通流式中。普通流式用 message_* 即可，**Rust 端不应依赖 entry_appended 渲染当前对话**；待后续 resume 场景再验证。
+6. **✅ 已验证（compact）—— 错误响应的 `error` 是人类可读字符串**，例如 compact 在会话过小时返回：
+   `{type:"response", id:"compact-3", command:"compact", success:false, error:"Nothing to compact (session too small)"}`。注意：即便返回这个业务错误，`compaction_start`/`compaction_end` 事件**仍然发出**。compaction 阈值是 `keepRecentTokens = 20000`，探针级小会话无法让它成功，这是预期。
+7. **⚠️ 未触发 —— `bash_execution_update`**：没有覆盖 Rust 主动发 `bash` command 的场景（当前内置场景只走 agent 循环）。其 `id` 语义待补一个 direct-bash 场景验证。
+8. **✅ 已验证（全部场景）—— stderr 完全干净**：所有运行的 `stderr.log` 为 0 行；stdout 无任何非 JSON / ANSI 行（探针没有产生任何 `parse_error` 分类）。`notify` 一类通知走 stdout 的 `extension_ui_request`，**不**走 stderr。另注意：pi 自身的 TPS 等提示也是通过 `extension_ui_request.notify` 出现的。
+
+### 额外观察（类型定义里不显眼、但影响渲染）
+
+- assistant 内容里 `thinking_*` 与 `text_*` 会**各自成对**出现 `*_start`/`*_end`，且一次回答可有多个 thinking 块（tool_call 场景观察到 2 个 thinking_start）。content block 必须按 `contentIndex` 建索引，不能假设只有一块 thinking + 一块 text。
+- `steer` 会触发额外的 `turn_start/turn_end` 与 `queue_update`；`follow_up` 排队时一次 run 内有多个 turn（3 个 turn_start）。
+- 工具失败时 `tool_execution_end.isError = true`（failed_tool 已验证），但 assistant 仍会继续生成解释文本。
 
 ---
 
-## 9. 下一步（探针脚本要做的事）
+## 9. 探针（已实现）
 
-> 注：本节是**给后续 `/opsx-propose` 用的任务清单**，本文档本身不实现脚本。
+探针已由 `build-rpc-probe-client` 变更实现为 cargo bin target：
 
-探针脚本要覆盖的场景：
+```bash
+cargo build --bin probe
+./target/debug/probe --list                      # 列出内置场景
+./target/debug/probe --scenario text_only        # 跑单个场景
+./target/debug/probe --all \
+  --ext probe-fixture-extension/probe-ui.ts      # 跑全部（extension_ui 需 fixture 扩展）
+```
 
-- [ ] 发一条纯文本 prompt，抓全部事件，验证时间线（3.1）。
-- [ ] 发一条会触发工具调用的 prompt（如"读一下 package.json"），抓 `tool_execution_*` 与 `toolcall_*` 的交织顺序。
-- [ ] 发一条会触发 thinking 的 prompt（high level），抓 `thinking_*` delta 序列。
-- [ ] 在生成过程中发 `steer`，观察 `disposition` 与后续事件。
-- [ ] 在队列里塞两条 follow_up，触发 `queue_update`。
-- [ ] 手动发 `compact`，观察 `compaction_start/end`。
-- [ ] 触发一个会失败的工具调用，验证 `isError=true` 时的形状。
-- [ ] 模拟一个扩展弹窗（写个最小扩展调用 `ctx.ui.select`），抓 `extension_ui_request` 完整形状。
-
-每个场景抓下来的原始 JSONL 应**归档到本文档同目录**，用作 Rust 端的 fixture。
+- 二进制名是 **`pi`**（v1.5.0，`pi --mode rpc`），不是旧文档里的 `pi-agent`；可用 `PI_BIN` 覆盖。
+- 产物在 `probe-out/<scenario>/runs/<ts>/`（git-ignored），`latest/` 为最新副本；`--snapshot` 写截断快照到 `tests/fixtures/probe/<scenario>/snapshot/`。
+- 已覆盖场景：text_only / tool_call / thinking / steer / follow_up / compact / failed_tool / extension_ui。
+- 尚未覆盖（后续可加）：Rust 主动发 `bash`（验证 `bash_execution_update`）、resume 会话（验证 `entry_appended`）、其余 extension UI method（input/editor/setStatus/setWidget/setTitle/set_editor_text）。

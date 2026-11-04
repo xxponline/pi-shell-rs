@@ -1,0 +1,8 @@
+{"dir":"out","raw":{"id":"extension_ui-1","message":"/probe-ui","type":"prompt"},"seq":0,"ts_ms":0}
+{"dir":"in","raw":{"id":"a7b2a469-5f7e-4162-a635-eaefc3a28815","method":"select","options":["first","second"],"title":"probe select","type":"extension_ui_request"},"seq":1,"ts_ms":21}
+{"dir":"out","raw":{"id":"a7b2a469-5f7e-4162-a635-eaefc3a28815","type":"extension_ui_response","value":"first"},"seq":2,"ts_ms":21}
+{"dir":"in","raw":{"id":"bd2e786b-5ffa-4b89-aa19-6c3c35d1d2b0","message":"you picked first","method":"confirm","title":"probe confirm","type":"extension_ui_request"},"seq":3,"ts_ms":45}
+{"dir":"out","raw":{"confirmed":true,"id":"bd2e786b-5ffa-4b89-aa19-6c3c35d1d2b0","type":"extension_ui_response"},"seq":4,"ts_ms":45}
+{"dir":"in","raw":{"id":"cbcc3908-dba6-489a-9b6f-f827ede1155e","message":"probe notify: choice=first confirmed=true","method":"notify","notifyType":"info","type":"extension_ui_request"},"seq":5,"ts_ms":70}
+{"dir":"in","raw":{"command":"prompt","data":{"disposition":"handled"},"id":"extension_ui-1","success":true,"type":"response"},"seq":6,"ts_ms":95}
+{"dir":"in","raw":{"id":"8a3fe587-08c6-4075-8c51-f930c9eb83f4","message":"Provider \"volcengine\" unreachable: 404 Not Found @ https://ark.cn-beijing.volces.com/api/plan/models","method":"notify","notifyType":"warning","type":"extension_ui_request"},"seq":7,"ts_ms":223}

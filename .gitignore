@@ -16,3 +16,8 @@ Cargo.lock
 
 # Symlink to external pi repo (not part of this project)
 /pi
+
+# Probe raw run output (timestamped dirs hold potentially sensitive content).
+# Tracked snapshots live under tests/fixtures/probe/<name>/snapshot/.
+/probe-out/
+tests/fixtures/probe/**/runs/

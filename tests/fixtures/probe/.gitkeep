@@ -1,0 +1,2 @@
+# Tracked snapshot fixtures land in <scenario>/snapshot/.
+# Raw timestamped runs stay in <scenario>/runs/ and are git-ignored.

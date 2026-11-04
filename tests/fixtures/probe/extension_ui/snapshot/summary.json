@@ -1,0 +1,34 @@
+{
+  "counts": {
+    "extension_ui_request.confirm": 1,
+    "extension_ui_request.notify": 2,
+    "extension_ui_request.select": 1,
+    "response.prompt": 1
+  },
+  "failure": null,
+  "ok": true,
+  "recordCount": 8,
+  "steps": [
+    {
+      "detail": "armed UI answer for select",
+      "ok": true,
+      "step": 0
+    },
+    {
+      "detail": "armed UI answer for confirm",
+      "ok": true,
+      "step": 1
+    },
+    {
+      "detail": "response ok",
+      "ok": true,
+      "step": 2
+    },
+    {
+      "detail": "saw extension_ui_request",
+      "ok": true,
+      "step": 3
+    }
+  ],
+  "truncations": []
+}
