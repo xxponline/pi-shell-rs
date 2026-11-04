@@ -154,6 +154,8 @@ pi-rust-tui/
 └── Docs/
 ```
 
+> 阶段 0+1 的库模块与回放用法见 [`library-and-replay.md`](./library-and-replay.md)。
+
 依赖单向，保证可测：
 
 ```

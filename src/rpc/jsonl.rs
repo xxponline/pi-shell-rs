@@ -1,8 +1,7 @@
-//! JSONL wire types shared between the transport and the scenario runner.
+//! JSONL wire types shared by the transport, RPC client, and consumers.
 //!
-//! We deliberately keep these weak: pi's payloads evolve, and the probe's job is
-//! to capture the *raw* JSON untouched. Only the discriminator fields needed for
-//! routing/classification are extracted here.
+//! Weak on purpose: pi's payloads evolve, so only the discriminator fields
+//! needed for routing/classification are extracted; raw JSON is preserved.
 
 use serde_json::Value;
 
@@ -13,7 +12,6 @@ pub enum WireMessage {
     Json(Value),
     /// A line that was not valid JSON. Kept verbatim so a protocol regression
     /// (stray log line, ANSI fragment) becomes evidence instead of a crash.
-    #[allow(dead_code)] // `raw` is read in tests and future transcript rendering.
     ParseError { raw: String },
 }
 
@@ -26,10 +24,18 @@ impl WireMessage {
             },
         }
     }
+
+    /// Top-level `type` discriminator for JSON messages; `"parse_error"` for a
+    /// non-JSON line; `None` for a JSON object without a `type` field.
+    pub fn top_type(&self) -> Option<&str> {
+        match self {
+            WireMessage::Json(v) => v.get("type").and_then(|t| t.as_str()),
+            WireMessage::ParseError { .. } => Some("parse_error"),
+        }
+    }
 }
 
-/// One command envelope handed to the transport for sending. The transport
-/// inserts the `id`; callers build the rest of the object.
+/// One command envelope sent to the transport. The transport inserts `id`.
 #[derive(Debug, Clone)]
 pub struct OutgoingCommand {
     /// Command object with `id` inserted.

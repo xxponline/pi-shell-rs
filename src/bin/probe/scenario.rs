@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::classify;
-use crate::jsonl::{Direction, OutgoingCommand, WireMessage};
-use crate::process::{StderrLine, Transport, TransportEvent};
+use pi_rust_tui::rpc::jsonl::{OutgoingCommand, WireMessage};
+use pi_rust_tui::rpc::process::{TransportEvent};
+use pi_rust_tui::rpc::{Direction, StderrLine, Transport};
 
 /// Answer to an `extension_ui_request`.
 #[derive(Debug, Clone)]

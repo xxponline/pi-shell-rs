@@ -2,14 +2,13 @@
 
 mod artifact;
 mod classify;
-mod jsonl;
-mod process;
 mod scenario;
 mod scenarios;
 
 use std::path::PathBuf;
 use std::time::Duration;
 
+use pi_rust_tui::rpc::{resolve_binary, Transport};
 use serde_json::json;
 
 use crate::scenario::RunOutcome;
@@ -125,7 +124,7 @@ fn main() {
         std::process::exit(2);
     };
 
-    let binary = process::resolve_binary();
+    let binary = resolve_binary();
     let extra_args = {
         let mut v = Vec::new();
         for e in &cli.exts {
@@ -165,7 +164,7 @@ fn run_one(
     extra_args: &[String],
     cli: &Cli,
 ) -> std::io::Result<bool> {
-    let mut transport = process::Transport::spawn_rpc(binary, extra_args)?;
+    let mut transport = Transport::spawn_rpc(binary, extra_args)?;
 
     // 5.2 preflight: get_state must return before any scenario steps.
     let preflight = scenario::Scenario {

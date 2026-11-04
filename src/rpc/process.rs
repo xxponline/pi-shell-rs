@@ -1,12 +1,12 @@
 //! Child-process transport for `pi --mode rpc` (or `PI_BIN` override).
 //!
-//! Three OS threads feed a single mpsc channel:
+//! Three OS threads:
 //!   - writer thread:  sends JSONL lines to child stdin
 //!   - stdout reader:  parses each line into [`WireMessage`]
-//!   - stderr reader:  forwards raw timestamped lines to a sink
+//!   - stderr reader:  forwards raw timestamped lines on a separate channel
 //!
-//! The transport is deliberately generic over the program spawned, so tests can
-//! point `PI_BIN` at a fake "pi" shell script that replays fixture lines.
+//! Generic over the spawned program so tests can point it at a fake "pi"
+//! shell script that replays fixture lines.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
@@ -14,7 +14,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::jsonl::{OutgoingCommand, WireMessage};
+use crate::rpc::jsonl::{OutgoingCommand, WireMessage};
 
 /// Something observed on the child's stdout.
 #[derive(Debug, Clone)]
@@ -104,13 +104,12 @@ impl Transport {
         });
 
         // Stderr reader thread (separate channel; never mixed with stdout).
-        let err_started = started;
         thread::spawn(move || {
             let reader = BufReader::new(stderr);
             for line in reader.lines().map_while(Result::ok) {
                 if err_tx
                     .send(StderrLine {
-                        at: err_started.elapsed(),
+                        at: started.elapsed(),
                         text: line,
                     })
                     .is_err()
@@ -150,9 +149,8 @@ impl Transport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
-    /// Drain events until `StdoutClosed`, collecting every stdout line.
+    /// Drain events until timeout/closed, collecting every stdout line.
     fn drain(transport: &Transport) -> Vec<WireMessage> {
         let mut out = Vec::new();
         while let Ok(TransportEvent::Message(m)) =
@@ -163,12 +161,9 @@ mod tests {
         out
     }
 
-    // 2.4: a fake "pi" shell script replays lines from an inline heredoc.
-    #[test]
-    fn fake_pi_replays_lines_over_transport() {
-        // The script: write a valid JSON line, then a non-JSON line, then exit.
-        let script = "#!/bin/sh\nprintf '%s\n' '{\"type\":\"response\",\"id\":\"1\"}' 'not json at all'\n";
-        let dir = std::env::temp_dir().join(format!("probe-test-{}", std::process::id()));
+    fn write_fake(script: &str, name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("probe-lib-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("fake-pi.sh");
         std::fs::write(&path, script).unwrap();
@@ -177,7 +172,13 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        path
+    }
 
+    #[test]
+    fn fake_pi_replays_lines_over_transport() {
+        let script = "#!/bin/sh\nprintf '%s\n' '{\"type\":\"response\",\"id\":\"1\"}' 'not json at all'\n";
+        let path = write_fake(script, "replay");
         let transport = Transport::spawn_rpc(path.to_str().unwrap(), &[]).unwrap();
         let msgs = drain(&transport);
         assert_eq!(msgs.len(), 2, "expected two lines, got {msgs:?}");
@@ -192,11 +193,9 @@ mod tests {
             WireMessage::ParseError { raw } => assert_eq!(raw, "not json at all"),
             other => panic!("expected parse_error, got {other:?}"),
         }
-
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
-    // 2.1: missing binary fails fast with a descriptive error, never hangs.
     #[test]
     fn missing_binary_errors_clearly() {
         let err = match Transport::spawn_rpc("/nonexistent/pi-binary-xyz", &[]) {
@@ -206,19 +205,10 @@ mod tests {
         assert!(err.to_string().contains("failed to spawn"));
     }
 
-    // 2.2: stderr is delivered on its own channel and never mixed into stdout.
     #[test]
     fn stderr_is_separate_from_stdout() {
-        let script = "#!/bin/sh\necho 'stdout-json-line-placeholder' 2>/dev/null\necho 'a stderr warning' >&2\nprintf '%s\n' '{\"type\":\"x\"}'\n";
-        let dir = std::env::temp_dir().join(format!("probe-test-err-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("fake-pi-err.sh");
-        std::fs::write(&path, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        let script = "#!/bin/sh\nprintf '%s\n' 'stdout-json-line-placeholder'\necho 'a stderr warning' >&2\nprintf '%s\n' '{\"type\":\"x\"}'\n";
+        let path = write_fake(script, "stderr");
         let transport = Transport::spawn_rpc(path.to_str().unwrap(), &[]).unwrap();
 
         let mut stderr_text = String::new();
@@ -234,25 +224,18 @@ mod tests {
         }
         assert!(stderr_text.contains("a stderr warning"), "stderr: {stderr_text:?}");
 
-        // The stdout placeholder was non-JSON but must still arrive on the
-        // stdout channel: prove the two pipes are not cross-wired.
         let stdout_msgs = drain(&transport);
-        let stdout_dump: String = stdout_dump(&stdout_msgs);
+        let stdout_dump: String = stdout_msgs
+            .iter()
+            .map(|m| match m {
+                WireMessage::Json(v) => v.to_string(),
+                WireMessage::ParseError { raw } => raw.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(stdout_dump.contains("stdout-json-line-placeholder"));
         assert!(!stdout_dump.contains("a stderr warning"));
 
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    fn stdout_dump(msgs: &[WireMessage]) -> String {
-        let mut s = String::new();
-        for m in msgs {
-            match m {
-                WireMessage::Json(v) => s.push_str(&v.to_string()),
-                WireMessage::ParseError { raw } => s.push_str(raw),
-            }
-            s.push('\n');
-        }
-        s
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
