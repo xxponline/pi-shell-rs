@@ -290,11 +290,27 @@ impl SessionState {
         }
     }
 
+    /// 处理 `message_end`：把 assistant 消息权威落盘；若携带错误信息，
+    /// 额外追加一条 error 通知，避免运行级错误静默丢失。
+    ///
+    /// 输入: message — 权威完整消息（System/User/Assistant 等）；None 直接忽略
+    /// 输出: 无返回值；副作用为更新 in-flight/transcript，
+    ///       且当 assistant 消息含非空 errorMessage 时追加 Notice{kind:"error"}
     fn on_message_end(&mut self, message: Option<&Value>) {
         let Some(message) = message else { return };
         if message.get("role").and_then(|r| r.as_str()) == Some("assistant") {
             self.replace_inflight_from_message(message);
             self.flush_inflight();
+            // 运行级错误（如模型 400/订阅失效）：content 可能为空，
+            // 但 errorMessage 携带原因，必须呈现给用户。
+            if let Some(err) = message.get("errorMessage").and_then(|e| e.as_str())
+                && !err.is_empty()
+            {
+                self.transcript.push(Entry::Notice {
+                    kind: "error".to_string(),
+                    text: err.to_string(),
+                });
+            }
         }
     }
 
@@ -838,5 +854,35 @@ mod tests {
             .entries()
             .iter()
             .any(|e| matches!(e, Entry::Assistant { .. })));
+    }
+
+    #[test]
+    fn assistant_error_message_becomes_error_notice() {
+        let mut s = SessionState::new();
+        s.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+        s.handle(&json!({"type":"message_end","message":{
+            "role":"assistant","content":[],"stopReason":"error",
+            "errorMessage":"400: InvalidSubscription (test)"
+        }}));
+        let notices: Vec<(&str,&str)> = s.entries().iter().filter_map(|e| match e {
+            Entry::Notice { kind, text } => Some((kind.as_str(), text.as_str())),
+            _ => None,
+        }).collect();
+        assert_eq!(notices, vec![("error", "400: InvalidSubscription (test)")], "{:?}", s.entries());
+        // turn_end 重复同一消息时不得重复追加通知
+        s.handle(&json!({"type":"turn_end","message":{
+            "role":"assistant","content":[],"stopReason":"error",
+            "errorMessage":"400: InvalidSubscription (test)"
+        },"toolResults":[]}));
+        let count = s.entries().iter().filter(|e| matches!(e, Entry::Notice { kind, .. } if kind == "error")).count();
+        assert_eq!(count, 1, "notice must not duplicate on turn_end");
+    }
+
+    #[test]
+    fn normal_assistant_message_has_no_error_notice() {
+        let mut s = SessionState::new();
+        s.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+        s.handle(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}));
+        assert!(!s.entries().iter().any(|e| matches!(e, Entry::Notice { .. })));
     }
 }

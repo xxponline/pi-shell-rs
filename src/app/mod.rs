@@ -8,6 +8,7 @@ mod chat;
 mod event;
 mod terminal;
 mod view;
+mod wrap;
 
 use std::io;
 use std::sync::mpsc::{Receiver, Sender};
@@ -21,22 +22,46 @@ use pi_rust_tui::session::{Phase, SessionState};
 use crate::app::event::UiEvent;
 use crate::app::terminal::TerminalGuard;
 
-/// Top-level application state.
+/// 应用顶层状态（输入缓冲、会话状态、瞬时提示、退出标志）。
 pub struct App {
     state: SessionState,
     input: String,
-    /// Last human-readable transient notice (parse errors, send failures).
+    /// 最近的瞬时提示（parse 错误、发送失败等）。
     notice: Option<String>,
     should_quit: bool,
+    /// 诊断日志句柄；环境变量 `PI_RUST_TUI_LOG=<path>` 开启时逐条记录
+    /// 收到的 UiEvent，用于排查“回复不显示”类问题；None 表示未开启。
+    debug_log: Option<std::fs::File>,
 }
 
 impl App {
+    /// 创建应用状态。
+    ///
+    /// 输入: 无
+    /// 输出: 空闲态 App；若设置 PI_RUST_TUI_LOG 则同时创建/截断该日志文件
     pub fn new() -> Self {
+        let debug_log = std::env::var("PI_RUST_TUI_LOG")
+            .ok()
+            .and_then(|path| std::fs::File::create(path).ok());
         Self {
             state: SessionState::new(),
             input: String::new(),
             notice: None,
             should_quit: false,
+            debug_log,
+        }
+    }
+
+    /// 向诊断日志追加一行 `kind detail`；未开启或写失败时静默忽略。
+    ///
+    /// 输入: kind — 事件类别（如 rpc/key/send）；detail — 详情文本（超 1500 字符截断）
+    /// 输出: 无返回值；副作用为向日志文件追加一行并 flush
+    fn log_event(&mut self, kind: &str, detail: &str) {
+        if let Some(f) = self.debug_log.as_mut() {
+            use std::io::Write;
+            let detail: String = detail.chars().take(1500).collect();
+            let _ = writeln!(f, "{kind} {detail}");
+            let _ = f.flush();
         }
     }
 
@@ -93,22 +118,27 @@ impl App {
         while !self.should_quit {
             match ui_rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(UiEvent::Key(key)) => {
+                    self.log_event("key", &format!("{key:?}"));
                     self.handle_key(key, commander, report_tx);
                     self.draw(terminal)?;
                 }
                 Ok(UiEvent::Rpc(raw)) => {
+                    self.log_event("rpc", &raw.to_string());
                     self.state.handle(&raw);
                     self.draw(terminal)?;
                 }
                 Ok(UiEvent::ParseError(raw)) => {
+                    self.log_event("parse_error", &raw);
                     self.notice = Some(format!("[parse_error] {raw}"));
                     self.draw(terminal)?;
                 }
                 Ok(UiEvent::Closed) => {
+                    self.log_event("closed", "stdout closed");
                     self.notice = Some("pi 连接已关闭".to_string());
                     self.should_quit = true;
                 }
                 Ok(UiEvent::SendFailed(err)) => {
+                    self.log_event("send_failed", &err);
                     self.notice = Some(err);
                     self.draw(terminal)?;
                 }
@@ -156,17 +186,26 @@ impl App {
         }
     }
 
-    /// Whether the current input would actually send a prompt.
+    /// 判断当前输入是否构成可发送的消息（去空白后非空）。
+    ///
+    /// 输入: self — 当前应用状态（读 input）
+    /// 输出: true 表示可以发送；false 表示应忽略 Enter
     fn can_submit(&self) -> bool {
         !self.input.trim().is_empty()
     }
 
+    /// 把当前输入作为 prompt 发出（空消息直接忽略）。
+    ///
+    /// 输入: commander — RPC 命令句柄；report_tx — 失败回报通道
+    /// 输出: 无返回值；副作用为清空输入、记录日志、异步发送 prompt
     fn submit(&mut self, commander: &CommandSender, report_tx: &Sender<UiEvent>) {
         if !self.can_submit() {
+            self.log_event("submit", "skipped: empty input");
             return;
         }
         let message = self.input.trim().to_string();
         self.input.clear();
+        self.log_event("submit", &format!("prompt sent: {message}"));
         self.send_command(
             commander,
             report_tx,

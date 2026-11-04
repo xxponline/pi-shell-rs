@@ -21,9 +21,19 @@ pub fn chat_lines(state: &SessionState) -> Vec<Line<'static>> {
                 append_blocks(&mut lines, blocks, true);
             }
             Entry::Notice { kind, text } => {
+                // error 类通知（如模型 400/订阅失效）标红加粗，其余弱化为斜体灰。
+                let style = if kind == "error" {
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC)
+                };
                 lines.push(Line::from(vec![Span::styled(
                     format!("[{kind}] {text}"),
-                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                    style,
                 )]));
             }
         }
@@ -173,5 +183,43 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn error_notice_renders_red_with_text() {
+        let mut st = SessionState::new();
+        st.handle(&serde_json::json!({"type":"message_end","message":{
+            "role":"assistant","content":[],"stopReason":"error",
+            "errorMessage":"400: subscription expired"
+        }}));
+        let lines = chat_lines(&st);
+        let err_line = lines.iter().find(|l| {
+            l.spans.iter().any(|s| s.content.as_ref().contains("[error]"))
+        }).expect("error notice line");
+        let span = err_line.spans.iter().find(|s| s.content.as_ref().contains("[error]")).unwrap();
+        assert!(span.content.as_ref().contains("subscription expired"));
+        assert_eq!(span.style.fg, Some(Color::Red), "error must be red");
+    }
+
+    #[test]
+    fn non_error_notice_stays_subdued() {
+        let mut st = SessionState::new();
+        // Notice 可直接入公开 transcript（非 error 类型保持弱化样式）
+        st.transcript.push(pi_rust_tui::session::Entry::Notice {
+            kind: "info".to_string(),
+            text: "something".to_string(),
+        });
+        let lines = chat_lines(&st);
+        let info = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.as_ref().contains("[info]")))
+            .expect("info notice line");
+        let span = info
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref().contains("[info]"))
+            .unwrap();
+        assert_eq!(span.style.fg, Some(Color::DarkGray));
+        assert_ne!(span.style.fg, Some(Color::Red));
     }
 }

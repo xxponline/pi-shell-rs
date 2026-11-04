@@ -3,12 +3,13 @@
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use pi_rust_tui::session::{Phase, SessionState};
 
 use crate::app::chat::chat_lines;
+use crate::app::wrap::wrap_for_viewport;
 
 /// Render one frame from immutable state.
 pub fn render(
@@ -61,10 +62,10 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, state: &Session
 
 fn render_chat(frame: &mut Frame, area: ratatui::layout::Rect, state: &SessionState) {
     let lines = chat_lines(state);
-    let line_count = lines.len() as u16;
-    let paragraph = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((line_count.saturating_sub(area.height), 0));
+    // 自行换行并底部锚定：ratatui 的 Wrap+scroll 偏移按换行后行数计，
+    // 我们无法精确预知，会导致最新内容被挤出视口（见 wrap 模块说明）。
+    let wrapped = wrap_for_viewport(&lines, area.width, area.height);
+    let paragraph = Paragraph::new(wrapped);
     frame.render_widget(paragraph.block(Block::default().borders(Borders::NONE)), area);
 }
 
@@ -104,5 +105,62 @@ mod tests {
         assert_eq!(truncate("abcdef", 0), "");
         // CJK-safe: no panic, respects char boundaries
         assert_eq!(truncate("中文测试", 3), "中文…");
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use pi_rust_tui::session::SessionState;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use serde_json::json;
+
+    /// Render the view into a TestBackend buffer and return its text.
+    fn render_to_buffer(state: &SessionState, input: &str, w: u16, h: u16) -> String {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, state, input, None))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn long_reply_state() -> SessionState {
+        let mut s = SessionState::new();
+        s.handle(&json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"give me a long answer"}]}}));
+        s.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+        let body = "word ".repeat(600) + "TAIL-MARKER-END";
+        s.handle(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text": body}]}}));
+        s
+    }
+
+    #[test]
+    fn long_reply_tail_visible_in_viewport() {
+        let state = long_reply_state();
+        let buf = render_to_buffer(&state, "", 60, 20);
+        assert!(
+            buf.contains("TAIL-MARKER-END"),
+            "reply tail must be visible in viewport; got:\n{buf}"
+        );
+    }
+
+    #[test]
+    fn short_content_fully_visible() {
+        let mut s = SessionState::new();
+        s.handle(&json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}));
+        s.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+        s.handle(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"hello there"}]}}));
+        let buf = render_to_buffer(&s, "", 60, 20);
+        assert!(buf.contains("hi"));
+        assert!(buf.contains("hello there"));
     }
 }
