@@ -13,3 +13,6 @@ Cargo.lock
 # Environment
 .env
 .env.local
+
+# Symlink to external pi repo (not part of this project)
+/pi
