@@ -82,7 +82,14 @@ struct Waiter {
 }
 
 pub struct RpcClient {
-    events: Receiver<ClientEvent>,
+    events: Option<Receiver<ClientEvent>>,
+    to_pump: Sender<PumpMessage>,
+}
+
+/// Cheap, `Send` + `Clone` handle for issuing commands without borrowing the
+/// whole client (safe to move into a detached thread).
+#[derive(Clone)]
+pub struct CommandSender {
     to_pump: Sender<PumpMessage>,
 }
 
@@ -100,14 +107,27 @@ impl RpcClient {
         let (to_pump, from_caller) = mpsc::channel::<PumpMessage>();
         thread::spawn(move || pump(transport, event_tx, from_caller));
         RpcClient {
-            events: event_rx,
+            events: Some(event_rx),
             to_pump,
+        }
+    }
+
+    /// A clonable, `Send` command handle usable from other threads.
+    pub fn command_sender(&self) -> CommandSender {
+        CommandSender {
+            to_pump: self.to_pump.clone(),
         }
     }
 
     /// Receiver for all unsolicited events.
     pub fn events(&self) -> &Receiver<ClientEvent> {
-        &self.events
+        self.events.as_ref().expect("events receiver taken")
+    }
+
+    /// Take ownership of the event receiver (e.g. move into a reader thread).
+    /// Panics if called more than once.
+    pub fn take_events(&mut self) -> Receiver<ClientEvent> {
+        self.events.take().expect("events receiver already taken")
     }
 
     /// Send a command object (no `id` needed) and await its response.
@@ -140,6 +160,30 @@ impl RpcClient {
         self.to_pump
             .send(PumpMessage::Raw(line))
             .map_err(|_| ClientError::Transport("client pump gone".into()))
+    }
+}
+
+impl CommandSender {
+    /// Issue a command and await its response. Mirrors [`RpcClient::send_command`].
+    pub fn send_command(
+        &self,
+        value: Value,
+        timeout: Duration,
+        policy: ResponsePolicy,
+    ) -> Result<Value, ClientError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let waiter = Waiter {
+            value,
+            deadline: Instant::now() + timeout,
+            policy,
+            reply: reply_tx,
+        };
+        self.to_pump
+            .send(PumpMessage::Command(waiter))
+            .map_err(|_| ClientError::Transport("client pump gone".into()))?;
+        reply_rx
+            .recv()
+            .unwrap_or(Err(ClientError::Transport("no reply".into())))
     }
 }
 

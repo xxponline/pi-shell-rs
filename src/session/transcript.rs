@@ -89,6 +89,18 @@ impl SessionState {
         &self.transcript
     }
 
+    /// Blocks for the assistant message currently streaming but not yet
+    /// finalized by `message_end`. Empty when nothing is in flight. Reading is
+    /// non-mutating.
+    pub fn in_flight(&self) -> &[Block] {
+        &self.inflight
+    }
+
+    /// Whether an assistant message is currently accumulating.
+    pub fn is_in_flight(&self) -> bool {
+        !self.inflight.is_empty()
+    }
+
     /// Apply one top-level wire event (weakly typed JSON). Unknown event types
     /// are safely ignored.
     pub fn handle(&mut self, event: &Value) {
@@ -799,5 +811,32 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, vec!["answer1".to_string(), "answer2".to_string()]);
+    }
+
+    #[test]
+    fn in_flight_accessor_tracks_streaming_lifecycle() {
+        let mut s = SessionState::new();
+        assert!(!s.is_in_flight());
+        assert!(s.in_flight().is_empty());
+
+        s.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+        s.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"text_start","contentIndex":0}}));
+        s.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"abc"}}));
+        // During streaming, in-flight blocks are visible and transcript untouched.
+        assert!(s.is_in_flight());
+        let visible: Vec<&Block> = s.in_flight().iter().collect();
+        assert!(visible.iter().any(|b| matches!(b, Block::Text { text } if text == "abc")));
+        let entries_before = s.entries().len();
+        let _ = s.in_flight(); // read is non-mutating
+        assert_eq!(s.entries().len(), entries_before);
+
+        s.handle(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"abc"}]}}));
+        // After finalization, in-flight clears and the entry exists.
+        assert!(!s.is_in_flight());
+        assert!(s.in_flight().is_empty());
+        assert!(s
+            .entries()
+            .iter()
+            .any(|e| matches!(e, Entry::Assistant { .. })));
     }
 }

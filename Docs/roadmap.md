@@ -183,6 +183,7 @@ tool start/update/end 归一化。不引入 ratatui。
 ### 阶段 2：最小可见 TUI（接真 pi，ratatui 首秀）
 
 顶栏 + 滚动消息流（先纯文本，不做 markdown）+ 基础编辑器；esc 中断；流式显示。
+使用方式与键位见 [`tui-usage.md`](./tui-usage.md)。
 
 - 验收：程序跑起来能与 pi 聊天，能看到流式回复并中断。
 
