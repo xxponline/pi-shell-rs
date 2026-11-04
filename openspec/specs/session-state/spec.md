@@ -1,0 +1,77 @@
+# session-state Specification
+
+## Purpose
+
+提供一个与终端、网络都无关的会话状态机：把 RPC 事件流增量累积并归一化为结构化 transcript 与运行态，使渲染层只需消费稳定的数据结构；它必须能从已归档的 JSONL 快照离线回放，以便无 token、无 pi 进程地测试。
+
+## Requirements
+
+### Requirement: 事件驱动的增量状态更新
+
+状态机 MUST 接受按时间顺序的顶层会话事件并增量更新自身权威状态，至少处理 `message_start`、`message_update`、`message_end`、`turn_start`、`turn_end`、`agent_start`、`agent_end`、`agent_settled`、`tool_execution_start`、`tool_execution_update`、`tool_execution_end`、`queue_update`、`thinking_level_changed`、`session_info_changed`。未知事件类型 MUST 被安全忽略而不中断。
+
+#### Scenario: 一次完整对话驱动流式与空闲状态
+
+- **WHEN** 向状态机依次送入 text_only 快照中的 agent_start → message_* → turn_* → agent_settled
+- **THEN** 状态机先反映"正在流式"，在 agent_settled 后反映"空闲"，且 transcript 中得到一条用户消息与一条 assistant 消息
+
+#### Scenario: 未知事件不致命
+
+- **WHEN** 状态机收到一个当前版本未识别的事件类型
+- **THEN** 状态机不报错、不丢失此前状态，后续已知事件仍被正常处理
+
+### Requirement: assistant 内容块按 contentIndex 累积
+
+状态机 MUST 依据 `message_update.assistantMessageEvent` 的 `contentIndex` 维护 text、thinking、toolCall 三类内容块，用 `text_delta` / `thinking_delta` / `toolcall_delta` 追加，并在收到对应 `*_end` 或 `message_end` 时用权威值校正。toolcall_start MUST 从线格式顶层取得工具调用 id 与工具名。
+
+#### Scenario: 文本与思考增量累积
+
+- **WHEN** 重放某 assistant 消息的一串 thinking_delta 与 text_delta
+- **THEN** 重建出的对应内容块文本等于该消息 `message_end` 中的最终 text 与 thinking 内容
+
+#### Scenario: 工具调用块记录 id 与名字
+
+- **WHEN** 重放 tool_call 快照中的 toolcall_start → toolcall_delta → toolcall_end
+- **THEN** assistant 内容中存在一个 toolCall 块，其 id 与 name 与权威消息一致
+
+#### Scenario: message_end 权威校正
+
+- **WHEN** 增量累积后收到携带完整消息的 message_end
+- **THEN** 该 assistant 消息的最终内容以 message_end 为准，消除增量漂移
+
+### Requirement: 工具执行归一化
+
+状态机 MUST 把 `tool_execution_start/update/end` 关联到对应工具调用，记录工具名、参数、进行中/结束状态、`isError`、结果与耗时，并作为 transcript 中可区分的工具执行条目（或 assistant 消息上的结构化字段）暴露。
+
+#### Scenario: 成功工具执行
+
+- **WHEN** 重放 tool_call 快照的 read 工具 start → update → end(isError=false)
+- **THEN** 状态机中该工具执行为已结束、无错误，且包含结果内容
+
+#### Scenario: 失败工具执行
+
+- **WHEN** 重放 failed_tool 快照，其 tool_execution_end 为 isError=true
+- **THEN** 该工具执行被标记为错误，且不影响同 turn 后续 assistant 文本被正常累积
+
+### Requirement: 结构化 transcript 与运行态
+
+状态机 MUST 暴露有序 transcript（用户/assistant/工具等条目，顺序对应会话发生顺序）以及运行态：是否正在流式、thinking 级别、会话名、steering/follow_up 队列、最近 usage。多 turn（follow_up 排队产生多个 turn）MUST 全部保留，不能只保留最后一轮。
+
+#### Scenario: transcript 顺序与角色
+
+- **WHEN** 重放 tool_call 快照（system/user/assistant/toolResult/assistant）
+- **THEN** transcript 中用户消息先于 assistant 回复，工具执行位于其触发的 assistant 内容与后续回复之间
+
+#### Scenario: 队列状态更新
+
+- **WHEN** 收到 queue_update 事件
+- **THEN** 运行态中的待处理 steering/follow_up 反映事件给出的队列内容
+
+### Requirement: 从 JSONL 快照离线回放
+
+状态机 MUST 提供入口，读取探针归档的 transcript JSONL（每行含 `dir` 与 `raw`），只回放入站（in）事件来重建状态，整个过程不需要启动 pi 或访问网络。
+
+#### Scenario: 离线重建真实快照
+
+- **WHEN** 离线测试加载 text_only、tool_call、failed_tool 三个 snapshot 的 transcript.jsonl 并回放
+- **THEN** 三个场景各自重建出非空 transcript，关键断言（消息数、内容块类型、工具成败）成立，且测试不依赖 pi 进程
