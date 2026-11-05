@@ -6,6 +6,17 @@
 
 use crate::app::commands::{self, CommandSpec};
 
+/// 一条动态斜杠命令（扩展/模板/skill，来自 `get_commands` RPC）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DynamicCommand {
+    /// 命令名（skill 为 `skill:xxx` 形式）。
+    pub name: String,
+    /// 描述（来源标签由 merge 时拼接）。
+    pub description: String,
+    /// 来源分类：`extension` / `prompt` / `skill`。
+    pub source: String,
+}
+
 /// 一条补全候选。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompletionItem {
@@ -58,6 +69,8 @@ pub fn suggestions(
     text_before: &str,
     models: &[String],
     levels: &[String],
+    dynamic: &[DynamicCommand],
+    skill_enabled: bool,
 ) -> Option<(CompletionKind, String, Vec<CompletionItem>)> {
     let trimmed = text_before.trim_start();
     if !trimmed.starts_with('/') {
@@ -66,8 +79,8 @@ pub fn suggestions(
     let rest = &trimmed[1..];
     match rest.find(char::is_whitespace) {
         None => {
-            // 命令名补全：全部命令按 rest 模糊过滤
-            let items = filter_commands(rest);
+            // 命令名补全：内置 + 动态命令合并后按 rest 模糊过滤
+            let items = filter_commands(rest, dynamic, skill_enabled);
             if items.is_empty() {
                 return None; // 无匹配 → 菜单收起（spec）
             }
@@ -113,15 +126,50 @@ pub fn arg_need(text_before: &str) -> Option<&'static str> {
     }
 }
 
-/// 命令表 → 补全候选（说明列 = `参数提示 — 说明`，无提示则仅说明）。
+/// 合并内置与动态命令为补全候选（对齐 pi 的合并规则）：
+/// 1) 与内置同名的动态项被过滤（pi 冲突规则）；2) `skill:` 项仅在开关开启时保留；
+/// 3) 动态描述加 `[{source}]` 标签；4) 内置原序在前、动态按返回序在后。
 ///
-/// 输入: query — `/` 之后的查询文本
+/// 输入: builtin — 内置命令表；dynamic — get_commands 结果；skill_enabled — 开关
+/// 输出: 合并后的候选（未过滤 fuzzy）
+pub fn merge_candidates(
+    builtin: &[commands::CommandSpec],
+    dynamic: &[DynamicCommand],
+    skill_enabled: bool,
+) -> Vec<CompletionItem> {
+    let mut out: Vec<CompletionItem> = builtin.iter().map(command_item).collect();
+    let builtin_names: Vec<&str> = builtin.iter().map(|c| c.name).collect();
+    for cmd in dynamic {
+        if builtin_names.contains(&cmd.name.as_str()) {
+            continue; // 同名冲突：过滤扩展（pi: filter((cmd) => !builtinCommandNames.has(...))）
+        }
+        if cmd.name.starts_with("skill:") && !skill_enabled {
+            continue; // enableSkillCommands=false
+        }
+        let desc = if cmd.description.is_empty() {
+            format!("[{}]", cmd.source)
+        } else {
+            format!("[{}] {}", cmd.source, cmd.description)
+        };
+        out.push(CompletionItem {
+            value: cmd.name.clone(),
+            label: cmd.name.clone(),
+            description: Some(desc),
+        });
+    }
+    out
+}
+
+/// 合并 + 模糊过滤：命令候选（说明列 = `参数提示 — 说明` 或 `[source] 描述`）。
+///
+/// 输入: query — `/` 之后的查询文本；dynamic/skill_enabled — 动态命令与开关
 /// 输出: 过滤排序后的候选
-fn filter_commands(query: &str) -> Vec<CompletionItem> {
-    let items: Vec<CompletionItem> = commands::COMMANDS
-        .iter()
-        .map(command_item)
-        .collect();
+fn filter_commands(
+    query: &str,
+    dynamic: &[DynamicCommand],
+    skill_enabled: bool,
+) -> Vec<CompletionItem> {
+    let items = merge_candidates(commands::COMMANDS, dynamic, skill_enabled);
     fuzzy_filter(&items, query, |item| item.value.clone())
 }
 
@@ -348,27 +396,27 @@ mod tests {
     fn trigger_only_at_line_start_slash_without_space() {
         let (models, levels) = data();
         // 行首 `/` 无空格 → 命令菜单
-        assert!(suggestions("/", &models, &levels).is_some());
-        assert!(suggestions("/th", &models, &levels).is_some());
+        assert!(suggestions("/", &models, &levels, &[], true).is_some());
+        assert!(suggestions("/th", &models, &levels, &[], true).is_some());
         // 前导空白允许（trim 语义）
-        assert!(suggestions("  /th", &models, &levels).is_some());
+        assert!(suggestions("  /th", &models, &levels, &[], true).is_some());
         // 非行首斜杠不触发（spec：消息中部）
-        assert!(suggestions("hello /th", &models, &levels).is_none());
-        assert!(suggestions("see src/app", &models, &levels).is_none());
+        assert!(suggestions("hello /th", &models, &levels, &[], true).is_none());
+        assert!(suggestions("see src/app", &models, &levels, &[], true).is_none());
         // 空输入不触发
-        assert!(suggestions("", &models, &levels).is_none());
+        assert!(suggestions("", &models, &levels, &[], true).is_none());
     }
 
     #[test]
     fn no_match_closes_menu() {
         let (models, levels) = data();
-        assert!(suggestions("/zzz", &models, &levels).is_none(), "无匹配应收起");
+        assert!(suggestions("/zzz", &models, &levels, &[], true).is_none(), "无匹配应收起");
     }
 
     #[test]
     fn command_items_and_description() {
         let (models, levels) = data();
-        let (kind, prefix, items) = suggestions("/mo", &models, &levels).unwrap();
+        let (kind, prefix, items) = suggestions("/mo", &models, &levels, &[], true).unwrap();
         assert_eq!(kind, CompletionKind::Command);
         assert_eq!(prefix, "/mo");
         let model = items.iter().find(|i| i.value == "model").expect("model 应命中");
@@ -376,7 +424,7 @@ mod tests {
         assert!(desc.contains("<provider/model>"), "参数提示应前缀: {desc}");
         assert!(desc.contains("Select model"), "说明应含描述: {desc}");
         // thinking 也应模糊命中（mo… / th… 不同词元）
-        let (_, _, th) = suggestions("/thi", &models, &levels).unwrap();
+        let (_, _, th) = suggestions("/thi", &models, &levels, &[], true).unwrap();
         assert_eq!(th[0].value, "thinking", "thi 应排首: {th:?}");
     }
 
@@ -422,19 +470,19 @@ mod tests {
     fn argument_completion_for_model_and_thinking_only() {
         let (models, levels) = data();
         // /model 空格 → 模型候选
-        let (kind, prefix, items) = suggestions("/model gpt", &models, &levels).unwrap();
+        let (kind, prefix, items) = suggestions("/model gpt", &models, &levels, &[], true).unwrap();
         assert_eq!(kind, CompletionKind::Argument("model".into()));
         assert_eq!(prefix, "gpt");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].value, "openai/gpt-5.4");
         // /thinking 空格 → 级别候选
-        let (_, _, th) = suggestions("/thinking hi", &models, &levels).unwrap();
+        let (_, _, th) = suggestions("/thinking hi", &models, &levels, &[], true).unwrap();
         assert_eq!(th.len(), 1);
         assert_eq!(th[0].value, "high");
         // 无参数补全的命令空格后不弹（spec）
-        assert!(suggestions("/copy x", &models, &levels).is_none());
+        assert!(suggestions("/copy x", &models, &levels, &[], true).is_none());
         // 无匹配参数 → 收起
-        assert!(suggestions("/model nomatch", &models, &levels).is_none());
+        assert!(suggestions("/model nomatch", &models, &levels, &[], true).is_none());
     }
 
     #[test]
@@ -471,5 +519,77 @@ mod tests {
         let (line, cur) = apply_completion("中 /thi", 6, "/thi", "thinking", &CompletionKind::Command);
         assert_eq!(line, "中 /thinking ");
         assert_eq!(cur, 12, "字符下标: 中+空格+/+thinking+空格");
+    }
+
+    // ── 动态命令合并（spec：动态斜杠命令补全） ──
+
+    /// 造三条动态命令（扩展/模板/skill 各一）。
+    fn dyn_cmds() -> Vec<DynamicCommand> {
+        vec![
+            DynamicCommand { name: "my-ext".into(), description: "Do thing".into(), source: "extension".into() },
+            DynamicCommand { name: "deploy".into(), description: "Ship it".into(), source: "prompt".into() },
+            DynamicCommand { name: "skill:review".into(), description: "Review code".into(), source: "skill".into() },
+        ]
+    }
+
+    #[test]
+    fn merge_filters_conflicts_and_skill_toggle_and_tags() {
+        // 冲突：与内置同名的动态项被过滤
+        let mut dyns = dyn_cmds();
+        dyns.push(DynamicCommand { name: "tree".into(), description: "shadow builtin".into(), source: "extension".into() });
+        let merged = merge_candidates(commands::COMMANDS, &dyns, true);
+        assert_eq!(merged.len(), 24 + 3, "同名 tree 被过滤: {}", merged.len());
+        let tree = merged.iter().find(|i| i.value == "tree").unwrap();
+        assert!(!tree.description.as_deref().unwrap_or("").contains("shadow"), "内置项未被遮蔽");
+
+        // skill 开关
+        let merged_off = merge_candidates(commands::COMMANDS, &dyns, false);
+        assert_eq!(merged_off.len(), 24 + 2, "skill 候选被过滤");
+        assert!(!merged_off.iter().any(|i| i.value.starts_with("skill:")));
+
+        // 源标签
+        let ext = merged.iter().find(|i| i.value == "my-ext").unwrap();
+        assert_eq!(ext.description.as_deref(), Some("[extension] Do thing"));
+        let tpl = merged.iter().find(|i| i.value == "deploy").unwrap();
+        assert_eq!(tpl.description.as_deref(), Some("[prompt] Ship it"));
+        let sk = merged.iter().find(|i| i.value == "skill:review").unwrap();
+        assert_eq!(sk.description.as_deref(), Some("[skill] Review code"));
+
+        // 空描述 → 仅标签
+        let merged2 = merge_candidates(
+            commands::COMMANDS,
+            &[DynamicCommand { name: "x1".into(), description: "".into(), source: "extension".into() }],
+            true,
+        );
+        let x1 = merged2.iter().find(|i| i.value == "x1").unwrap();
+        assert_eq!(x1.description.as_deref(), Some("[extension]"));
+
+        // 顺序：内置在前、动态按返回序
+        assert_eq!(merged[0].value, "settings", "内置原序在前");
+        let tail: Vec<&str> = merged[24..].iter().map(|i| i.value.as_str()).collect();
+        assert_eq!(tail, vec!["my-ext", "deploy", "skill:review"]);
+    }
+
+    #[test]
+    fn suggestions_includes_dynamic_commands() {
+        let (models, levels) = data();
+        // 键入 /my → 出现扩展候选
+        let (_, _, items) = suggestions("/my", &models, &levels, &dyn_cmds(), true).unwrap();
+        assert!(items.iter().any(|i| i.value == "my-ext"), "{items:?}");
+        // 空缓存 → 仅内置（降级场景）
+        match suggestions("/my", &models, &levels, &[], true) {
+            None => {} // /my 无内置匹配 → 收起（即纯内置语义）
+            Some((_, _, items)) => assert!(!items.iter().any(|i| i.value == "my-ext")),
+        }
+        // skill 开关关闭 → skill 候选不可见
+        if let Some((_, _, items)) = suggestions("/ski", &models, &levels, &dyn_cmds(), false) {
+            assert!(!items.iter().any(|i| i.value.starts_with("skill:")), "{items:?}");
+        }
+        // 动态命令 Tab 应用（与内置一致）
+        let (kind, prefix, items) = suggestions("/my", &models, &levels, &dyn_cmds(), true).unwrap();
+        let idx = best_match_index(&items, "my");
+        let (line, cur) = apply_completion("/my", 3, &prefix, &items[idx].value, &kind);
+        assert_eq!(line, "/my-ext ");
+        assert_eq!(cur, 8);
     }
 }

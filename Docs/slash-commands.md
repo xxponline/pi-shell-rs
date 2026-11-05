@@ -45,8 +45,26 @@
 | 20 | `/new` | ✅ | 新会话，消息区清空（4b） |
 | 21 | `/compact [指令]` | ✅ | 手动压缩；压缩期间输入本地排队、结束自动补发（4b） |
 | 22 | `/resume` | ✅ | 会话选择器（当前项目会话、两段式删除、Enter 切换）（4b） |
-| 23 | `/reload` | ⚠️ 简化 | 空闲时重读本地配置（会话目录解析）+ 补全缓存失效 + 绿条提示；流式/压缩中黄条拒绝。pi 重载 keybindings/extensions/skills/prompts/themes——本 TUI 无这些运行时，RPC 无 reload 方法 |
+| 23 | `/reload` | ⚠️ 简化 | 空闲时重读本地配置（会话目录解析）+ 补全缓存失效 + **重拉动态命令与 skill 开关** + 绿条提示；流式/压缩中黄条拒绝。pi 重载 keybindings/extensions/skills/prompts/themes——本 TUI 无这些运行时，RPC 无 reload 方法 |
 | 24 | `/quit` | ✅ | 退出（4b） |
+
+## 动态命令（扩展 / skill / 模板）
+
+内置 24 个之外，补全菜单还会列出 `get_commands` 返回的**动态命令**（启动与
+`/reload` 时静默拉取，失败自动降级为仅内置）：
+
+- **执行链全在 pi 侧**：扩展命令由 pi 的 `prompt()` 立即拦截执行（不进模型上下文，
+  流式中也可执行）；`skill:name args` 展开 skill 全文、`/模板名` 展开提示模板，
+  随后作为普通消息发给模型
+- **补全**：描述带源标签 `[extension]` / `[prompt]` / `[skill]`；与内置同名的扩展
+  被过滤（不遮蔽内置项）；`enableSkillCommands=false`（全局 settings.json，缺省 true）
+  时 `skill:` 候选全部隐藏
+- **压缩期语义**（对齐 pi）：**扩展命令立即发送**（pi 的执行先于其压缩检查）；
+  skill/模板与普通消息一样本地排队——它们的展开在压缩检查之后，立即发会被 pi 拒绝
+- 扩展的参数补全（pi 独有 `getArgumentCompletions`）与模板 `argumentHint`
+  **未实现**（RPC 不返回）
+- 扩展运行时动态注册/注销后，列表需 `/reload` 才刷新（执行不受影响——pi 按
+  其当前注册表判定，我们只负责发送文本）
 
 ## 未命中与边界
 

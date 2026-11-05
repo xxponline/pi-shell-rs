@@ -27,6 +27,8 @@ pub enum UiEvent {
     Info(String),
     /// /model 参数无精确匹配时回退打开模型选择器。
     OpenModelSelect,
+    /// get_commands 响应（动态命令缓存回填；静默拉取，仅成功时回报）。
+    CommandsFetched(serde_json::Value),
     /// 一次性线程取回的异步数据（选择器加载/模型与级别应用结果）。
     AsyncData { kind: AsyncKind, seq: u64, data: serde_json::Value },
 }

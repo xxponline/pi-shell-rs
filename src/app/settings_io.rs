@@ -88,6 +88,22 @@ pub fn read_double_escape_action(path: &Path) -> DoubleEscapeAction {
         .unwrap_or(DoubleEscapeAction::Tree)
 }
 
+/// 读取 `enableSkillCommands`：缺失/非法/不可解析 → true（pi 默认）。
+///
+/// 输入: path — settings.json 路径
+/// 输出: skill 命令是否启用
+pub fn read_enable_skill_commands(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return true;
+    };
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&text) else {
+        return true;
+    };
+    map.get("enableSkillCommands")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
 /// 写回 `doubleEscapeAction`：保留文件其它键、tmp+rename 原子写。
 /// 文件存在但不可解析（或非对象）时**拒绝写入**，避免覆盖损坏文件。
 ///
@@ -190,6 +206,18 @@ mod tests {
         assert_eq!(v["markdown"]["gfm"], true, "嵌套键保留: {text}");
         assert_eq!(v["doubleEscapeAction"], "none");
         assert_eq!(read_double_escape_action(&path), DoubleEscapeAction::None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn enable_skill_commands_defaults_true() {
+        let path = temp_path("skill");
+        let _ = std::fs::remove_file(&path);
+        assert!(read_enable_skill_commands(&path), "缺失 → true");
+        std::fs::write(&path, "{broken").unwrap();
+        assert!(read_enable_skill_commands(&path), "损坏 → true");
+        std::fs::write(&path, r#"{"enableSkillCommands":false}"#).unwrap();
+        assert!(!read_enable_skill_commands(&path), "显式 false");
         let _ = std::fs::remove_file(&path);
     }
 

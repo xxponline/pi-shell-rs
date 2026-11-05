@@ -198,7 +198,7 @@ pub fn dispatch(
             true
         }
         "reload" => {
-            app.cmd_reload();
+            app.cmd_reload(commander, report_tx);
             true
         }
         // ── 桩命令（spec：未支持命令提示桩） ──

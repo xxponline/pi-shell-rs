@@ -158,7 +158,7 @@ macOS 实现）。
 | 4 | alt+enter 空闲时 = 普通 Enter | ✅ 已对齐（空闲=prompt，流式=follow_up） | ~~中~~ 已完成 |
 | 5 | **双击 esc**（500ms）开 tree/fork（可设置） | ✅ 空输入双击开树（500ms 窗口、`doubleEscapeAction` 三态、`/settings` 行可写回；fork=树沿用简化） | ~~低~~ 已完成 |
 | 6 | `!cmd` bash 模式（边框变色、!! 排除上下文） | ✅ 分流/流式输出/运行门控/Esc 中止/`bashExecution` 重建全落地；user_bash 扩展拦截未做（无扩展运行时） | ~~中~~ 已完成 |
-| 7 | 本地 slash 命令（26 个） | ✅ 24 个内置命令全部落地（9 实现自 4b + 本 change 补齐 15：9 真实现 / 2 简化 / 4 桩），**斜杠补全菜单**同步复刻；详见 `Docs/slash-commands.md` | ~~分批~~ 已完成 |
+| 7 | 本地 slash 命令（26 个） | ✅ 24 个内置命令全部落地 + **斜杠补全菜单** + **动态命令**（扩展/skill/模板的发现、补全标签与压缩期语义，`add-dynamic-slash-commands`）；详见 `Docs/slash-commands.md` | ~~分批~~ 已完成 |
 | 8 | 编辑器 Emacs 全套（词移动/删除、yank、undo、历史） | ✅ 已对齐（多行+光标+词行删除+kill-ring/yank+undo；历史 pi 默认未绑定→不做） | ~~高~~ 已完成 |
 | 9 | ctrl+g 外部编辑器、ctrl+x 复制、ctrl+v 粘贴图片 | 无 | 中 |
 | 10 | shift+enter 换行（编辑器内多行） | ✅ 已对齐（shift+enter/ctrl+j 换行，输入区动态增高） | ~~高~~ 已完成 |

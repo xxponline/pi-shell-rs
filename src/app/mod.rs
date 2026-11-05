@@ -108,6 +108,10 @@ pub struct App {
     settings_path: Option<std::path::PathBuf>,
     /// 上一次"空闲且空输入"的 Esc 时刻（双击窗口判定，500ms）。
     last_escape: Option<std::time::Instant>,
+    /// 动态斜杠命令缓存（扩展/模板/skill，来自 get_commands；启动与 /reload 刷新）。
+    dynamic_commands: Vec<crate::app::autocomplete::DynamicCommand>,
+    /// skill 命令开关（settings.json `enableSkillCommands`，随缓存拉取刷新）。
+    skill_commands_enabled: bool,
     /// thinking 是否展开（ctrl+t 切换，默认折叠）。
     show_thinking: bool,
     /// 工具输出是否展开（ctrl+o 切换，默认折叠）。
@@ -146,6 +150,8 @@ impl App {
             levels_requested: false,
             settings_path: None,
             last_escape: None,
+            dynamic_commands: Vec::new(),
+            skill_commands_enabled: true,
             show_thinking: false,
             expand_tools: false,
             debug_log,
@@ -204,6 +210,11 @@ impl App {
         }
 
         let (ui_rx, report_tx) = event::spawn_event_sources(&mut client);
+        // 启动静默拉取动态斜杠命令（design D1：失败不打扰）
+        {
+            let settings_path = self.settings_path();
+            Self::fetch_commands_quiet(&client.command_sender(), &report_tx, settings_path);
+        }
         let mut terminal = guard.take_terminal();
 
         let commander = client.command_sender();
@@ -270,6 +281,12 @@ impl App {
                     } else {
                         self.notice = Some((err, Color::Red));
                     }
+                    self.draw(terminal)?;
+                }
+                Ok(UiEvent::CommandsFetched(data)) => {
+                    self.log_event("async", "commands fetched");
+                    self.apply_commands_fetched(&data);
+                    self.refresh_completion();
                     self.draw(terminal)?;
                 }
                 Ok(UiEvent::OpenModelSelect) => {
@@ -808,12 +825,101 @@ impl App {
         self.notice = Some(("✓ changelog 已显示".into(), Color::Green));
     }
 
+    /// 行首命令是否为已知**动态扩展命令**（压缩期立即发送判定，design D3）。
+    ///
+    /// 输入: message — 提交文本（trim 后）
+    /// 输出: true = 命中缓存中 source=="extension" 的命令名
+    fn is_dynamic_extension(&self, message: &str) -> bool {
+        let Some(rest) = message.strip_prefix('/') else {
+            return false;
+        };
+        let Some(name) = rest.split_whitespace().next() else {
+            return false;
+        };
+        self.dynamic_commands
+            .iter()
+            .any(|c| c.source == "extension" && c.name == name)
+    }
+
+    /// 静默拉取动态斜杠命令（`get_commands`）与 skill 开关。
+    /// 失败静默丢弃（缓存保持旧值/空——发现性数据不打扰用户，design D1）。
+    ///
+    /// 输入: commander/report_tx — 发送与回报通道；settings_path — 设置文件
+    /// 输出: 无返回值；副作用为线程内成功时回报 CommandsFetched
+    pub(crate) fn fetch_commands_quiet(
+        commander: &CommandSender,
+        report_tx: &Sender<UiEvent>,
+        settings_path: std::path::PathBuf,
+    ) {
+        let report = report_tx.clone();
+        let cmd = commander.clone();
+        thread::spawn(move || {
+            let data = cmd.send_command(
+                serde_json::json!({"type": "get_commands"}),
+                Duration::from_secs(15),
+                ResponsePolicy::RequireSuccess,
+            );
+            if let Ok(data) = data {
+                // skill 开关同次读取（事件携带，避免主线程再读文件）
+                let enabled =
+                    crate::app::settings_io::read_enable_skill_commands(&settings_path);
+                let _ = report.send(UiEvent::CommandsFetched(
+                    serde_json::json!({ "commands": data.get("commands").cloned().unwrap_or_default(), "skillEnabled": enabled }),
+                ));
+            }
+            // Err → 静默（design D1）
+        });
+    }
+
+    /// 消费 get_commands：解析为动态命令缓存（坏项跳过、不 panic）。
+    ///
+    /// 输入: data — {commands:[{name,description,source}], skillEnabled}
+    /// 输出: 无返回值；副作用为回填 dynamic_commands 与开关
+    fn apply_commands_fetched(&mut self, data: &serde_json::Value) {
+        let list = data
+            .get("commands")
+            .and_then(|c| c.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|c| {
+                        Some(crate::app::autocomplete::DynamicCommand {
+                            name: c.get("name").and_then(|n| n.as_str())?.to_string(),
+                            description: c
+                                .get("description")
+                                .and_then(|d| d.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            source: c
+                                .get("source")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("extension")
+                                .to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.dynamic_commands = list;
+        self.skill_commands_enabled = data
+            .get("skillEnabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        self.log_event(
+            "async",
+            &format!(
+                "commands fetched: {} dynamic, skill={}",
+                self.dynamic_commands.len(),
+                self.skill_commands_enabled
+            ),
+        );
+    }
+
     /// /reload：空闲时重读本地配置（会话目录设置 + 补全缓存失效）并绿条
     /// 提示、触发重绘；流式/压缩中黄条拒绝（spec：配置重读）。
     ///
     /// 输入: self — 应用状态
     /// 输出: 无返回值；副作用为提示与缓存复位
-    fn cmd_reload(&mut self) {
+    fn cmd_reload(&mut self, commander: &CommandSender, report_tx: &Sender<UiEvent>) {
         self.log_event("slash", "reload");
         if self.state.phase == Phase::Streaming {
             self.notice = Some(("等待当前响应完成后再 reload".into(), Color::Yellow));
@@ -831,6 +937,9 @@ impl App {
         self.levels_requested = false;
         let dir = crate::app::sessions::resolve_sessions_dir();
         self.log_event("slash", &format!("reload sessions_dir={}", dir.display()));
+        // 联动：重拉动态命令与 skill 开关（design D4）
+        let settings_path = self.settings_path();
+        Self::fetch_commands_quiet(commander, report_tx, settings_path);
         self.notice = Some((format!("✓ 配置已重新加载（sessions: {}）", dir.display()), Color::Green));
     }
 
@@ -1493,7 +1602,13 @@ impl App {
             .map(|(b, _)| b)
             .unwrap_or(line.len());
         let text_before = &line[..byte];
-        match autocomplete::suggestions(text_before, &self.models_cache, &self.levels_cache) {
+        match autocomplete::suggestions(
+            text_before,
+            &self.models_cache,
+            &self.levels_cache,
+            &self.dynamic_commands,
+            self.skill_commands_enabled,
+        ) {
             Some((kind, prefix, items)) => {
                 let query = match &kind {
                     autocomplete::CompletionKind::Command => prefix.trim_start_matches('/').to_string(),
@@ -2016,8 +2131,24 @@ impl App {
             }
             // `!` 无命令体 → 普通消息继续
         }
-        // 3) compaction 进行中：本地排队（pi 的 prompt 在压缩中直接拒绝，必须客户端排队）
+        // 3) compaction 进行中：本地排队（pi 的 prompt 在压缩中直接拒绝，必须客户端排队）。
+        //    例外：动态扩展命令立即发送——pi 的 _tryExecuteExtensionCommand 先于其
+        //    压缩检查（skill/模板展开在其后，仍需排队，design D3）。
         if self.state.compacting {
+            if command == "prompt" && self.is_dynamic_extension(&message) {
+                self.editor.replace("");
+                self.log_event(
+                    "submit",
+                    &format!("extension during compact (bypass queue): {message}"),
+                );
+                let payload = Self::build_command_payload(
+                    command,
+                    &message,
+                    self.state.phase == Phase::Streaming,
+                );
+                self.send_command(commander, report_tx, payload, true);
+                return;
+            }
             if message.is_empty() {
                 self.log_event("submit", "skipped: empty input (compact queue)");
                 return;
@@ -5427,6 +5558,160 @@ done
         let after = std::fs::read_to_string(&log).unwrap_or_default();
         let abort_count = after.matches("abort_bash").count() - before.matches("abort_bash").count();
         assert_eq!(abort_count, 0, "流式 Esc 不走 bash 中止");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 动态斜杠命令缓存（spec：动态斜杠命令补全 / design D1） ──
+
+    #[test]
+    fn commands_fetched_backfills_cache_and_skill_flag() {
+        let (client, dir, _log) = recording_commander("cmds", r#"{"steering":[],"followUp":[]}"#);
+        let _commander = client.command_sender();
+        let (_tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        // 三类 source 解析 + 坏项跳过 + 开关携带
+        app.apply_commands_fetched(&serde_json::json!({
+            "skillEnabled": false,
+            "commands": [
+                {"name": "my-ext", "description": "Do thing", "source": "extension"},
+                {"name": "deploy", "description": "Ship it", "source": "prompt"},
+                {"name": "skill:review", "description": "Review code", "source": "skill"},
+                {"name": null, "description": "bad"},
+                {"description": "no name"}
+            ]
+        }));
+        assert_eq!(app.dynamic_commands.len(), 3, "坏项跳过");
+        assert_eq!(app.dynamic_commands[0].name, "my-ext");
+        assert_eq!(app.dynamic_commands[0].source, "extension");
+        assert_eq!(app.dynamic_commands[1].source, "prompt");
+        assert_eq!(app.dynamic_commands[2].name, "skill:review");
+        assert!(!app.skill_commands_enabled, "开关随事件携带");
+
+        // 缺省字段 → 默认值
+        app.apply_commands_fetched(&serde_json::json!({}));
+        assert!(app.dynamic_commands.is_empty());
+        assert!(app.skill_commands_enabled, "缺省 skillEnabled → true");
+
+        // 静默拉取：死 pi（立即 EOF）→ 无 SendFailed、无红条
+        let dead = std::env::temp_dir().join(format!("dead-cmds-{}", std::process::id()));
+        std::fs::create_dir_all(&dead).unwrap();
+        let script = dead.join("pi.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let dead_client = pi_rust_tui::rpc::RpcClient::spawn(script.to_str().unwrap(), &[]).unwrap();
+        let (dtx, drx) = std::sync::mpsc::channel::<UiEvent>();
+        App::fetch_commands_quiet(&dead_client.command_sender(), &dtx, std::path::PathBuf::from("/nonexistent/settings.json"));
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let events: Vec<UiEvent> = drx.try_iter().collect();
+        assert!(
+            !events.iter().any(|e| matches!(e, UiEvent::SendFailed(_))),
+            "静默拉取不产生失败通知: {events:?}"
+        );
+        assert!(!app.notice.is_some_and(|(t, _)| t.contains("失败")), "无红条");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dead);
+    }
+
+    // ── 压缩期扩展例外与 /reload 联动（spec：手动 compact 流程 MODIFIED） ──
+
+    /// 造带动态命令缓存的压缩期 App。
+    fn compacting_with_dynamic(tag: &str) -> (App, CommandSender, Sender<UiEvent>, std::path::PathBuf) {
+        let (client, dir, log) = recording_commander(tag, r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+        app.state.compacting = true;
+        app.apply_commands_fetched(&serde_json::json!({
+            "skillEnabled": true,
+            "commands": [
+                {"name": "my-ext", "description": "d", "source": "extension"},
+                {"name": "skill:review", "description": "d", "source": "skill"},
+                {"name": "deploy", "description": "d", "source": "prompt"}
+            ]
+        }));
+        let _ = log;
+        (app, commander, tx, dir)
+    }
+
+    #[test]
+    fn extension_bypasses_compaction_queue_but_others_queue() {
+        // 扩展命令 → 立即发送（不入队）
+        let (mut app, cmd, tx, dir) = compacting_with_dynamic("ext-bypass");
+        app.editor.replace("/my-ext arg1");
+        app.submit_as(&cmd, &tx, "prompt");
+        assert!(app.editor.is_empty(), "清空输入");
+        assert!(app.compact_queue.is_empty(), "不入队");
+        // recording 日志名 recv-{tag}.log：立即发送应含命令文本
+        let content =
+            read_log_until(&dir.join("recv-ext-bypass.log"), "my-ext", 2000).expect("应立即发送");
+        assert!(content.contains("my-ext"), "{content}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // skill 命令 → 排队（pi 的展开在压缩检查之后）
+        let (mut app, cmd, tx, dir) = compacting_with_dynamic("skill-queue");
+        app.editor.replace("/skill:review code");
+        app.submit_as(&cmd, &tx, "prompt");
+        assert_eq!(app.compact_queue, vec!["/skill:review code".to_string()], "skill 入队");
+        assert!(app.editor.is_empty());
+        let (text, color) = app.notice.clone().unwrap();
+        assert!(text.contains("压缩进行中"), "{text}");
+        assert_eq!(color, Color::Yellow);
+
+        // 模板命令与未知文本 → 排队
+        app.editor.replace("/deploy now");
+        app.submit_as(&cmd, &tx, "prompt");
+        app.editor.replace("/whatever");
+        app.submit_as(&cmd, &tx, "prompt");
+        assert_eq!(app.compact_queue.len(), 3, "模板与未知都入队: {:?}", app.compact_queue);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 缓存为空（拉取未到）→ 保守排队
+        let (client, dir2, _log) = recording_commander("empty-cache", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx2, _rx2) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app2 = App::new();
+        app2.state.compacting = true;
+        app2.editor.replace("/my-ext arg");
+        app2.submit_as(&commander, &tx2, "prompt");
+        assert_eq!(app2.compact_queue.len(), 1, "缓存空时保守排队");
+        let _ = std::fs::remove_dir_all(&dir2);
+
+        // 非压缩期扩展 → 常规发送路径（无排队语义）
+        let (mut app, cmd, tx, dir) = compacting_with_dynamic("ext-idle");
+        app.state.compacting = false;
+        app.editor.replace("/my-ext");
+        app.submit_as(&cmd, &tx, "prompt");
+        assert!(app.compact_queue.is_empty());
+        assert!(app.editor.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reload_refetches_dynamic_commands() {
+        let (client, dir, log) = recording_commander("reload-cmds", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+        app.dynamic_commands.clear();
+
+        // /reload → 静默重拉（get_commands 进日志）
+        app.editor.replace("/reload");
+        assert!(crate::app::commands::dispatch(&mut app, &commander, &tx, "/reload"));
+        assert!(app.editor.is_empty());
+        read_log_until(&log, "get_commands", 2000).expect("reload 应重拉 get_commands");
+        // 响应回填（模拟事件）
+        app.apply_commands_fetched(&serde_json::json!({
+            "skillEnabled": true,
+            "commands": [{"name": "after-reload", "description": "d", "source": "extension"}]
+        }));
+        assert_eq!(app.dynamic_commands.len(), 1);
+        assert_eq!(app.dynamic_commands[0].name, "after-reload");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

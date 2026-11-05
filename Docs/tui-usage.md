@@ -35,7 +35,9 @@ cargo run                       # 默认运行 TUI（default-run）
 - 信息与文件：`/copy`（OSC52）· `/changelog` · `/hotkeys` · `/export` · `/import`（确认后导入并切换）
 - 设置类：`/settings`（简化：两开关）· `/scoped-models`（只读）· `/trust` · `/reload`
 - 🚫 提示桩：`/share` `/bug`（网络上报）· `/login` `/logout`（不做交互式登录，靠预登录）
-- 未命中的 `/xxx` 作为普通消息照常发送（与 pi 一致）
+- 未命中的 `/xxx` 作为普通消息照常发送（与 pi 一致）——其中**扩展/skill/模板
+  命令由 pi 内部拦截执行**；补全菜单会列出它们（描述带 `[extension]`/`[prompt]`/
+  `[skill]` 标签），`/reload` 可刷新列表
 
 ### bash 模式（`!` 前缀）
 
