@@ -21,3 +21,4 @@ Cargo.lock
 # Tracked snapshots live under tests/fixtures/probe/<name>/snapshot/.
 /probe-out/
 tests/fixtures/probe/**/runs/
+__LOG__

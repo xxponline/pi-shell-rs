@@ -4175,11 +4175,11 @@ done
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("recv.log");
         let script = r#"#!/bin/sh
 log="__LOG__"
 while IFS= read -r line; do
-  printf '%s
-' "$line" >> "$log"
+  printf '%s\n' "$line" >> "$log"
   id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
   case "$line" in
     *get_available_models*)
@@ -4189,7 +4189,8 @@ while IFS= read -r line; do
     *) printf '{"type":"response","id":"%s","success":true}\n' "$id" ;;
   esac
 done
-"#;
+"#
+        .replace("__LOG__", &log.display().to_string());
         let path = dir.join("pi.sh");
         std::fs::write(&path, script).unwrap();
         #[cfg(unix)]
