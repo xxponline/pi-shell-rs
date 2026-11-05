@@ -23,6 +23,8 @@ pub enum UiEvent {
     SendFailed(String),
     /// `clear_queue` 的返回数据（alt+up 取回排队消息，主线程回填输入框）。
     RestoreQueued(serde_json::Value),
+    /// 成功类提示（如"✓ 会话已删除"），显示为绿色通知。
+    Info(String),
     /// 一次性线程取回的异步数据（选择器加载/模型与级别应用结果）。
     AsyncData { kind: AsyncKind, seq: u64, data: serde_json::Value },
 }
@@ -42,6 +44,20 @@ pub enum AsyncKind {
     ThinkingApplied,
     /// cycle_thinking_level 结果，data 为 {level} 或 null。
     CycleThinking,
+    /// 无需回填状态的命令完成（如 set_session_name），data 被忽略。
+    CommandDone,
+    /// get_state 响应：应用状态 + 更新 session_file。
+    StateApplied,
+    /// get_messages 响应：load_messages 重建 transcript。
+    Messages,
+    /// 会话列表（SessionSelect 数据），按 seq 匹配填充。
+    SessionList,
+    /// switch/new/fork/clone 的首跳响应：{command, cancelled}。
+    SessionSwitched,
+    /// get_tree 响应：填充树浮层（按 seq）。
+    Tree,
+    /// get_session_stats 响应：填充信息面板（按 seq）。
+    Stats,
 }
 
 /// Spawn the keyboard + RPC reader threads. Returns the receiving end and a

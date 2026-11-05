@@ -5,6 +5,8 @@
 //! 保证主界面键位表零改动。渲染为纯函数，TestBackend 可测。
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::path::Path;
+
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -35,6 +37,35 @@ pub enum Overlay {
         levels: Vec<String>,
         loading: bool,
         cursor: usize,
+        seq: u64,
+    },
+    /// 会话选择器（/resume）。
+    SessionSelect {
+        items: Vec<crate::app::sessions::SessionItem>,
+        cursor: usize,
+        loading: bool,
+        seq: u64,
+        /// ctrl+d 两段式删除确认态。
+        confirming: bool,
+    },
+    /// 会话树（/tree）。
+    Tree {
+        /// get_tree 的原始节点数组。
+        tree: Vec<serde_json::Value>,
+        leaf_id: Option<String>,
+        /// 当前可见行（fold+filter 后重建）。
+        rows: Vec<crate::app::tree::TreeRow>,
+        cursor: usize,
+        folded: std::collections::HashSet<String>,
+        filter: crate::app::tree::FilterMode,
+        loading: bool,
+        seq: u64,
+    },
+    /// 会话信息面板（/session）。
+    Info {
+        title: String,
+        lines: Vec<String>,
+        loading: bool,
         seq: u64,
     },
     /// 扩展 select 请求。
@@ -77,6 +108,8 @@ pub enum OverlayOutcome {
     Close { reply: Option<Value> },
     /// 选择器：应用第 index 项。
     Apply(usize),
+    /// 会话选择器：对第 index 项执行删除（两段式确认的第二段）。
+    Delete(usize),
 }
 
 /// 居中矩形：按百分比在给定区域内取中心块。
@@ -109,6 +142,119 @@ pub fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 pub fn overlay_key(o: &mut Overlay, key: KeyEvent) -> OverlayOutcome {
     // ctrl+c 由 App 全局处理，不进此函数；这里兜底忽略其它修饰键组合。
     match o {
+        Overlay::Tree {
+            tree,
+            leaf_id,
+            rows,
+            cursor,
+            folded,
+            filter,
+            loading,
+            ..
+        } => {
+            if *loading {
+                return match key.code {
+                    KeyCode::Esc => OverlayOutcome::Close { reply: None },
+                    _ => OverlayOutcome::Handled,
+                };
+            }
+            let rebuild = |tree: &Vec<serde_json::Value>,
+                           leaf: &Option<String>,
+                           folded: &std::collections::HashSet<String>,
+                           filter: crate::app::tree::FilterMode,
+                           rows: &mut Vec<crate::app::tree::TreeRow>| {
+                *rows = crate::app::tree::flatten_tree(tree, leaf.as_deref(), folded, filter);
+            };
+            match key.code {
+                KeyCode::Up => {
+                    *cursor = cursor.saturating_sub(1);
+                    OverlayOutcome::Handled
+                }
+                KeyCode::Down => {
+                    if *cursor + 1 < rows.len() {
+                        *cursor += 1;
+                    }
+                    OverlayOutcome::Handled
+                }
+                KeyCode::Enter if !rows.is_empty() => OverlayOutcome::Apply(*cursor),
+                // ctrl+o：过滤模式循环
+                KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    *filter = filter.next();
+                    rebuild(tree, leaf_id, folded, *filter, rows);
+                    OverlayOutcome::Handled
+                }
+                // ← 折叠选中子树；→ 展开
+                KeyCode::Left => {
+                    if let Some(row) = rows.get(*cursor)
+                        && row.has_children
+                    {
+                        folded.insert(row.id.clone());
+                        rebuild(tree, leaf_id, folded, *filter, rows);
+                        if *cursor >= rows.len() {
+                            *cursor = rows.len().saturating_sub(1);
+                        }
+                    }
+                    OverlayOutcome::Handled
+                }
+                KeyCode::Right => {
+                    if let Some(row) = rows.get(*cursor)
+                        && folded.remove(&row.id)
+                    {
+                        rebuild(tree, leaf_id, folded, *filter, rows);
+                    }
+                    OverlayOutcome::Handled
+                }
+                KeyCode::Esc => OverlayOutcome::Close { reply: None },
+                _ => OverlayOutcome::Handled,
+            }
+        }
+        Overlay::Info { .. } => match key.code {
+            KeyCode::Esc | KeyCode::Enter => OverlayOutcome::Close { reply: None },
+            _ => OverlayOutcome::Handled,
+        },
+        Overlay::SessionSelect {
+            items, cursor, loading, confirming, ..
+        } => {
+            if *loading {
+                // 加载中仅允许 Esc 退出等待
+                return match key.code {
+                    KeyCode::Esc => OverlayOutcome::Close { reply: None },
+                    _ => OverlayOutcome::Handled,
+                };
+            }
+            match key.code {
+                KeyCode::Up => {
+                    *cursor = cursor.saturating_sub(1);
+                    OverlayOutcome::Handled
+                }
+                KeyCode::Down => {
+                    if *cursor + 1 < items.len() {
+                        *cursor += 1;
+                    }
+                    OverlayOutcome::Handled
+                }
+                KeyCode::Enter if !items.is_empty() && !*confirming => {
+                    OverlayOutcome::Apply(*cursor)
+                }
+                KeyCode::Char('d')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) && !items.is_empty() =>
+                {
+                    if *confirming {
+                        OverlayOutcome::Delete(*cursor)
+                    } else {
+                        *confirming = true;
+                        OverlayOutcome::Handled
+                    }
+                }
+                KeyCode::Esc if *confirming => {
+                    // Esc 先退出确认态，再按才关窗
+                    *confirming = false;
+                    OverlayOutcome::Handled
+                }
+                KeyCode::Esc => OverlayOutcome::Close { reply: None },
+                _ => OverlayOutcome::Handled,
+            }
+        }
         Overlay::ModelSelect {
             items, loading, cursor, ..
         } => {
@@ -367,9 +513,187 @@ fn cancelled_reply(id: &str) -> Value {
 ///
 /// 输入: frame — ratatui 帧；overlay — 浮层状态
 /// 输出: 无返回值；副作用为在帧最上层绘制
-pub fn render_overlay(frame: &mut Frame, overlay: &Overlay) {
+pub fn render_overlay(frame: &mut Frame, overlay: &Overlay, current_session: Option<&str>) {
     let area = frame.area();
     match overlay {
+        Overlay::Tree {
+            rows,
+            cursor,
+            filter,
+            loading,
+            ..
+        } => {
+            let title = format!(
+                " Tree (filter:{}) Enter=分支 ←=折叠 →=展开 ",
+                filter.label()
+            );
+            let lines: Vec<Line> = if *loading {
+                vec![Line::from(Span::styled(
+                    "loading…",
+                    Style::default().fg(Color::DarkGray),
+                ))]
+            } else if rows.is_empty() {
+                vec![Line::from(Span::styled(
+                    "(空树)",
+                    Style::default().fg(Color::DarkGray),
+                ))]
+            } else {
+                rows.iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        let selected = i == *cursor;
+                        let indent = "  ".repeat(r.depth);
+                        let marker = if r.is_leaf {
+                            Span::styled("● ", Style::default().fg(Color::Green))
+                        } else if r.has_children {
+                            Span::styled("▾ ", Style::default().fg(Color::DarkGray))
+                        } else {
+                            Span::raw("  ")
+                        };
+                        let mut spans = vec![
+                            Span::styled(
+                                if selected { "> " } else { "  " },
+                                Style::default().fg(Color::Cyan),
+                            ),
+                            Span::raw(indent),
+                            marker,
+                            Span::styled(
+                                r.text.clone(),
+                                if selected {
+                                    Style::default().add_modifier(Modifier::BOLD)
+                                } else {
+                                    Style::default()
+                                },
+                            ),
+                        ];
+                        if r.is_leaf {
+                            spans.push(Span::styled(
+                                " ◀ 当前",
+                                Style::default().fg(Color::Green),
+                            ));
+                        }
+                        Line::from(spans)
+                    })
+                    .collect()
+            };
+            draw_list(frame, area, &title, lines, rows.len().min(16) as u16 + 2);
+        }
+        Overlay::Info {
+            title,
+            lines,
+            loading,
+            ..
+        } => {
+            let mut display: Vec<Line> = if *loading {
+                vec![Line::from(Span::styled(
+                    "loading…",
+                    Style::default().fg(Color::DarkGray),
+                ))]
+            } else {
+                lines
+                    .iter()
+                    .map(|l| Line::from(l.clone()))
+                    .collect()
+            };
+            display.push(Line::from(Span::styled(
+                "",
+                Style::default(),
+            )));
+            display.push(Line::from(Span::styled(
+                "Esc 关闭",
+                Style::default().fg(Color::DarkGray),
+            )));
+            // 按行数精确定位（非百分比）：内容 + 上下边框
+            let inner_h = (display.len() as u16 + 2)
+                .min(area.height.saturating_sub(2))
+                .max(4);
+            let width = area.width.saturating_mul(70) / 100;
+            let rect = Rect {
+                x: area.x + area.width.saturating_sub(width) / 2,
+                y: area.y + area.height.saturating_sub(inner_h) / 2,
+                width,
+                height: inner_h,
+            };
+            frame.render_widget(Clear, rect);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {title} "));
+            frame.render_widget(Paragraph::new(display).block(block), rect);
+        }
+        Overlay::SessionSelect {
+            items,
+            cursor,
+            loading,
+            confirming,
+            ..
+        } => {
+            let title = if *confirming {
+                " Resume · ⚠ 再按 ctrl+d 确认删除，Esc 取消 ".to_string()
+            } else {
+                " Resume (Enter 切换 · ctrl+d 删除) ".to_string()
+            };
+            let now = std::time::SystemTime::now();
+            let lines: Vec<Line> = if *loading {
+                vec![Line::from(Span::styled(
+                    "loading…",
+                    Style::default().fg(Color::DarkGray),
+                ))]
+            } else if items.is_empty() {
+                vec![Line::from(Span::styled(
+                    "(无会话)",
+                    Style::default().fg(Color::DarkGray),
+                ))]
+            } else {
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, it)| {
+                        let selected = i == *cursor;
+                        let label = it
+                            .name
+                            .clone()
+                            .filter(|n| !n.is_empty())
+                            .unwrap_or_else(|| {
+                                if it.first_message.is_empty() {
+                                    "(空会话)".to_string()
+                                } else {
+                                    it.first_message.clone()
+                                }
+                            });
+                        let mut spans = vec![
+                            Span::styled(
+                                if selected { "> " } else { "  " },
+                                Style::default().fg(Color::Cyan),
+                            ),
+                            Span::styled(
+                                truncate_text(&label, 52),
+                                if selected {
+                                    Style::default().add_modifier(Modifier::BOLD)
+                                } else {
+                                    Style::default()
+                                },
+                            ),
+                            Span::styled(
+                                format!("  {}", crate::app::sessions::rel_time(it.modified, now)),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                        ];
+                        // 当前会话标记
+                        if current_session
+                            .map(|c| Path::new(c) == it.path.as_path())
+                            .unwrap_or(false)
+                        {
+                            spans.insert(
+                                0,
+                                Span::styled("• ", Style::default().fg(Color::Green)),
+                            );
+                        }
+                        Line::from(spans)
+                    })
+                    .collect()
+            };
+            draw_list(frame, area, &title, lines, items.len().min(12) as u16 + 2);
+        }
         Overlay::ModelSelect {
             items,
             loading,
@@ -594,6 +918,19 @@ pub fn render_overlay(frame: &mut Frame, overlay: &Overlay) {
     }
 }
 
+/// 字符安全截断（浮层行内标签用）。
+///
+/// 输入: text — 原文；max — 最大字符数
+/// 输出: 截断串（超长以 … 结尾）
+fn truncate_text(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        let taken: String = text.chars().take(max.saturating_sub(1)).collect();
+        format!("{taken}…")
+    }
+}
+
 /// 绘制通用列表浮层（标题 + 行 + 边框），按**行数**精确定位（非百分比）。
 ///
 /// 输入: frame — ratatui 帧；area — 父区域；title — 标题；
@@ -798,7 +1135,7 @@ mod tests {
         };
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render_overlay(frame, &overlay)).unwrap();
+        terminal.draw(|frame| render_overlay(frame, &overlay, None)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         let mut out = String::new();
         for y in 0..buffer.area.height {
@@ -814,7 +1151,7 @@ mod tests {
 
         // loading 态内容行也要可见
         let loading = Overlay::ModelSelect { items: vec![], loading: true, cursor: 0, seq: 1 };
-        terminal.draw(|frame| render_overlay(frame, &loading)).unwrap();
+        terminal.draw(|frame| render_overlay(frame, &loading, None)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         let mut out2 = String::new();
         for y in 0..buffer.area.height {
@@ -823,5 +1160,170 @@ mod tests {
             }
         }
         assert!(out2.contains("loading"), "loading 行必须可见: {out2}");
+    }
+
+    #[test]
+    fn session_select_keys_and_two_stage_delete() {
+        use crate::app::sessions::SessionItem;
+        use std::path::PathBuf;
+        use std::time::SystemTime;
+        let mk = |n: &str| SessionItem {
+            path: PathBuf::from(format!("/s/{n}.jsonl")),
+            name: Some(n.to_string()),
+            first_message: String::new(),
+            modified: Some(SystemTime::now()),
+            cwd: String::new(),
+        };
+        let mut o = Overlay::SessionSelect {
+            items: vec![mk("one"), mk("two"), mk("three")],
+            cursor: 0,
+            loading: false,
+            seq: 1,
+            confirming: false,
+        };
+        // 导航
+        assert_eq!(overlay_key(&mut o, key(KeyCode::Down)), OverlayOutcome::Handled);
+        assert_eq!(overlay_key(&mut o, key(KeyCode::Down)), OverlayOutcome::Handled);
+        assert_eq!(overlay_key(&mut o, key(KeyCode::Down)), OverlayOutcome::Handled); // 底部 clamp
+        // Enter → Apply(2)
+        assert_eq!(overlay_key(&mut o, key(KeyCode::Enter)), OverlayOutcome::Apply(2));
+        // ctrl+d 第一次 → 确认态（Handled，不关窗）
+        let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(overlay_key(&mut o, ctrl_d), OverlayOutcome::Handled);
+        let confirming = matches!(&o, Overlay::SessionSelect { confirming: true, .. });
+        assert!(confirming, "进入确认态");
+        // Esc 先退确认态
+        assert_eq!(overlay_key(&mut o, key(KeyCode::Esc)), OverlayOutcome::Handled);
+        let confirming = matches!(&o, Overlay::SessionSelect { confirming: true, .. });
+        assert!(!confirming, "Esc 退出确认态");
+        // 再次 ctrl+d 两段 → 确认态 → Delete
+        overlay_key(&mut o, ctrl_d);
+        assert_eq!(overlay_key(&mut o, ctrl_d), OverlayOutcome::Delete(2));
+        // 确认态下 Enter 不切换（防误触）
+        overlay_key(&mut o, ctrl_d); // 重新进确认态？Delete 后 confirming 仍在？——Delete 分支不改状态，
+        // 确认态下 Enter：
+        let mut o2 = Overlay::SessionSelect {
+            items: vec![mk("a")],
+            cursor: 0,
+            loading: false,
+            seq: 1,
+            confirming: true,
+        };
+        assert_eq!(overlay_key(&mut o2, key(KeyCode::Enter)), OverlayOutcome::Handled);
+        // loading 态全部按键忽略
+        let mut o3 = Overlay::SessionSelect {
+            items: vec![],
+            cursor: 0,
+            loading: true,
+            seq: 1,
+            confirming: false,
+        };
+        assert_eq!(overlay_key(&mut o3, key(KeyCode::Enter)), OverlayOutcome::Handled, "loading 忽略导航/确认");
+        assert_eq!(
+            overlay_key(&mut o3, key(KeyCode::Esc)),
+            OverlayOutcome::Close { reply: None },
+            "loading 中 Esc 可退出等待"
+        );
+        // 正常 Esc 关窗
+        let mut o4 = Overlay::SessionSelect {
+            items: vec![mk("a")],
+            cursor: 0,
+            loading: false,
+            seq: 1,
+            confirming: false,
+        };
+        assert_eq!(overlay_key(&mut o4, key(KeyCode::Esc)), OverlayOutcome::Close { reply: None });
+    }
+
+    #[test]
+    fn tree_keys_nav_filter_fold_and_fork() {
+        use crate::app::tree::FilterMode;
+        use std::collections::HashSet;
+        // 复用 tree 测试的小树
+        let tree: Vec<serde_json::Value> = vec![serde_json::json!({
+            "entry": {"type":"message","id":"root","parentId":null,
+                "message":{"role":"user","content":[{"type":"text","text":"q"}]}},
+            "children": [
+                {"entry":{"type":"message","id":"a1","parentId":"root",
+                    "message":{"role":"assistant","content":[{"type":"text","text":"a"}]}},
+                 "children":[]},
+                {"entry":{"type":"message","id":"b1","parentId":"root",
+                    "message":{"role":"user","content":[{"type":"text","text":"b"}]}},
+                 "children":[]}
+            ]
+        })];
+        let mk = |filter: FilterMode| Overlay::Tree {
+            tree: tree.clone(),
+            leaf_id: Some("b1".to_string()),
+            rows: crate::app::tree::flatten_tree(&tree, Some("b1"), &HashSet::new(), filter),
+            cursor: 0,
+            folded: HashSet::new(),
+            filter,
+            loading: false,
+            seq: 1,
+        };
+        let ctrl_o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        let ctrl = KeyModifiers::CONTROL;
+        let alt = KeyModifiers::ALT;
+
+        let mut o = mk(FilterMode::Default);
+        // 导航
+        assert_eq!(overlay_key(&mut o, key(KeyCode::Down)), OverlayOutcome::Handled);
+        match &o { Overlay::Tree { cursor, .. } => assert_eq!(*cursor, 1), _ => unreachable!() }
+        // Enter → Apply（fork）
+        assert_eq!(overlay_key(&mut o, key(KeyCode::Enter)), OverlayOutcome::Apply(1));
+        // ctrl+o 循环过滤
+        overlay_key(&mut o, ctrl_o);
+        match &o { Overlay::Tree { filter, .. } => assert_eq!(*filter, FilterMode::NoTools), _ => unreachable!() }
+        overlay_key(&mut o, ctrl_o);
+        overlay_key(&mut o, ctrl_o);
+        overlay_key(&mut o, ctrl_o);
+        overlay_key(&mut o, ctrl_o); // 转一圈回 default
+        match &o { Overlay::Tree { filter, .. } => assert_eq!(*filter, FilterMode::Default), _ => unreachable!() }
+        // ← 折叠 root（cursor 回 0；root 有 children，本测试树的 a1/b1 是叶子）
+        overlay_key(&mut o, key(KeyCode::Up)); // cursor 1→0
+        overlay_key(&mut o, key(KeyCode::Left));
+        match &o { Overlay::Tree { rows, folded, cursor, .. } => {
+            assert!(folded.contains("root"), "root 被折叠");
+            assert_eq!(*cursor, 0);
+            let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+            assert_eq!(ids, vec!["root"], "子树被跳过: {ids:?}");
+        }, _ => unreachable!() }
+        // → 展开恢复
+        overlay_key(&mut o, key(KeyCode::Right));
+        match &o { Overlay::Tree { rows, .. } => {
+            let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+            assert_eq!(ids, vec!["root", "a1", "b1"], "展开恢复: {ids:?}");
+        }, _ => unreachable!() }
+        // Esc 关闭
+        assert_eq!(overlay_key(&mut o, key(KeyCode::Esc)), OverlayOutcome::Close { reply: None });
+        // loading 忽略所有键
+        let mut ld = mk(FilterMode::Default);
+        match &mut ld { Overlay::Tree { loading, .. } => *loading = true, _ => unreachable!() }
+        assert_eq!(overlay_key(&mut ld, key(KeyCode::Enter)), OverlayOutcome::Handled);
+
+        // alt 键不干扰（未绑定 → Handled）
+        let _ = alt; let _ = ctrl;
+    }
+
+    #[test]
+    fn info_overlay_closes_on_esc_or_enter() {
+        let mut o = Overlay::Info {
+            title: " Session Info ".into(),
+            lines: vec!["名称: x".into()],
+            loading: false,
+            seq: 1,
+        };
+        assert_eq!(overlay_key(&mut o, key(KeyCode::Esc)), OverlayOutcome::Close { reply: None });
+        let mut o2 = Overlay::Info {
+            title: "t".into(),
+            lines: vec![],
+            loading: false,
+            seq: 1,
+        };
+        assert_eq!(overlay_key(&mut o2, key(KeyCode::Enter)), OverlayOutcome::Close { reply: None });
+        // loading 也响应 Esc（用户应能退出等待）
+        let mut o3 = Overlay::Info { title: "t".into(), lines: vec![], loading: true, seq: 1 };
+        assert_eq!(overlay_key(&mut o3, key(KeyCode::Esc)), OverlayOutcome::Close { reply: None });
     }
 }

@@ -5,10 +5,13 @@
 //! region layout: header / scrollable chat / input editor.
 
 mod chat;
+mod commands;
 mod editor;
 mod event;
 mod markdown;
 mod overlay;
+mod sessions;
+mod tree;
 mod terminal;
 mod tools;
 mod view;
@@ -86,6 +89,10 @@ pub struct App {
     overlay_seq: u64,
     /// 上一次 ctrl+c 的时刻（双击退出判定）。
     last_ctrl_c: Option<std::time::Instant>,
+    /// 当前会话文件路径（get_state 刷新；选择器标记/删除校验用）。
+    session_file: Option<String>,
+    /// compaction 进行中本地排队的提交文本（压缩结束按序补发）。
+    compact_queue: Vec<String>,
     /// thinking 是否展开（ctrl+t 切换，默认折叠）。
     show_thinking: bool,
     /// 工具输出是否展开（ctrl+o 切换，默认折叠）。
@@ -115,6 +122,8 @@ impl App {
             pending_overlays: VecDeque::new(),
             overlay_seq: 0,
             last_ctrl_c: None,
+            session_file: None,
+            compact_queue: Vec::new(),
             show_thinking: false,
             expand_tools: false,
             debug_log,
@@ -157,8 +166,14 @@ impl App {
             Duration::from_secs(15),
             ResponsePolicy::RequireSuccess,
         ) {
-            // 探活成功：把 model/sessionName/thinkingLevel 应用到状态（状态行显示）。
-            Ok(data) => self.state.apply_get_state(&data),
+            // 探活成功：应用 model/sessionName/thinkingLevel 并记住会话路径。
+            Ok(data) => {
+                self.state.apply_get_state(&data);
+                self.session_file = data
+                    .get("sessionFile")
+                    .and_then(|f| f.as_str())
+                    .map(String::from);
+            }
             Err(e) => Self::fail_early(
                 &mut guard,
                 &format!("pi 探活失败 (get_state): {e}"),
@@ -201,6 +216,10 @@ impl App {
                     } else {
                         self.state.handle(&raw);
                     }
+                    // compaction 结束边沿：补发压缩期间排队的提交
+                    if raw.get("type").and_then(|t| t.as_str()) == Some("compaction_end") {
+                        self.flush_compact_queue(commander, report_tx);
+                    }
                     self.draw(terminal)?;
                 }
                 Ok(UiEvent::AsyncData { kind, seq, data }) => {
@@ -221,6 +240,11 @@ impl App {
                 Ok(UiEvent::SendFailed(err)) => {
                     self.log_event("send_failed", &err);
                     self.notice = Some((err, Color::Red));
+                    self.draw(terminal)?;
+                }
+                Ok(UiEvent::Info(text)) => {
+                    self.log_event("info", &text);
+                    self.notice = Some((text, Color::Green));
                     self.draw(terminal)?;
                 }
                 Ok(UiEvent::RestoreQueued(data)) => {
@@ -316,6 +340,324 @@ impl App {
         self.handle_ctrl_c();
     }
 
+    /// 由 get_session_stats 响应构建信息面板行（纯函数）。
+    ///
+    /// 输入: data — get_session_stats 的 data；state — 会话状态（取会话名）
+    /// 输出: 信息面板文本行
+    fn session_info_lines(data: &serde_json::Value, state: &SessionState) -> Vec<String> {
+        let name = state
+            .session_name
+            .clone()
+            .unwrap_or_else(|| "(未命名)".to_string());
+        let num = |k: &str| -> String {
+            data.get(k)
+                .and_then(|v| v.as_u64())
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        };
+        let token_total = data
+            .pointer("/tokens/total")
+            .and_then(|v| v.as_u64())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let cost = data
+            .get("cost")
+            .and_then(|v| v.as_f64())
+            .map(|c| format!("${c:.4}"))
+            .unwrap_or_else(|| "-".to_string());
+        vec![
+            format!("名称: {name}"),
+            format!("会话 id: {}", data.get("sessionId").and_then(|v| v.as_str()).unwrap_or("-")),
+            format!(
+                "消息: {} 用户 / {} 助手 / {} 工具",
+                num("userMessages"),
+                num("assistantMessages"),
+                num("toolCalls")
+            ),
+            format!("总消息数: {}", num("totalMessages")),
+            format!("tokens: {token_total}"),
+            format!("费用: {cost}"),
+        ]
+    }
+
+    /// 打开会话树浮层：置 loading 并异步拉 get_tree（序号防过期）。
+    ///
+    /// 输入: report_tx — 回报通道
+    /// 输出: 无返回值；副作用为浮层与异步树请求
+    fn open_tree(&mut self, commander: &CommandSender, report_tx: &Sender<UiEvent>) {
+        self.overlay_seq += 1;
+        let seq = self.overlay_seq;
+        self.overlay = Some(Overlay::Tree {
+            tree: Vec::new(),
+            leaf_id: None,
+            rows: Vec::new(),
+            cursor: 0,
+            folded: std::collections::HashSet::new(),
+            filter: crate::app::tree::FilterMode::Default,
+            loading: true,
+            seq,
+        });
+        self.log_event("overlay", "open tree");
+        Self::spawn_async(
+            commander,
+            report_tx,
+            serde_json::json!({"type": "get_tree"}),
+            AsyncKind::Tree,
+            seq,
+            None,
+        );
+    }
+
+    /// 打开会话信息面板：置 loading 并异步拉 get_session_stats。
+    ///
+    /// 输入: report_tx — 回报通道
+    /// 输出: 无返回值；副作用为浮层与异步统计请求
+    fn open_session_info(&mut self, commander: &CommandSender, report_tx: &Sender<UiEvent>) {
+        self.overlay_seq += 1;
+        let seq = self.overlay_seq;
+        self.overlay = Some(Overlay::Info {
+            title: " Session Info ".to_string(),
+            lines: Vec::new(),
+            loading: true,
+            seq,
+        });
+        Self::spawn_async(
+            commander,
+            report_tx,
+            serde_json::json!({"type": "get_session_stats"}),
+            AsyncKind::Stats,
+            seq,
+            None,
+        );
+    }
+
+    /// 打开会话选择器：置 loading 浮层并异步拉取会话列表（序号防过期）。
+    ///
+    /// 输入: commander/report_tx — 命令与回报通道
+    /// 输出: 无返回值；副作用为浮层与异步列表请求
+    fn open_session_selector(&mut self, report_tx: &Sender<UiEvent>) {
+        self.overlay_seq += 1;
+        let seq = self.overlay_seq;
+        self.overlay = Some(Overlay::SessionSelect {
+            items: Vec::new(),
+            cursor: 0,
+            loading: true,
+            seq,
+            confirming: false,
+        });
+        self.log_event("overlay", "open session selector");
+        let report = report_tx.clone();
+        thread::spawn(move || {
+            let data = crate::app::sessions::list_sessions_json();
+            let _ = report.send(UiEvent::AsyncData {
+                kind: AsyncKind::SessionList,
+                seq,
+                data,
+            });
+        });
+    }
+
+    /// 会话切换链：首跳命令 → (cancelled → 通知并终止) → get_state 刷新
+    /// → get_messages 重建 transcript。
+    ///
+    /// 输入: commander — 命令句柄；report_tx — 回报通道；first — 首跳命令
+    ///       （switch_session/new_session/fork/clone）；command_name — 用于
+    ///       取消通知的命令名；success_notice — 成功后的绿色提示（可空）
+    /// 输出: 无返回值；副作用为异步执行整条链
+    pub(crate) fn spawn_session_chain(
+        commander: &CommandSender,
+        report_tx: &Sender<UiEvent>,
+        first: serde_json::Value,
+        command_name: &'static str,
+        success_notice: Option<&'static str>,
+    ) {
+        let report = report_tx.clone();
+        let cmd = commander.clone();
+        thread::spawn(move || {
+            let first_resp = match cmd.send_command(
+                first,
+                Duration::from_secs(30),
+                ResponsePolicy::RequireSuccess,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = report.send(UiEvent::SendFailed(e.to_string()));
+                    return;
+                }
+            };
+            let cancelled = first_resp
+                .get("cancelled")
+                .and_then(|c| c.as_bool())
+                .unwrap_or(false);
+            if cancelled {
+                let _ = report.send(UiEvent::AsyncData {
+                    kind: AsyncKind::SessionSwitched,
+                    seq: 0,
+                    data: serde_json::json!({ "command": command_name }),
+                });
+                return;
+            }
+            // 刷新 get_state（apply 模型/会话名 + session_file）
+            if let Ok(state) = cmd.send_command(
+                serde_json::json!({"type": "get_state"}),
+                Duration::from_secs(30),
+                ResponsePolicy::RequireSuccess,
+            ) {
+                let _ = report.send(UiEvent::AsyncData {
+                    kind: AsyncKind::StateApplied,
+                    seq: 0,
+                    data: state,
+                });
+            }
+            // 重建 transcript
+            match cmd.send_command(
+                serde_json::json!({"type": "get_messages"}),
+                Duration::from_secs(30),
+                ResponsePolicy::RequireSuccess,
+            ) {
+                Ok(messages) => {
+                    let _ = report.send(UiEvent::AsyncData {
+                        kind: AsyncKind::Messages,
+                        seq: 0,
+                        data: messages,
+                    });
+                    if let Some(notice) = success_notice {
+                        let _ = report.send(UiEvent::Info(notice.to_string()));
+                    }
+                }
+                Err(e) => {
+                    let _ = report.send(UiEvent::SendFailed(e.to_string()));
+                }
+            }
+        });
+    }
+
+    /// 删除会话：校验 + trash/unlink 后刷新选择器列表。
+    ///
+    /// 输入: overlay — 打开中的会话选择器（取 path/seq）；idx — 选中项；
+    ///       report_tx — 回报通道
+    /// 输出: 无返回值；副作用为异步删除并刷新列表
+    fn request_delete_session(
+        &self,
+        overlay: &Overlay,
+        idx: usize,
+        report_tx: &Sender<UiEvent>,
+    ) {
+        let Overlay::SessionSelect { items, seq, .. } = overlay else {
+            return;
+        };
+        let Some(item) = items.get(idx) else {
+            return;
+        };
+        let path = item.path.clone();
+        let seq = *seq;
+        let current = self.session_file.clone();
+        let report = report_tx.clone();
+        thread::spawn(move || {
+            // 删除校验以**项目子目录**为父（文件实际所在层）
+            let (dir, _) = crate::app::sessions::project_sessions_dir();
+            match crate::app::sessions::delete_session_file(&path, &dir, current.as_deref()) {
+                Ok(()) => {
+                    let data = crate::app::sessions::list_sessions_json();
+                    let _ = report.send(UiEvent::AsyncData {
+                        kind: AsyncKind::SessionList,
+                        seq,
+                        data,
+                    });
+                    let _ = report.send(UiEvent::Info("✓ 会话已删除".to_string()));
+                }
+                Err(e) => {
+                    let _ = report.send(UiEvent::SendFailed(format!("删除失败: {e}")));
+                }
+            }
+        });
+    }
+
+    /// /compact [自定义指令]：发送 compact 命令（异步；成败经 SendFailed/
+    /// compaction_end 通知呈现）。
+    ///
+    /// 输入: args — 指令参数（可空）；commander/report_tx — 发送与回报
+    /// 输出: 无返回值；输入清空，压缩流程由事件驱动
+    fn cmd_compact(
+        &mut self,
+        args: &str,
+        commander: &CommandSender,
+        report_tx: &Sender<UiEvent>,
+    ) {
+        self.editor.replace("");
+        let mut cmd = serde_json::json!({"type": "compact"});
+        if !args.is_empty() {
+            cmd["customInstructions"] = serde_json::Value::String(args.to_string());
+        }
+        self.log_event("slash", &format!("compact: {args}"));
+        Self::spawn_async(commander, report_tx, cmd, AsyncKind::CommandDone, 0, None);
+    }
+
+    /// compaction 结束边沿：把压缩期间排队的文本按序补发（每条带 steer，
+    /// idle 时 pi 忽略该字段、streaming 时合法排队）。
+    ///
+    /// 输入: commander/report_tx — 发送与回报通道
+    /// 输出: 无返回值；副作用为清空 compact_queue 并异步发送
+    fn flush_compact_queue(&mut self, commander: &CommandSender, report_tx: &Sender<UiEvent>) {
+        if self.compact_queue.is_empty() {
+            return;
+        }
+        let queued = std::mem::take(&mut self.compact_queue);
+        self.log_event(
+            "compact",
+            &format!("flush {} queued message(s) after compaction", queued.len()),
+        );
+        for message in queued {
+            let payload =
+                Self::build_command_payload("prompt", &message, /*streaming*/ true);
+            Self::spawn_async(
+                commander,
+                report_tx,
+                payload,
+                AsyncKind::CommandDone,
+                0,
+                None,
+            );
+        }
+    }
+
+    /// /quit：置退出标志并清空输入。
+    ///
+    /// 输入: 无
+    /// 输出: 无返回值；副作用为 should_quit=true、输入清空
+    fn cmd_quit(&mut self) {
+        self.editor.replace("");
+        self.should_quit = true;
+    }
+
+    /// /name <名称>：发送 set_session_name（无参时提示用法，不发送）。
+    ///
+    /// 输入: args — 命令参数原文（已 trim）；commander/report_tx — 发送与回报
+    /// 输出: 无返回值；有参异步发命令并清空输入，无参显示用法提示
+    fn cmd_set_name(
+        &mut self,
+        args: &str,
+        commander: &CommandSender,
+        report_tx: &Sender<UiEvent>,
+    ) {
+        if args.is_empty() {
+            self.notice = Some(("用法: /name <名称>".to_string(), Color::Yellow));
+            self.editor.replace("");
+            return;
+        }
+        let name = args.to_string();
+        self.editor.replace("");
+        self.log_event("slash", &format!("set_session_name: {name}"));
+        Self::spawn_async(
+            commander,
+            report_tx,
+            serde_json::json!({"type": "set_session_name", "name": name}),
+            AsyncKind::CommandDone,
+            0,
+            None,
+        );
+    }
+
     /// 处理一个按键：先做纯意图映射，再应用状态，最后按需走命令通道。
     ///
     /// 输入: key — 原始按键；commander/report_tx — 发送 prompt/abort 所需
@@ -349,6 +691,16 @@ impl App {
                     self.log_event("overlay", &format!("apply #{idx}"));
                     self.apply_overlay(&overlay, idx, commander, report_tx);
                     self.close_overlay();
+                }
+                OverlayOutcome::Delete(idx) => {
+                    self.log_event("overlay", &format!("delete #{idx}"));
+                    self.request_delete_session(&overlay, idx, report_tx);
+                    // 浮层保持打开等待异步刷新，确认态复位
+                    let mut o = overlay;
+                    if let Overlay::SessionSelect { confirming, .. } = &mut o {
+                        *confirming = false;
+                    }
+                    self.overlay = Some(o);
                 }
             }
             return;
@@ -629,7 +981,31 @@ impl App {
         }
         let message = self.editor.text();
         let message = message.trim().to_string();
+        // compaction 进行中：本地排队（pi 的 prompt 在压缩中直接拒绝，必须客户端排队）
+        if self.state.compacting {
+            if message.is_empty() {
+                self.log_event("submit", "skipped: empty input (compact queue)");
+                return;
+            }
+            self.compact_queue.push(message.clone());
+            self.editor.replace("");
+            self.notice = Some((
+                format!("压缩进行中，已排队 {} 条", self.compact_queue.len()),
+                Color::Yellow,
+            ));
+            self.log_event("submit", &format!("queued during compact: {message}"));
+            return;
+        }
+        // 本地命令与正常发送都先清空输入（spec：命令执行后输入清空）
         self.editor.replace("");
+        // 斜杠分发：仅普通 prompt 路径（Enter 与空闲 alt+enter 共用）；
+        // 流式 alt+enter 的 follow_up 路径不拦截（对齐 pi）。
+        if command == "prompt"
+            && crate::app::commands::dispatch(self, commander, report_tx, &message)
+        {
+            self.log_event("submit", &format!("local command: {message}"));
+            return;
+        }
         self.log_event("submit", &format!("{command} sent: {message}"));
         let payload = Self::build_command_payload(
             command,
@@ -867,6 +1243,32 @@ impl App {
         report_tx: &Sender<UiEvent>,
     ) {
         match overlay {
+            Overlay::Tree { rows, .. } => {
+                if let Some(row) = rows.get(idx) {
+                    let entry_id = row.id.clone();
+                    Self::spawn_session_chain(
+                        commander,
+                        report_tx,
+                        serde_json::json!({"type": "fork", "entryId": entry_id}),
+                        "fork",
+                        Some("✓ 已分支到选中节点"),
+                    );
+                }
+            }
+            Overlay::SessionSelect { items, .. } => {
+                if let Some(item) = items.get(idx) {
+                    Self::spawn_session_chain(
+                        commander,
+                        report_tx,
+                        serde_json::json!({
+                            "type": "switch_session",
+                            "sessionPath": item.path.to_string_lossy()
+                        }),
+                        "switch_session",
+                        None,
+                    );
+                }
+            }
             Overlay::ModelSelect { items, seq, .. } => {
                 if let Some(item) = items.get(idx) {
                     let command = serde_json::json!({
@@ -1037,6 +1439,83 @@ impl App {
                     self.state.thinking_level = Some(level.to_string());
                 }
             }
+            AsyncKind::CommandDone => {
+                // 无需回填状态；错误已由 SendFailed 通道处理。
+            }
+            AsyncKind::StateApplied => {
+                self.state.apply_get_state(data);
+                self.session_file = data
+                    .get("sessionFile")
+                    .and_then(|f| f.as_str())
+                    .map(String::from);
+            }
+            AsyncKind::Messages => {
+                self.state.load_messages(data);
+            }
+            AsyncKind::SessionSwitched => {
+                let cmd = data
+                    .get("command")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("会话操作");
+                self.notice = Some((format!("{cmd} 已取消"), Color::Yellow));
+            }
+            AsyncKind::Tree => {
+                if let Some(Overlay::Tree {
+                    tree,
+                    leaf_id,
+                    rows,
+                    folded,
+                    filter,
+                    loading,
+                    seq: s,
+                    ..
+                }) = self.overlay.as_mut()
+                    && *s == seq
+                {
+                        *tree = data
+                            .get("tree")
+                            .and_then(|t| t.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        *leaf_id = data
+                            .get("leafId")
+                            .and_then(|l| l.as_str())
+                            .map(String::from);
+                        *rows = crate::app::tree::flatten_tree(
+                            tree,
+                            leaf_id.as_deref(),
+                            folded,
+                            *filter,
+                        );
+                        *loading = false;
+                }
+            }
+            AsyncKind::Stats => {
+                if let Some(Overlay::Info {
+                    lines,
+                    loading,
+                    seq: s,
+                    ..
+                }) = self.overlay.as_mut()
+                    && *s == seq
+                {
+                    *lines = Self::session_info_lines(data, &self.state);
+                    *loading = false;
+                }
+            }
+            AsyncKind::SessionList => {
+                if let Some(Overlay::SessionSelect {
+                    items,
+                    loading,
+                    seq: s,
+                    ..
+                }) = self.overlay.as_mut()
+                    && *s == seq
+                {
+                    *items = crate::app::sessions::parse_sessions_json(data);
+                    *loading = false;
+                }
+            }
             AsyncKind::CycleThinking => {
                 if let Some(level) = data.pointer("/level").and_then(|x| x.as_str()) {
                     self.state.thinking_level = Some(level.to_string());
@@ -1061,6 +1540,8 @@ impl App {
                 expand_tools: self.expand_tools,
             },
             overlay: self.overlay.as_ref(),
+            current_session: self.session_file.as_deref(),
+            local_queue: &self.compact_queue,
         };
         terminal.draw(|frame| view::render(frame, &self.state, &ui))?;
         Ok(())
@@ -1924,6 +2405,494 @@ mod input_tests {
             }
             other => panic!("{other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 假 pi：switch_session 返回 cancelled=false，随后 get_state / get_messages
+    /// 返回可断言的固定数据（4.3 切换链）。
+    fn chain_fake_pi(tag: &str, cancelled: bool) -> (pi_rust_tui::rpc::RpcClient, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "chain-pi-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = format!(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  cmd=$(printf '%s' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  case "$cmd" in
+    switch_session|new_session|fork|clone)
+      printf '{{"type":"response","id":"%s","success":true,"data":{{"cancelled":{cancelled}}}}}
+' "$id" ;;
+    get_state)
+      printf '{{"type":"response","id":"%s","success":true,"data":{{"sessionFile":"/s/target.jsonl","model":{{"id":"m","name":"TargetModel"}},"thinkingLevel":"low","sessionId":"t"}}}}
+' "$id" ;;
+    get_messages)
+      printf '{{"type":"response","id":"%s","success":true,"data":{{"messages":[{{"role":"system","content":""}},{{"role":"user","content":[{{"type":"text","text":"switched question"}}]}},{{"role":"assistant","content":[{{"type":"text","text":"switched answer"}}]}}]}}}}
+' "$id" ;;
+    *) printf '{{"type":"response","id":"%s","success":true}}
+' "$id" ;;
+  esac
+done
+"#,
+            cancelled = cancelled
+        );
+        let path = dir.join("pi.sh");
+        std::fs::write(&path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // 保留一份供外部检查（测试结束后目录被删，这里另存）
+        let _ = std::fs::write("/tmp/last-chain-pi.sh", std::fs::read(&path).unwrap_or_default());
+        let client = pi_rust_tui::rpc::RpcClient::spawn(path.to_str().unwrap(), &[]).unwrap();
+        (client, dir)
+    }
+
+    /// 从回报通道收集 AsyncData（按 kind 过滤，限时）。
+    fn collect_async(
+        rx: &std::sync::mpsc::Receiver<UiEvent>,
+        kinds: &[AsyncKind],
+        ms: u64,
+    ) -> Vec<(AsyncKind, serde_json::Value)> {
+        let mut got = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        while std::time::Instant::now() < deadline {
+            if let Ok(UiEvent::AsyncData { kind, data, .. }) =
+                rx.recv_timeout(std::time::Duration::from_millis(200))
+                && kinds.contains(&kind)
+            {
+                let done = kind == AsyncKind::Messages;
+                got.push((kind, data));
+                if done {
+                    break;
+                }
+            }
+        }
+        got
+    }
+
+    #[test]
+    fn switch_chain_rebuilds_state_and_session_file() {
+        let (client, dir) = chain_fake_pi("ok", false);
+        let commander = client.command_sender();
+        let (tx, rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        App::spawn_session_chain(
+            &commander,
+            &tx,
+            serde_json::json!({"type": "switch_session", "sessionPath": "/s/old.jsonl"}),
+            "switch_session",
+            None,
+        );
+        let got = collect_async(
+            &rx,
+            &[AsyncKind::StateApplied, AsyncKind::Messages],
+            4000,
+        );
+        assert!(got.iter().any(|(k, _)| *k == AsyncKind::StateApplied), "应有 StateApplied");
+        let messages = got
+            .iter()
+            .find(|(k, _)| *k == AsyncKind::Messages)
+            .map(|(_, d)| d.clone())
+            .expect("应有 Messages");
+
+        // 应用到 App
+        for (kind, data) in &got {
+            app.handle_async_data(*kind, 0, data);
+        }
+        assert_eq!(app.session_file.as_deref(), Some("/s/target.jsonl"), "session_file 刷新");
+        assert_eq!(app.state.model.as_deref(), Some("TargetModel"), "模型刷新");
+        // transcript 重建为切换后的会话
+        let users: Vec<&str> = app
+            .state
+            .entries()
+            .iter()
+            .filter_map(|e| match e {
+                pi_rust_tui::session::Entry::User { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users, vec!["switched question"], "{:?}", app.state.entries());
+        assert!(app.state.entries().iter().any(|e| matches!(
+            e,
+            pi_rust_tui::session::Entry::Assistant { .. }
+        )));
+        let _ = messages;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn switch_chain_cancelled_notifies_without_touching_state() {
+        let (client, dir) = chain_fake_pi("cancel", true);
+        let commander = client.command_sender();
+        let (tx, rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+        // 先有旧状态
+        app.state.load_messages(&serde_json::json!({"messages": [
+            {"role":"user","content":[{"type":"text","text":"before"}]}
+        ]}));
+
+        App::spawn_session_chain(
+            &commander,
+            &tx,
+            serde_json::json!({"type": "switch_session", "sessionPath": "/s/x.jsonl"}),
+            "switch_session",
+            None,
+        );
+        // 等 SessionSwitched（不应有 Messages）
+        let mut switched = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if let Ok(ev) = rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                match ev {
+                    UiEvent::AsyncData { kind: AsyncKind::SessionSwitched, data, .. } => {
+                        assert_eq!(
+                            data.get("command").and_then(|c| c.as_str()),
+                            Some("switch_session")
+                        );
+                        switched = true;
+                        break;
+                    }
+                    UiEvent::AsyncData { kind: AsyncKind::Messages, .. } => {
+                        panic!("cancelled 后不应重建 Messages");
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(switched, "应收到 SessionSwitched");
+        // 应用通知 → 黄色取消提示
+        app.handle_async_data(
+            AsyncKind::SessionSwitched,
+            0,
+            &serde_json::json!({"command":"switch_session"}),
+        );
+        let (text, color) = app.notice.clone().expect("cancel notice");
+        assert!(text.contains("取消"), "{text}");
+        assert_eq!(color, Color::Yellow);
+        // 旧状态未动
+        assert!(app.state.entries().iter().any(|e| matches!(
+            e,
+            pi_rust_tui::session::Entry::User { text } if text == "before"
+        )));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_opens_selector_and_fills_via_async() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (client, dir) = test_commander();
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        // /resume 命中本地表 → 打开浮层（loading）
+        assert!(crate::app::commands::dispatch(
+            &mut app,
+            &commander,
+            &tx,
+            "/resume"
+        ));
+        match &app.overlay {
+            Some(Overlay::SessionSelect { loading, seq, confirming, .. }) => {
+                assert!(*loading);
+                assert!(*seq >= 1);
+                assert!(!*confirming);
+            }
+            other => panic!("未打开会话选择器: {other:?}"),
+        }
+
+        // 键盘路径同样可用（Esc 关闭）
+        let seq = match &app.overlay {
+            Some(Overlay::SessionSelect { seq, .. }) => *seq,
+            _ => 0,
+        };
+        app.overlay = Some(Overlay::SessionSelect {
+            items: Vec::new(),
+            cursor: 0,
+            loading: true,
+            seq,
+            confirming: false,
+        });
+        app.handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &commander,
+            &tx,
+        );
+        // loading 中 Esc 可关闭（退出等待）
+        assert!(app.overlay.is_none(), "loading 中 Esc 关闭浮层");
+
+        // 重新打开以验证填充
+        crate::app::commands::dispatch(&mut app, &commander, &tx, "/resume");
+        let seq = match &app.overlay {
+            Some(Overlay::SessionSelect { seq, .. }) => *seq,
+            other => panic!("重开失败: {other:?}"),
+        };
+
+        // SessionList 填充（正确 seq）
+        let data = serde_json::json!({"sessions":[
+            {"path":"/s/a.jsonl","name":"alpha","firstMessage":"","modifiedMs":1700000000},
+            {"path":"/s/b.jsonl","name":null,"firstMessage":"first ask","modifiedMs":1600000000}
+        ]});
+        app.handle_async_data(AsyncKind::SessionList, seq, &data);
+        match &app.overlay {
+            Some(Overlay::SessionSelect { items, loading, .. }) => {
+                assert!(!*loading, "数据到达结束 loading");
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].name.as_deref(), Some("alpha"));
+                assert_eq!(items[1].first_message, "first ask");
+            }
+            other => panic!("{other:?}"),
+        }
+        // 过期 seq 丢弃
+        app.handle_async_data(AsyncKind::SessionList, seq + 99, &serde_json::json!({"sessions":[]}));
+        match &app.overlay {
+            Some(Overlay::SessionSelect { items, .. }) => assert_eq!(items.len(), 2),
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_and_clone_dispatch_send_their_commands() {
+        // 录制假 pi：断言 /new 与 /clone 发出正确命令类型（5.1）
+        let (client, dir, log) = recording_commander("newclone", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        app.editor.replace("/new");
+        assert!(crate::app::commands::dispatch(&mut app, &commander, &tx, "/new"));
+        assert!(app.editor.is_empty(), "命令后输入清空");
+        let content = read_log_until(&log, "new_session", 2000).expect("应发出 new_session");
+        assert!(content.contains(r#""type":"new_session""#), "{content}");
+
+        app.editor.replace("/clone");
+        assert!(crate::app::commands::dispatch(&mut app, &commander, &tx, "/clone"));
+        let content = read_log_until(&log, "clone", 2000).expect("应发出 clone");
+        assert!(content.contains(r#""type":"clone""#), "{content}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tree_and_session_info_open_and_fill() {
+        let (client, dir) = test_commander();
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        // /tree → loading 浮层
+        assert!(crate::app::commands::dispatch(&mut app, &commander, &tx, "/tree"));
+        let seq = match &app.overlay {
+            Some(Overlay::Tree { loading, seq, .. }) => {
+                assert!(*loading);
+                *seq
+            }
+            other => panic!("未打开树: {other:?}"),
+        };
+        // get_tree 数据到达 → 行构建
+        app.handle_async_data(
+            AsyncKind::Tree,
+            seq,
+            &serde_json::json!({
+                "leafId": "n2",
+                "tree": [{
+                    "entry": {"type":"message","id":"n1","message":{"role":"user","content":[{"type":"text","text":"root q"}]}},
+                    "children": [{
+                        "entry": {"type":"message","id":"n2","message":{"role":"assistant","content":[{"type":"text","text":"answer"}]}},
+                        "children": []
+                    }]
+                }]
+            }),
+        );
+        match &app.overlay {
+            Some(Overlay::Tree { rows, loading, leaf_id, .. }) => {
+                assert!(!*loading);
+                assert_eq!(leaf_id.as_deref(), Some("n2"));
+                assert_eq!(rows.len(), 2);
+                assert!(rows[1].is_leaf);
+            }
+            other => panic!("{other:?}"),
+        }
+        // /session → Info 浮层 + stats 填充
+        app.editor.replace("/session");
+        assert!(crate::app::commands::dispatch(&mut app, &commander, &tx, "/session"));
+        let seq = match &app.overlay {
+            Some(Overlay::Info { loading, seq, .. }) => {
+                assert!(*loading);
+                *seq
+            }
+            other => panic!("未打开 info: {other:?}"),
+        };
+        app.handle_async_data(
+            AsyncKind::Stats,
+            seq,
+            &serde_json::json!({
+                "sessionId": "abc123",
+                "userMessages": 3, "assistantMessages": 4, "toolCalls": 5,
+                "totalMessages": 12,
+                "tokens": {"total": 9876},
+                "cost": 0.042
+            }),
+        );
+        match &app.overlay {
+            Some(Overlay::Info { lines, loading, .. }) => {
+                assert!(!*loading);
+                let joined = lines.join("\n");
+                assert!(joined.contains("abc123"), "{joined}");
+                assert!(joined.contains("9876"), "{joined}");
+                assert!(joined.contains("$0.042"), "{joined}");
+                assert!(joined.contains("3 用户"), "{joined}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tree_and_info_overlays_close_on_esc() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (client, dir) = test_commander();
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+        crate::app::commands::dispatch(&mut app, &commander, &tx, "/tree");
+        assert!(app.overlay.is_some());
+        app.handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &commander,
+            &tx,
+        );
+        // loading 中 Esc 也应关闭（overlay_key Info/Tree 的 Esc 臂）
+        assert!(app.overlay.is_none(), "Esc 关闭树浮层");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_delete_two_stage_resets_confirming() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (client, dir) = test_commander();
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        // 打开选择器并填充一项
+        crate::app::commands::dispatch(&mut app, &commander, &tx, "/resume");
+        let seq = match &app.overlay {
+            Some(Overlay::SessionSelect { seq, .. }) => *seq,
+            other => panic!("{other:?}"),
+        };
+        app.handle_async_data(
+            AsyncKind::SessionList,
+            seq,
+            &serde_json::json!({"sessions":[
+                {"path":"/nonexistent/deletable.jsonl","name":"victim","firstMessage":"","modifiedMs":1}
+            ]}),
+        );
+        let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+
+        // 第一次 ctrl+d → 确认态（不关窗、不删除）
+        app.handle_key(ctrl_d, &commander, &tx);
+        match &app.overlay {
+            Some(Overlay::SessionSelect { confirming, items, .. }) => {
+                assert!(*confirming, "进入确认态");
+                assert_eq!(items.len(), 1);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // 第二次 ctrl+d → Delete 臂执行：确认态复位、浮层保持（等异步刷新）
+        app.handle_key(ctrl_d, &commander, &tx);
+        match &app.overlay {
+            Some(Overlay::SessionSelect { confirming, .. }) => {
+                assert!(!*confirming, "Delete 后确认态复位");
+            }
+            other => panic!("浮层应保持: {other:?}"),
+        }
+
+        // 删除线程对不存在路径失败 → 稍后出现红色通知（路径校验失败）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut saw_fail = false;
+        while std::time::Instant::now() < deadline && !saw_fail {
+            if let Ok(UiEvent::SendFailed(msg)) =
+                _rx.recv_timeout(std::time::Duration::from_millis(200))
+            {
+                saw_fail = msg.contains("删除失败");
+            }
+        }
+        assert!(saw_fail, "不存在的路径删除应失败并通知");
+
+        // Esc 退出浮层
+        app.handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &commander,
+            &tx,
+        );
+        assert!(app.overlay.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compact_command_sends_and_clears_input() {
+        let (client, dir, log) = recording_commander("compact", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+        app.editor.replace("/compact make it tiny");
+        assert!(crate::app::commands::dispatch(&mut app, &commander, &tx, "/compact make it tiny"));
+        assert!(app.editor.is_empty());
+        let content = read_log_until(&log, "compact", 2000).expect("compact 应发出");
+        assert!(content.contains(r#""type":"compact""#), "{content}");
+        assert!(content.contains("make it tiny"), "customInstructions 透传: {content}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn submit_during_compaction_queues_locally() {
+        let (client, dir, log) = recording_commander("cqueue", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+        app.state.compacting = true;
+
+        app.editor.replace("wait for compact");
+        app.submit_as(&commander, &tx, "prompt");
+
+        // 本地排队：输入清空、队列可见、通知黄字
+        assert!(app.editor.is_empty());
+        assert_eq!(app.compact_queue, vec!["wait for compact".to_string()]);
+        let (text, color) = app.notice.clone().expect("排队通知");
+        assert!(text.contains("压缩进行中"), "{text}");
+        assert_eq!(color, Color::Yellow);
+
+        // 压缩结束边沿补发：每条 prompt 带 steeringBehavior=steer
+        app.state.compacting = false;
+        app.flush_compact_queue(&commander, &tx);
+        assert!(app.compact_queue.is_empty(), "补发后队列清空");
+        let content = read_log_until(&log, "steer", 2000).expect("补发应带 steer");
+        assert!(content.contains(r#""streamingBehavior":"steer""#), "{content}");
+        assert!(content.contains("wait for compact"), "{content}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compact_end_edge_without_queue_is_noop() {
+        let (client, dir, _log) = recording_commander("cempty", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+        app.flush_compact_queue(&commander, &tx); // 空队列不 panic、无副作用
+        assert!(app.compact_queue.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

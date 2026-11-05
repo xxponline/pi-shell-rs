@@ -93,6 +93,8 @@ pub struct SessionState {
     pub follow_up_queue: Vec<String>,
     pub usage: Option<Usage>,
     pub transcript: Vec<Entry>,
+    /// 手动压缩进行中（供上层拦截输入提交）。
+    pub compacting: bool,
 
     /// Current turn counter (incremented on turn_start; 0 before first turn).
     current_turn: usize,
@@ -111,6 +113,117 @@ impl SessionState {
     /// 输出: 全字段默认值的 SessionState
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 从 `get_messages` 响应快照整体重建 transcript（切换/fork/new 后调用）。
+    ///
+    /// 输入: data — get_messages 的 data 对象 {messages: [...]}；缺失按空数组处理
+    /// 输出: 无返回值；transcript 被整体替换，phase=Idle、inflight/队列/
+    ///       compacting/usage 清空；system 与无法解析的消息跳过，不 panic
+    pub fn load_messages(&mut self, data: &Value) {
+        let empty = Vec::new();
+        let msgs = data
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .unwrap_or(&empty);
+
+        let mut new_transcript: Vec<Entry> = Vec::new();
+        let mut turn = 0usize;
+        for msg in msgs {
+            match msg.get("role").and_then(|r| r.as_str()) {
+                Some("user") => {
+                    if let Some(text) = extract_user_text(msg) {
+                        new_transcript.push(Entry::User { text });
+                    }
+                }
+                Some("assistant") => {
+                    let content = msg
+                        .get("content")
+                        .and_then(|c| c.as_array())
+                        .map(|c| c.as_slice())
+                        .unwrap_or(&[]);
+                    let blocks = Self::blocks_from_content(content);
+                    let error = msg
+                        .get("errorMessage")
+                        .and_then(|e| e.as_str())
+                        .filter(|e| !e.is_empty());
+                    if !blocks.is_empty() {
+                        turn += 1;
+                        new_transcript.push(Entry::Assistant {
+                            turn,
+                            blocks,
+                            usage: None,
+                        });
+                    } else if let Some(err) = error {
+                        // 空 content 但带错误（与事件路径一致：只出 error 通知）
+                        new_transcript.push(Entry::Notice {
+                            kind: "error".to_string(),
+                            text: err.to_string(),
+                        });
+                        continue;
+                    } else {
+                        continue; // 无可显示内容的空消息跳过
+                    }
+                    if let Some(err) = error {
+                        new_transcript.push(Entry::Notice {
+                            kind: "error".to_string(),
+                            text: err.to_string(),
+                        });
+                    }
+                }
+                Some("toolResult") => {
+                    Self::merge_tool_result_message(&mut new_transcript, msg);
+                }
+                _ => {} // system 及其它类型跳过
+            }
+        }
+
+        self.transcript = new_transcript;
+        self.phase = Phase::Idle;
+        self.inflight.clear();
+        self.inflight_appended = false;
+        self.pending_tools.clear();
+        self.steering_queue.clear();
+        self.follow_up_queue.clear();
+        self.compacting = false;
+        self.usage = None;
+        self.current_turn = turn;
+    }
+
+    /// 把一条 toolResult 消息并入最近的含同 id ToolCall 的 assistant 条目。
+    ///
+    /// 输入: transcript — 目标条目列表（就地修改）；msg — toolResult 消息
+    /// 输出: 无返回值；找不到对应 ToolCall 时跳过
+    fn merge_tool_result_message(transcript: &mut [Entry], msg: &Value) {
+        let Some(id) = msg.get("toolCallId").and_then(|i| i.as_str()) else {
+            return;
+        };
+        let mut result_obj = serde_json::Map::new();
+        for key in ["content", "structuredContent", "details"] {
+            if let Some(v) = msg.get(key) {
+                result_obj.insert(key.to_string(), v.clone());
+            }
+        }
+        let exec = crate::session::blocks::ToolExecution {
+            status: crate::session::blocks::ToolStatus::Ended,
+            is_error: msg.get("isError").and_then(|b| b.as_bool()).unwrap_or(false),
+            result: Some(Value::Object(result_obj)),
+            duration_ms: msg.get("durationMs").and_then(|d| d.as_u64()),
+        };
+        for entry in transcript.iter_mut().rev() {
+            if let Entry::Assistant { blocks, .. } = entry {
+                for b in blocks.iter_mut() {
+                    if let Block::ToolCall {
+                        id: bid, tool, ..
+                    } = b
+                        && bid == id
+                    {
+                        *tool = merge_tool(&exec, std::mem::take(tool));
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     /// 把 `get_state` 响应（RpcSessionState）应用到状态。
@@ -242,9 +355,49 @@ impl SessionState {
                     text,
                 });
             }
+            // 手动压缩：置标志 + 通知（上层据此拦截输入提交）。
+            "compaction_start" => {
+                self.compacting = true;
+                self.transcript.push(Entry::Notice {
+                    kind: "compaction".to_string(),
+                    text: "压缩进行中…".to_string(),
+                });
+            }
+            "compaction_end" => {
+                self.compacting = false;
+                let aborted = event
+                    .get("aborted")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false);
+                let err = event.get("errorMessage").and_then(|x| x.as_str());
+                let result = event.get("result");
+                let (kind, text) = if let Some(e) = err.filter(|e| !e.is_empty()) {
+                    ("error", format!("压缩失败: {}", summarize(e)))
+                } else if aborted {
+                    ("compaction", "压缩已中止".to_string())
+                } else {
+                    let before = result
+                        .and_then(|r| r.get("tokensBefore"))
+                        .and_then(|x| x.as_u64());
+                    let after = result
+                        .and_then(|r| r.get("estimatedTokensAfter"))
+                        .and_then(|x| x.as_u64());
+                    (
+                        "compaction",
+                        match (before, after) {
+                            (Some(b), Some(a)) => format!("压缩完成: {b} → {a} tokens"),
+                            (Some(b), None) => format!("压缩完成: {b} tokens 起始"),
+                            _ => "压缩完成".to_string(),
+                        },
+                    )
+                };
+                self.transcript.push(Entry::Notice {
+                    kind: kind.to_string(),
+                    text,
+                });
+            }
             // Captured but not modeled in depth this phase:
-            "compaction_start" | "compaction_end"
-            | "summarization_retry_scheduled"
+            "summarization_retry_scheduled"
             | "summarization_retry_attempt_start" | "summarization_retry_finished"
             | "entry_appended" | "bash_execution_update" | "agent_end" => {}
             _ => {}
@@ -486,10 +639,11 @@ impl SessionState {
         }
     }
 
-    fn replace_inflight_from_message(&mut self, message: &Value) {
-        let Some(content) = message.get("content").and_then(|c| c.as_array()) else {
-            return;
-        };
+    /// 从消息 content 数组解析 assistant 内容块（text/thinking/toolCall）。
+    ///
+    /// 输入: content — 消息 content 数组（可为空切片）
+    /// 输出: 解析出的块序列；toolCall 的执行状态为默认值（由调用方按 id 合并）
+    fn blocks_from_content(content: &[Value]) -> Vec<Block> {
         let mut blocks: Vec<Block> = Vec::new();
         for item in content {
             match item.get("type").and_then(|t| t.as_str()) {
@@ -524,30 +678,47 @@ impl SessionState {
                         Some(other) => other.to_string(),
                         None => String::new(),
                     };
-                    let tool = self
-                        .pending_tools
-                        .remove(&id)
-                        .or_else(|| {
-                            // Preserve execution already attached to inflight.
-                            self.inflight.iter().find_map(|b| match b {
-                                Block::ToolCall {
-                                    id: bid,
-                                    tool,
-                                    ..
-                                } if bid == &id => Some(tool.clone()),
-                                _ => None,
-                            })
-                        })
-                        .or_else(|| self.find_tool_in_transcript(&id))
-                        .unwrap_or_default();
                     blocks.push(Block::ToolCall {
                         id,
                         name,
                         args_json: args,
-                        tool,
+                        tool: crate::session::blocks::ToolExecution::default(),
                     });
                 }
                 _ => {}
+            }
+        }
+        blocks
+    }
+
+    /// 用权威消息整体重建 in-flight 块，并把已知的工具执行状态合并回来。
+    ///
+    /// 输入: message — 携带完整 content 的权威消息
+    /// 输出: 无返回值；替换 inflight 内容（工具执行按 id 合并 pending/既有状态）
+    fn replace_inflight_from_message(&mut self, message: &Value) {
+        let Some(content) = message.get("content").and_then(|c| c.as_array()) else {
+            return;
+        };
+        let mut blocks = Self::blocks_from_content(content);
+        for b in &mut blocks {
+            if let Block::ToolCall { id, tool, .. } = b {
+                // 执行状态按 id 找回：pending 暂存 → 旧 inflight 块（toolcall_start
+                // 后工具事件直接挂在其上）→ 已落盘 transcript 条目。
+                let existing = self
+                    .pending_tools
+                    .remove(id.as_str())
+                    .or_else(|| {
+                        self.inflight.iter().find_map(|old| match old {
+                            Block::ToolCall { id: oid, tool: t, .. } if oid == id => {
+                                Some(t.clone())
+                            }
+                            _ => None,
+                        })
+                    })
+                    .or_else(|| self.find_tool_in_transcript(id));
+                if let Some(exec) = existing {
+                    *tool = merge_tool(&exec, std::mem::take(tool));
+                }
             }
         }
         self.inflight = blocks;
@@ -1099,5 +1270,152 @@ mod tests {
         // model 只有 id 无 name → 退回 id
         s.apply_get_state(&json!({"model": {"id":"only-id"}}));
         assert_eq!(s.model.as_deref(), Some("only-id"));
+    }
+
+    #[test]
+    fn load_messages_rebuilds_full_conversation() {
+        let mut s = SessionState::new();
+        // 先有旧状态，验证被替换
+        s.handle(&json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"OLD"}]}}));
+        s.steering_queue.push("stale".into());
+
+        s.load_messages(&json!({"messages": [
+            {"role":"system","content":"sys"},
+            {"role":"user","content":[{"type":"text","text":"question"}]},
+            {"role":"assistant","content":[
+                {"type":"text","text":"let me check"},
+                {"type":"toolCall","id":"call_1","name":"read","arguments":{"path":"/x"}}
+            ]},
+            {"role":"toolResult","toolCallId":"call_1","isError":false,
+             "content":[{"type":"text","text":"file body"}],
+             "details":{"d":1},"durationMs":7},
+            {"role":"assistant","content":[{"type":"text","text":"the answer"}]}
+        ]}));
+
+        // 顺序：user → assistant(toolCall+结果) → assistant(text)
+        assert_eq!(s.entries().len(), 3, "{:?}", s.entries());
+        match &s.entries()[0] {
+            Entry::User { text } => assert_eq!(text, "question"),
+            other => panic!("{other:?}"),
+        }
+        match &s.entries()[1] {
+            Entry::Assistant { blocks, turn, .. } => {
+                assert_eq!(*turn, 1);
+                match &blocks[1] {
+                    Block::ToolCall { id, name, tool, .. } => {
+                        assert_eq!(id, "call_1");
+                        assert_eq!(name, "read");
+                        assert_eq!(tool.status, crate::session::blocks::ToolStatus::Ended);
+                        assert!(!tool.is_error);
+                        let r = tool.result.as_ref().expect("result");
+                        assert!(r.get("details").is_some(), "details 透传");
+                        assert_eq!(r.pointer("/content/0/text").and_then(|x| x.as_str()), Some("file body"));
+                    }
+                    other => panic!("{other:?}"),
+                }
+                assert!(blocks.iter().any(|b| matches!(b, Block::Text{text} if text=="let me check")));
+            }
+            other => panic!("{other:?}"),
+        }
+        match &s.entries()[2] {
+            Entry::Assistant { turn, blocks, .. } => {
+                assert_eq!(*turn, 2);
+                assert!(blocks.iter().any(|b| matches!(b, Block::Text{text} if text=="the answer")));
+            }
+            other => panic!("{other:?}"),
+        }
+        // 重建后状态复位
+        assert_eq!(s.phase, Phase::Idle);
+        assert!(s.steering_queue.is_empty(), "旧队列被清");
+        assert!(s.in_flight().is_empty());
+        assert!(!s.compacting);
+    }
+
+    #[test]
+    fn load_messages_tolerates_bad_and_empty_input() {
+        let mut s = SessionState::new();
+        s.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+        s.handle(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"x"}]}}));
+        assert!(!s.entries().is_empty());
+
+        // 空数组 → 清空
+        s.load_messages(&json!({"messages": []}));
+        assert!(s.entries().is_empty());
+
+        // 缺 messages 字段 → 按空处理，不 panic
+        s.load_messages(&json!({}));
+        assert!(s.entries().is_empty());
+
+        // 坏消息类型/缺 content → 跳过不 panic；空 content 带 error → 仅 error 通知
+        s.load_messages(&json!({"messages": [
+            {"role":"weird"},
+            {"role":"assistant"},
+            {"role":"assistant","content":"not-an-array"},
+            {"role":"assistant","content":[],"stopReason":"error","errorMessage":"400 bad"}
+        ]}));
+        let kinds: Vec<&str> = s.entries().iter().filter_map(|e| match e {
+            Entry::Notice { kind, .. } => Some(kind.as_str()),
+            _ => None,
+        }).collect();
+        assert_eq!(kinds, vec!["error"], "{:?}", s.entries());
+        // 无 error 的空 assistant 不产生条目
+        assert_eq!(
+            s.entries().iter().filter(|e| matches!(e, Entry::Assistant { .. })).count(),
+            0
+        );
+    }
+
+    #[test]
+    fn compaction_lifecycle_sets_flag_and_notices() {
+        let mut s = SessionState::new();
+        s.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+        s.handle(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}));
+        let msgs_before = s.entries().iter().filter(|e| matches!(e, Entry::Assistant { .. })).count();
+
+        s.handle(&json!({"type":"compaction_start","reason":"manual"}));
+        assert!(s.compacting, "start 置标志");
+        s.handle(&json!({"type":"compaction_end","reason":"manual","aborted":false,
+            "result":{"tokensBefore":5000,"estimatedTokensAfter":1200}}));
+        assert!(!s.compacting, "end 清标志");
+
+        let notices: Vec<(&str,&str)> = s.entries().iter().filter_map(|e| match e {
+            Entry::Notice { kind, text } => Some((kind.as_str(), text.as_str())),
+            _ => None,
+        }).collect();
+        assert_eq!(notices.len(), 2, "{:?}", s.entries());
+        assert_eq!(notices[0].0, "compaction");
+        assert!(notices[0].1.contains("进行中"), "{}", notices[0].1);
+        assert!(notices[1].1.contains("5000"), "{}", notices[1].1);
+        assert!(notices[1].1.contains("1200"), "{}", notices[1].1);
+        // phase 与消息不受影响
+        assert_eq!(s.phase, Phase::Idle);
+        let msgs_after = s.entries().iter().filter(|e| matches!(e, Entry::Assistant { .. })).count();
+        assert_eq!(msgs_before, msgs_after);
+    }
+
+    #[test]
+    fn compaction_failure_and_abort_notices() {
+        let mut s = SessionState::new();
+        s.handle(&json!({"type":"compaction_start","reason":"manual"}));
+        s.handle(&json!({"type":"compaction_end","reason":"manual","aborted":false,
+            "errorMessage":"Nothing to compact"}));
+        assert!(!s.compacting);
+        let last = s.entries().iter().rev().find_map(|e| match e {
+            Entry::Notice { kind, text } => Some((kind.as_str(), text.as_str())),
+            _ => None,
+        }).expect("failure notice");
+        assert_eq!(last.0, "error", "失败为 error 通知");
+        assert!(last.1.contains("Nothing to compact"), "{}", last.1);
+
+        // 中止（无 errorMessage）→ 中止通知，标志清除
+        let mut s2 = SessionState::new();
+        s2.handle(&json!({"type":"compaction_start","reason":"manual"}));
+        s2.handle(&json!({"type":"compaction_end","reason":"manual","aborted":true}));
+        assert!(!s2.compacting);
+        let last = s2.entries().iter().rev().find_map(|e| match e {
+            Entry::Notice { kind, text } => Some((kind.as_str(), text.as_str())),
+            _ => None,
+        }).expect("abort notice");
+        assert!(last.1.contains("中止"), "{}", last.1);
     }
 }

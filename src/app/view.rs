@@ -30,13 +30,17 @@ pub struct ViewUi<'a> {
     pub flags: RenderFlags,
     /// 当前浮层（最上层绘制）。
     pub overlay: Option<&'a crate::app::overlay::Overlay>,
+    /// 当前会话文件路径（选择器标记"当前"用）。
+    pub current_session: Option<&'a str>,
+    /// compaction 期间本地排队的提交（队列带显示）。
+    pub local_queue: &'a [String],
 }
 
 
 /// 从不可变状态渲染一帧（含浮层）。
 pub fn render(frame: &mut Frame, state: &SessionState, ui: &ViewUi<'_>) {
     let area = frame.area();
-    let queue = queue_lines(state);
+    let queue = queue_lines(state, ui.local_queue);
     let queue_h = queue.len() as u16;
     // widget 区含 TOP 边框/标题行，非空时多占 1 行。
     let widget_h = if ui.widget_lines.is_empty() {
@@ -93,12 +97,14 @@ pub fn render(frame: &mut Frame, state: &SessionState, ui: &ViewUi<'_>) {
             widget_lines: ui.widget_lines,
             flags: ui.flags,
             overlay: ui.overlay,
+            current_session: ui.current_session,
+            local_queue: ui.local_queue,
         }
     };
     render_editor(frame, chunks[4], &editor_ui, state.phase);
 
     if let Some(overlay) = ui.overlay {
-        crate::app::overlay::render_overlay(frame, overlay);
+        crate::app::overlay::render_overlay(frame, overlay, ui.current_session);
     }
 }
 
@@ -106,8 +112,11 @@ pub fn render(frame: &mut Frame, state: &SessionState, ui: &ViewUi<'_>) {
 ///
 /// 输入: state — 含 steering_queue/follow_up_queue 的会话状态
 /// 输出: 空队列返回空 vec（不占布局行）
-fn queue_lines(state: &SessionState) -> Vec<Line<'static>> {
+fn queue_lines(state: &SessionState, local_queue: &[String]) -> Vec<Line<'static>> {
     let mut items: Vec<String> = Vec::new();
+    for text in local_queue {
+        items.push(format!("[queued] {text}"));
+    }
     for text in &state.steering_queue {
         items.push(format!("[steer] {text}"));
     }
@@ -117,13 +126,13 @@ fn queue_lines(state: &SessionState) -> Vec<Line<'static>> {
     if items.is_empty() {
         return Vec::new();
     }
+    let total = items.len();
     let max_lines = 2;
     let mut lines: Vec<Line> = items
         .into_iter()
         .take(max_lines)
         .map(|t| Line::from(Span::raw(t)))
         .collect();
-    let total = state.steering_queue.len() + state.follow_up_queue.len();
     if total > max_lines {
         lines.push(Line::from(Span::styled(
             format!("… {} more", total - max_lines),
@@ -466,12 +475,12 @@ mod render_tests {
     fn queue_strip_empty_single_and_overflow() {
         // 空队列 → 无行
         let empty = SessionState::new();
-        assert!(queue_lines(&empty).is_empty());
+        assert!(queue_lines(&empty, &[]).is_empty());
 
         // 单条 follow_up → 1 行，带 [queue] 前缀
         let mut one = SessionState::new();
         one.follow_up_queue.push("next question".into());
-        let lines = queue_lines(&one);
+        let lines = queue_lines(&one, &[]);
         assert_eq!(lines.len(), 1);
         let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("[queue] next question"), "{text}");
@@ -482,7 +491,7 @@ mod render_tests {
         many.follow_up_queue.push("f1".into());
         many.follow_up_queue.push("f2".into());
         many.follow_up_queue.push("f3".into());
-        let lines = queue_lines(&many);
+        let lines = queue_lines(&many, &[]);
         assert_eq!(lines.len(), 3, "2 行内容 + 1 行 more");
         let last: String = lines[2].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(last.contains("… 2 more"), "{last}");
@@ -684,5 +693,88 @@ mod render_tests {
         let huge = (0..60).map(|i| format!("{i}{}", "字".repeat(200))).collect::<Vec<_>>().join("\n");
         let (buf, _) = render_with_input(&state, &huge, 60, Some((59, 100)), 40, 15);
         assert!(buf.contains("input ("), "输入框仍在");
+    }
+
+    #[test]
+    fn session_selector_renders_items_current_marker_and_confirm_title() {
+        use crate::app::overlay::Overlay;
+        use crate::app::sessions::SessionItem;
+        use std::path::PathBuf;
+        use std::time::SystemTime;
+        let overlay = Overlay::SessionSelect {
+            items: vec![
+                SessionItem {
+                    path: PathBuf::from("/s/cur.jsonl"),
+                    name: Some("当前会话".into()),
+                    first_message: String::new(),
+                    modified: Some(SystemTime::now()),
+                    cwd: String::new(),
+                },
+                SessionItem {
+                    path: PathBuf::from("/s/old.jsonl"),
+                    name: None,
+                    first_message: "第一次的提问内容预览".into(),
+                    modified: Some(
+                        SystemTime::now() - std::time::Duration::from_secs(7200),
+                    ),
+                    cwd: String::new(),
+                },
+            ],
+            cursor: 1,
+            loading: false,
+            seq: 1,
+            confirming: false,
+        };
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::app::overlay::render_overlay(frame, &overlay, Some("/s/cur.jsonl")))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+        }
+        // 双宽 CJK 在缓冲中占两格，断言前去空白（视觉上是连续的）
+        let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(flat.contains("Resume"), "标题");
+        assert!(flat.contains("当前会话"), "名称项");
+        assert!(flat.contains("第一次的提问内容预览"), "无名回退首条消息");
+        assert!(flat.contains("2小时前"), "相对时间");
+        assert!(flat.contains("•"), "当前会话标记");
+        assert!(flat.contains(">"), "光标行");
+
+        // 确认态标题变化
+        let confirming = Overlay::SessionSelect {
+            items: vec![SessionItem {
+                path: PathBuf::from("/s/x.jsonl"),
+                name: Some("x".into()),
+                first_message: String::new(),
+                modified: None,
+                cwd: String::new(),
+            }],
+            cursor: 0,
+            loading: false,
+            seq: 1,
+            confirming: true,
+        };
+        // 用全新 Terminal 渲染，避免两帧缓冲混合干扰断言
+        let backend2 = TestBackend::new(100, 30);
+        let mut terminal2 = Terminal::new(backend2).unwrap();
+        terminal2
+            .draw(|frame| crate::app::overlay::render_overlay(frame, &confirming, None))
+            .unwrap();
+        let buffer = terminal2.backend().buffer().clone();
+        let mut out2 = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                out2.push_str(buffer[(x, y)].symbol());
+            }
+        }
+        let flat2: String = out2.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(flat2.contains("确认删除"), "确认态标题: {flat2}");
+        assert!(flat2.contains("未知时间"), "modified=None 显示未知时间");
     }
 }

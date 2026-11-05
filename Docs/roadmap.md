@@ -203,7 +203,11 @@ model/session/tree/thinking 选择器，extension_ui 9 种 method，write/grep/f
 拆分进度（方案 A）：
 - **4a add-overlay-dialogs ✅**：overlay 框架 + model/thinking 选择器与模型循环 +
   extension UI 9 method + write/grep/find/ls 卡片
-- **4b 待立项**：session 选择器 / 会话树 / 新建·重命名·删除 / compact 流程
+- **4b add-session-management ✅**：斜杠设施 + 会话选择器/切换、会话树（导航·折叠·
+  过滤·fork）、新建/克隆/重命名/两段式删除、compact（含压缩期间本地排队补发）、
+  /session 信息面板、切换后状态重建（get_messages）
+- 剩余：树内搜索/标签编辑、pi 其余 17 个斜杠命令、双击 esc（#5）、bash 模式（#6）、
+  剪贴板/外部编辑器（#9）
 
 操作逻辑对齐 ✅（change `align-interaction-semantics`）：按
 [`pi-tui-interaction.md`](./pi-tui-interaction.md) 差异清单完成 #1/2/3/4/8/10——

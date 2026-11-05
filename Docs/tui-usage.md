@@ -23,6 +23,22 @@ cargo run                       # 默认运行 TUI（default-run）
 - 启动流程：进入 TUI → 拉起 `pi --mode rpc` → `get_state` 探活（15s）→
   进入界面。任何一步失败都会**恢复终端**后打印可读原因并以非零码退出。
 
+## 斜杠命令（本变更落地的子集）
+
+| 命令 | 行为 |
+|---|---|
+| `/resume` | 会话选择器：当前项目会话列表（名称或首条消息预览 + 相对时间），Enter 切换、ctrl+d 两段式删除、Esc 关闭 |
+| `/tree` | 会话树：↑↓ 导航、← 折叠 / → 展开、ctrl+o 过滤循环（default→no-tools→user-only→labeled-only→all）、Enter 分支到选中节点、Esc 关闭 |
+| `/new` | 新建会话（消息区清空） |
+| `/clone` | 克隆当前会话 |
+| `/fork` | 同 /tree（树内回车即分支；pi 的消息选择器简化为树） |
+| `/session` | 会话信息面板（名称/消息数/tokens/费用），Esc 关闭 |
+| `/name <名称>` | 重命名当前会话（无参显示用法） |
+| `/compact [指令]` | 手动压缩；**压缩期间输入本地排队**，压缩结束自动补发（带 steer） |
+| `/quit` | 退出 |
+
+未命中的 `/xxx` 作为普通消息照常发送（与 pi 一致）。
+
 ## 界面布局
 
 ```
@@ -73,6 +89,8 @@ cargo run                       # 默认运行 TUI（default-run）
 | Esc（流式中） | 发送 abort **并恢复排队消息到输入框**，回到空闲 |
 | Esc（空闲） | **无操作**（不退出、不清空——对齐 pi） |
 | Ctrl+T | 切换 thinking 块展开/折叠（默认折叠为单行占位） |
+| /resume·/tree 内 ctrl+d | 会话两段式删除（再按一次确认；拒绝删除活跃会话） |
+| /tree 内 ctrl+o / ←→ | 过滤模式循环 / 折叠展开子树 |
 | Ctrl+O | 切换工具卡片输出展开/折叠（默认显示头行+前 3 行） |
 | Ctrl+L | 打开模型选择器（↑/↓ 导航，Enter 应用，Esc 取消） |
 | Ctrl+P / Shift+Ctrl+P | 循环切换模型（下一个 / 上一个） |
@@ -99,6 +117,10 @@ cargo run                       # 默认运行 TUI（default-run）
 - 扩展 `editor` 弹层为终端内最小多行编辑（Enter 提交 / Alt+Enter 换行），
   不含 pi 编辑器的 kill-ring/undo/外部 $EDITOR（Ctrl+G）等高级能力。
 - 选择器暂无输入即筛（fuzzy filter），靠 ↑/↓ 导航。
+- 斜杠命令仅落地本表所列子集（pi 另有 /settings /export /share /bug /login
+  /model /thinking 等 17 个，随后续变更）；树内搜索/标签编辑/复制未实现。
+- thinking 列表用 **alt+t** 打开（pi 走 `/thinking` 斜杠命令，我们暂无该命令）；
+  会话列表仅当前项目（pi 的 listAll 双列表未实现）。
 - **Shift+Enter / Ctrl+- 依赖 kitty 键盘协议**（启动时探测，最多 2s；不支持的
   终端上换行请用 Ctrl+J，undo 无替代键）。
 - 输入区超长单行按水平滚动显示（不视觉换行）；无输入历史/自动补全
