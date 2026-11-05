@@ -23,21 +23,25 @@ cargo run                       # 默认运行 TUI（default-run）
 - 启动流程：进入 TUI → 拉起 `pi --mode rpc` → `get_state` 探活（15s）→
   进入界面。任何一步失败都会**恢复终端**后打印可读原因并以非零码退出。
 
-## 斜杠命令（本变更落地的子集）
+## 斜杠命令（24 个全部可用）
 
-| 命令 | 行为 |
-|---|---|
-| `/resume` | 会话选择器：当前项目会话列表（名称或首条消息预览 + 相对时间），Enter 切换、ctrl+d 两段式删除、Esc 关闭 |
-| `/tree` | 会话树：↑↓ 导航、← 折叠 / → 展开、ctrl+o 过滤循环（default→no-tools→user-only→labeled-only→all）、Enter 分支到选中节点、Esc 关闭 |
-| `/new` | 新建会话（消息区清空） |
-| `/clone` | 克隆当前会话 |
-| `/fork` | 同 /tree（树内回车即分支；pi 的消息选择器简化为树） |
-| `/session` | 会话信息面板（名称/消息数/tokens/费用），Esc 关闭 |
-| `/name <名称>` | 重命名当前会话（无参显示用法） |
-| `/compact [指令]` | 手动压缩；**压缩期间输入本地排队**，压缩结束自动补发（带 steer） |
-| `/quit` | 退出 |
+完整命令表、每个命令的实现/简化/桩状态与差异原因见
+[`slash-commands.md`](./slash-commands.md)。要点：
 
-未命中的 `/xxx` 作为普通消息照常发送（与 pi 一致）。
+- 会话类：`/resume`（选择器+两段式删除）· `/tree`（导航/折叠/过滤/分支）·
+  `/new` · `/clone` · `/fork` · `/session` · `/name` · `/compact`（压缩中本地排队）·
+  `/quit`
+- 选择器入口：`/model [搜索]`（精确匹配直切）· `/thinking [级别]`（未知级别红条）
+- 信息与文件：`/copy`（OSC52）· `/changelog` · `/hotkeys` · `/export` · `/import`（确认后导入并切换）
+- 设置类：`/settings`（简化：两开关）· `/scoped-models`（只读）· `/trust` · `/reload`
+- 🚫 提示桩：`/share` `/bug`（网络上报）· `/login` `/logout`（不做交互式登录，靠预登录）
+- 未命中的 `/xxx` 作为普通消息照常发送（与 pi 一致）
+
+### 补全菜单
+
+输入行首 `/` 即弹出候选：模糊过滤（说明列 = `参数提示 — 说明`）、↑↓/PageUp/PageDown
+导航、Tab 应用、**Enter 补全并立即提交**、Esc 只关菜单；`/model `/`/thinking `
+空格后有参数候选。最多 5 条，超出显示 `(i/n)` 滚动。
 
 ## 界面布局
 
@@ -112,15 +116,14 @@ cargo run                       # 默认运行 TUI（default-run）
 - Windows 键位差异（pi 在 Windows 用 ctrl+q 等）未做平台分支——当前只按
   macOS 键位实现。
 - 工具卡片覆盖 read/bash/edit/write/grep/find/ls（其余走通用卡片兜底）。
-- **Alt+T 打开 thinking 列表**是我们自选的键（原生 pi 走 `/thinking` 斜杠命令，
-  我们暂无斜杠命令基础设施）；级别循环 Shift+Tab 与 pi 一致。
+- **Alt+T 打开 thinking 列表**与 `/thinking` 斜杠命令**都可用**（两者等价，
+  pi 原生只有后者）；级别循环 Shift+Tab 与 pi 一致。
 - 扩展 `editor` 弹层为终端内最小多行编辑（Enter 提交 / Alt+Enter 换行），
   不含 pi 编辑器的 kill-ring/undo/外部 $EDITOR（Ctrl+G）等高级能力。
 - 选择器暂无输入即筛（fuzzy filter），靠 ↑/↓ 导航。
-- 斜杠命令仅落地本表所列子集（pi 另有 /settings /export /share /bug /login
-  /model /thinking 等 17 个，随后续变更）；树内搜索/标签编辑/复制未实现。
-- thinking 列表用 **alt+t** 打开（pi 走 `/thinking` 斜杠命令，我们暂无该命令）；
-  会话列表仅当前项目（pi 的 listAll 双列表未实现）。
+- 斜杠命令 24 个全部可执行（实现/简化/桩见 `slash-commands.md`）；树内搜索/
+  标签编辑未实现；`@文件`/路径补全未实现（pi 的 fd 集成）。
+- 会话列表仅当前项目（pi 的 listAll 双列表未实现）。
 - **Shift+Enter / Ctrl+- 依赖 kitty 键盘协议**（启动时探测，最多 2s；不支持的
   终端上换行请用 Ctrl+J，undo 无替代键）。
 - 输入区超长单行按水平滚动显示（不视觉换行）；无输入历史/自动补全

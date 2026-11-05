@@ -34,6 +34,8 @@ pub struct ViewUi<'a> {
     pub current_session: Option<&'a str>,
     /// compaction 期间本地排队的提交（队列带显示）。
     pub local_queue: &'a [String],
+    /// 斜杠补全菜单（Some=打开，渲染于输入框下方）。
+    pub completion: Option<&'a crate::app::autocomplete::CompletionState>,
 }
 
 
@@ -49,6 +51,7 @@ pub fn render(frame: &mut Frame, state: &SessionState, ui: &ViewUi<'_>) {
         ui.widget_lines.len() as u16 + 1
     };
     let editor_h = editor_height(ui.input_lines.max(1));
+    let completion_h = ui.completion.map(completion_height).unwrap_or(0);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -57,6 +60,7 @@ pub fn render(frame: &mut Frame, state: &SessionState, ui: &ViewUi<'_>) {
             Constraint::Length(queue_h),      // queue strip（空队列不占行）
             Constraint::Length(widget_h),     // extension widget（未设置不占行）
             Constraint::Length(editor_h),     // input（随行数增长，上限 8）
+            Constraint::Length(completion_h), // 斜杠补全菜单（关闭时 0）
         ])
         .split(area);
 
@@ -99,9 +103,13 @@ pub fn render(frame: &mut Frame, state: &SessionState, ui: &ViewUi<'_>) {
             overlay: ui.overlay,
             current_session: ui.current_session,
             local_queue: ui.local_queue,
+            completion: ui.completion,
         }
     };
     render_editor(frame, chunks[4], &editor_ui, state.phase);
+    if let (Some(comp), Some(area)) = (ui.completion, chunks.get(5)) {
+        render_completion(frame, *area, comp);
+    }
 
     if let Some(overlay) = ui.overlay {
         crate::app::overlay::render_overlay(frame, overlay, ui.current_session);
@@ -261,6 +269,70 @@ fn render_chat(
 /// 输出: 输入框总高度（含上下边框）
 fn editor_height(lines: usize) -> u16 {
     (lines as u16 + 2).clamp(3, 8)
+}
+
+/// 补全菜单同时可见上限（对齐 pi autocompleteMaxVisible 默认 5）。
+const COMPLETION_MAX_VISIBLE: usize = 5;
+
+/// 补全菜单占高：可见条目 + 超限时的 `(i/n)` 计数行。
+///
+/// 输入: comp — 补全状态（打开时有候选）
+/// 输出: 菜单行数（关闭/空候选为 0）
+fn completion_height(comp: &crate::app::autocomplete::CompletionState) -> u16 {
+    if !comp.open || comp.items.is_empty() {
+        return 0;
+    }
+    let shown = comp.items.len().min(COMPLETION_MAX_VISIBLE);
+    let count = usize::from(comp.items.len() > COMPLETION_MAX_VISIBLE);
+    (shown + count) as u16
+}
+
+/// 渲染补全菜单（输入框正下方）：滚动窗口保证选中可见、选中行高亮、
+/// 描述列弱化、超限显示 `(当前/总数)` 计数（spec：菜单渲染与预选）。
+///
+/// 输入: frame — ratatui 帧；area — 菜单区域；comp — 补全状态
+/// 输出: 无返回值；副作用为绘制菜单
+fn render_completion(frame: &mut Frame, area: ratatui::layout::Rect, comp: &crate::app::autocomplete::CompletionState) {
+    let total = comp.items.len();
+    if !comp.open || total == 0 || area.height == 0 {
+        return;
+    }
+    let max = COMPLETION_MAX_VISIBLE.min(area.height as usize);
+    // 滚动窗口：选中项始终可见（靠近底部时上移窗口）
+    let start = comp.selected.saturating_sub(max - 1).min(total.saturating_sub(max));
+    let width = area.width as usize;
+    let name_w = 15; // scoped-models(13)+2 对齐列
+    let mut lines: Vec<Line> = Vec::new();
+    for (offset, item) in comp.items[start..].iter().take(max).enumerate() {
+        let idx = start + offset;
+        let selected = idx == comp.selected;
+        let base = if selected {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::default()
+        };
+        let name = format!("{:<name_w$}", item.value, name_w = name_w);
+        let mut spans = vec![Span::styled(name, base)];
+        if let Some(desc) = &item.description {
+            let room = width.saturating_sub(name_w + 1);
+            if room > 0 {
+                let desc_style = if selected {
+                    base
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                spans.push(Span::styled(truncate(desc, room), desc_style));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    if total > max {
+        lines.push(Line::from(Span::styled(
+            format!(" ({}/{})", comp.selected + 1, total),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// 渲染输入框：多行文本 + 滚动偏移（保证光标可见）+ 终端光标定位。
@@ -776,5 +848,112 @@ mod render_tests {
         let flat2: String = out2.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(flat2.contains("确认删除"), "确认态标题: {flat2}");
         assert!(flat2.contains("未知时间"), "modified=None 显示未知时间");
+    }
+
+    // ── 斜杠补全菜单渲染（spec：菜单渲染与最佳匹配预选） ──
+
+    /// 造一个打开的补全菜单（前 n 个命令，选中指定项）。
+    fn open_completion(selected: usize) -> crate::app::autocomplete::CompletionState {
+        let items = crate::app::commands::COMMANDS
+            .iter()
+            .map(|c| crate::app::autocomplete::CompletionItem {
+                value: c.name.to_string(),
+                label: c.name.to_string(),
+                description: Some(c.description.to_string()),
+            })
+            .collect();
+        crate::app::autocomplete::CompletionState {
+            open: true,
+            prefix: "/".into(),
+            items,
+            selected,
+            kind: Some(crate::app::autocomplete::CompletionKind::Command),
+        }
+    }
+
+    /// 渲染带补全菜单的一帧，返回缓冲文本。
+    fn render_with_completion(comp: &crate::app::autocomplete::CompletionState, w: u16, h: u16) -> String {
+        let state = SessionState::new();
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let ui = ViewUi {
+                    input: "/",
+                    input_cursor: Some((0, 1)),
+                    completion: Some(comp),
+                    ..ViewUi::default()
+                };
+                render(frame, &state, &ui);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn completion_height_matches_visible_plus_count() {
+        let mut comp = open_completion(0);
+        assert_eq!(completion_height(&comp), 6, "24 条 = 5 可见 + 1 计数");
+        comp.open = false;
+        assert_eq!(completion_height(&comp), 0, "关闭不占行");
+        comp.open = true;
+        comp.items.truncate(3);
+        assert_eq!(completion_height(&comp), 3, "3 条全显");
+        comp.items.clear();
+        assert_eq!(completion_height(&comp), 0, "空候选不占行");
+    }
+
+    #[test]
+    fn completion_renders_items_count_and_highlight() {
+        let comp = open_completion(0); // 选中 settings（首项）
+        let buf = render_with_completion(&comp, 80, 30);
+        let menu_row = buf
+            .lines()
+            .position(|l| l.contains("Open settings menu"))
+            .expect("应渲染首项说明");
+        assert!(buf.contains("(1/24)"), "超限应有计数行:\n{buf}");
+
+        // 选中行高亮：取该行首列单元格背景色（Cyan）
+        let backend = TestBackend::new(80, 30);
+        let _ = backend;
+        // 用带样式的缓冲重新取色
+        let state = SessionState::new();
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        terminal
+            .draw(|frame| {
+                let ui = ViewUi {
+                    input: "/",
+                    input_cursor: Some((0, 1)),
+                    completion: Some(&comp),
+                    ..ViewUi::default()
+                };
+                render(frame, &state, &ui);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let cell = &buffer[(0, menu_row as u16)];
+        assert_eq!(
+            cell.style().bg,
+            Some(Color::Cyan),
+            "选中行应有青色高亮背景"
+        );
+    }
+
+    #[test]
+    fn completion_scrolls_window_around_selection() {
+        // 选中第 11 项（下标 10）→ 窗口应上移到显示下标 6..10 的尾部窗口
+        let comp = open_completion(10);
+        let buf = render_with_completion(&comp, 100, 30);
+        assert!(buf.contains("import"), "窗口尾部应含下标 6 的 import:\n{buf}");
+        assert!(!buf.contains("settings"), "首项已滚出窗口: {buf}");
+        assert!(buf.contains("(11/24)"), "计数应反映选中项: {buf}");
     }
 }

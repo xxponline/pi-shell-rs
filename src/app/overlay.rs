@@ -68,6 +68,39 @@ pub enum Overlay {
         loading: bool,
         seq: u64,
     },
+    /// /import 二次确认（目标路径 + 光标行：0=导入 1=取消）。
+    ImportConfirm {
+        path: String,
+        cursor: usize,
+    },
+    /// 只读模型范围浮层（/scoped-models；无写入能力）。
+    ScopedModels {
+        models: Vec<String>,
+        loading: bool,
+        seq: u64,
+        cursor: usize,
+    },
+    /// 简化设置浮层（/settings；两开关 + 只读行）。
+    Settings {
+        cursor: usize,
+        loading: bool,
+        seq: u64,
+        /// autoCompact 开关（get_state 回填）。
+        auto_compaction: Option<bool>,
+        /// autoRetry 开关（RPC 无 getter，首次显示 —，切换后本地跟踪）。
+        auto_retry: Option<bool>,
+        /// 当前模型（只读）。
+        model: Option<String>,
+    },
+    /// 信任决策浮层（/trust；current=当前 cwd 的信任记录）。
+    Trust {
+        cursor: usize,
+        current: Option<bool>,
+    },
+    /// 键位表浮层（/hotkeys；cursor 为滚动位置）。
+    Hotkeys {
+        cursor: usize,
+    },
     /// 扩展 select 请求。
     ExtSelect {
         id: String,
@@ -110,6 +143,8 @@ pub enum OverlayOutcome {
     Apply(usize),
     /// 会话选择器：对第 index 项执行删除（两段式确认的第二段）。
     Delete(usize),
+    /// 应用第 index 项但**不关闭浮层**（设置类反复切换）。
+    Toggle(usize),
 }
 
 /// 居中矩形：按百分比在给定区域内取中心块。
@@ -208,6 +243,83 @@ pub fn overlay_key(o: &mut Overlay, key: KeyEvent) -> OverlayOutcome {
                 _ => OverlayOutcome::Handled,
             }
         }
+        Overlay::ImportConfirm { cursor, .. } => match key.code {
+            KeyCode::Esc => OverlayOutcome::Close { reply: None },
+            KeyCode::Enter => OverlayOutcome::Apply(*cursor),
+            KeyCode::Up | KeyCode::Down => {
+                *cursor = 1 - *cursor;
+                OverlayOutcome::Handled
+            }
+            _ => OverlayOutcome::Handled,
+        },
+        Overlay::ScopedModels { cursor, loading, .. } => {
+            if *loading {
+                return match key.code {
+                    KeyCode::Esc => OverlayOutcome::Close { reply: None },
+                    _ => OverlayOutcome::Handled,
+                };
+            }
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => OverlayOutcome::Close { reply: None },
+                KeyCode::Up => {
+                    *cursor = cursor.saturating_sub(1);
+                    OverlayOutcome::Handled
+                }
+                KeyCode::Down => {
+                    *cursor = cursor.saturating_add(1);
+                    OverlayOutcome::Handled
+                }
+                _ => OverlayOutcome::Handled,
+            }
+        }
+        Overlay::Settings {
+            cursor, loading, ..
+        } => {
+            if *loading {
+                return match key.code {
+                    KeyCode::Esc => OverlayOutcome::Close { reply: None },
+                    _ => OverlayOutcome::Handled,
+                };
+            }
+            match key.code {
+                KeyCode::Esc => OverlayOutcome::Close { reply: None },
+                KeyCode::Up => {
+                    *cursor = cursor.saturating_sub(1);
+                    OverlayOutcome::Handled
+                }
+                KeyCode::Down => {
+                    *cursor = (*cursor + 1).min(1); // 两行可切换（模型行只读）
+                    OverlayOutcome::Handled
+                }
+                KeyCode::Enter => OverlayOutcome::Toggle(*cursor),
+                _ => OverlayOutcome::Handled,
+            }
+        }
+        Overlay::Trust { cursor, .. } => match key.code {
+            KeyCode::Esc => OverlayOutcome::Close { reply: None },
+            KeyCode::Enter => OverlayOutcome::Apply(*cursor),
+            KeyCode::Up => {
+                *cursor = cursor.saturating_sub(1);
+                OverlayOutcome::Handled
+            }
+            KeyCode::Down => {
+                *cursor = (*cursor + 1).min(2);
+                OverlayOutcome::Handled
+            }
+            _ => OverlayOutcome::Handled,
+        },
+        Overlay::Hotkeys { cursor } => match key.code {
+            KeyCode::Esc | KeyCode::Enter => OverlayOutcome::Close { reply: None },
+            KeyCode::Up => {
+                *cursor = cursor.saturating_sub(1);
+                OverlayOutcome::Handled
+            }
+            KeyCode::Down => {
+                *cursor = cursor.saturating_add(1);
+                OverlayOutcome::Handled
+            }
+            _ => OverlayOutcome::Handled,
+        },
         Overlay::Info { .. } => match key.code {
             KeyCode::Esc | KeyCode::Enter => OverlayOutcome::Close { reply: None },
             _ => OverlayOutcome::Handled,
@@ -513,6 +625,45 @@ fn cancelled_reply(id: &str) -> Value {
 ///
 /// 输入: frame — ratatui 帧；overlay — 浮层状态
 /// 输出: 无返回值；副作用为在帧最上层绘制
+/// 键位表数据：(分组标题, 键位, 说明)——分组行为 Some(标题)，普通行为 None。
+/// 对照当前实现的真实绑定（key_intent / edit_key / 补全菜单）。
+pub fn hotkeys_rows() -> Vec<(Option<&'static str>, &'static str, &'static str)> {
+    vec![
+        (Some("提交与中断"), "", ""),
+        (None, "enter", "发送（流式中发送排队消息）"),
+        (None, "alt+enter", "流式中排队 follow_up；空闲等同 enter"),
+        (None, "esc", "流式中止；浮层/补全菜单关闭"),
+        (None, "alt+up", "取回全部排队消息"),
+        (None, "ctrl+c", "单击清空输入；500ms 内双击退出"),
+        (None, "ctrl+d", "空输入退出；非空向后删字符"),
+        (Some("编辑（Emacs）"), "", ""),
+        (None, "shift+enter / ctrl+j", "换行"),
+        (None, "ctrl+b / ctrl+f", "光标左/右"),
+        (None, "ctrl+a / ctrl+e", "行首 / 行尾"),
+        (None, "alt+b / alt+f", "词左 / 词右"),
+        (None, "←→↑↓ / home / end", "光标移动"),
+        (None, "ctrl+w / alt+backspace", "删词（后向）"),
+        (None, "alt+d", "删词（前向）"),
+        (None, "ctrl+u / ctrl+k", "删至行首 / 行尾"),
+        (None, "ctrl+y / alt+y", "yank / yank-pop"),
+        (None, "ctrl+-", "撤销"),
+        (Some("会话与模型"), "", ""),
+        (None, "ctrl+l", "模型选择器"),
+        (None, "ctrl+p / shift+ctrl+p", "模型循环 下一个/上一个"),
+        (None, "alt+t", "thinking 级别选择器"),
+        (None, "shift+tab", "thinking 级别循环"),
+        (None, "ctrl+t", "thinking 块展开/折叠"),
+        (None, "ctrl+o", "工具输出展开/折叠"),
+        (Some("斜杠命令与补全"), "", ""),
+        (None, "/ + 输入", "弹出命令补全菜单"),
+        (None, "↑↓ / pageup / pagedown", "菜单导航"),
+        (None, "tab", "应用选中补全"),
+        (None, "enter", "补全并立即提交"),
+        (None, "esc", "只关菜单（不清输入）"),
+        (None, "命令一览", "/resume /tree /new /clone /session /compact /name /copy /export /import /changelog /hotkeys /settings /scoped-models /trust /reload /model /thinking /fork /quit（详见 Docs/slash-commands.md）"),
+    ]
+}
+
 pub fn render_overlay(frame: &mut Frame, overlay: &Overlay, current_session: Option<&str>) {
     let area = frame.area();
     match overlay {
@@ -577,6 +728,244 @@ pub fn render_overlay(frame: &mut Frame, overlay: &Overlay, current_session: Opt
                     .collect()
             };
             draw_list(frame, area, &title, lines, rows.len().min(16) as u16 + 2);
+        }
+        Overlay::ImportConfirm { path, cursor } => {
+            let name = std::path::Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone());
+            let options = ["✓ 导入并切换", "取消"];
+            let inner_h = options.len() as u16 + 2;
+            let width = (area.width.saturating_mul(60) / 100).max(46);
+            let rect = Rect {
+                x: area.x + area.width.saturating_sub(width) / 2,
+                y: area.y + area.height.saturating_sub(inner_h) / 2,
+                width,
+                height: inner_h,
+            };
+            frame.render_widget(Clear, rect);
+            let lines: Vec<Line> = options
+                .iter()
+                .enumerate()
+                .map(|(i, opt)| {
+                    let style = if i == *cursor {
+                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                    } else {
+                        Style::default()
+                    };
+                    Line::from(Span::styled(format!("  {opt}"), style))
+                })
+                .collect();
+            frame.render_widget(
+                Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(format!(
+                    " Import {name}（替换当前会话） "
+                ))),
+                rect,
+            );
+        }
+        Overlay::ScopedModels {
+            models,
+            loading,
+            cursor,
+            ..
+        } => {
+            let mut rows: Vec<Line> = Vec::new();
+            if *loading {
+                rows.push(Line::from(Span::styled(
+                    "loading…",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else if models.is_empty() {
+                rows.push(Line::from(Span::styled(
+                    "(无可用模型)",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else {
+                rows.push(Line::from(Span::styled(
+                    "当前会话模型见状态行；本列表只读（写入需 pi /settings，本 TUI 未实现）",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                for (i, m) in models.iter().enumerate() {
+                    let selected = i == *cursor;
+                    let style = if selected {
+                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                    } else {
+                        Style::default()
+                    };
+                    rows.push(Line::from(Span::styled(format!("  {m}"), style)));
+                }
+            }
+            let inner_h = (rows.len() as u16 + 2)
+                .min(area.height.saturating_sub(2))
+                .max(6);
+            let width = (area.width.saturating_mul(60) / 100).max(44);
+            let rect = Rect {
+                x: area.x + area.width.saturating_sub(width) / 2,
+                y: area.y + area.height.saturating_sub(inner_h) / 2,
+                width,
+                height: inner_h,
+            };
+            frame.render_widget(Clear, rect);
+            frame.render_widget(
+                Paragraph::new(rows).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Scoped Models（只读） "),
+                ),
+                rect,
+            );
+        }
+        Overlay::Settings {
+            cursor,
+            loading,
+            auto_compaction,
+            auto_retry,
+            model,
+            ..
+        } => {
+            let rows: Vec<Line> = if *loading {
+                vec![Line::from(Span::styled(
+                    "loading…",
+                    Style::default().fg(Color::DarkGray),
+                ))]
+            } else {
+                let onoff = |v: &Option<bool>| match v {
+                    Some(true) => "on".to_string(),
+                    Some(false) => "off".to_string(),
+                    None => "—".to_string(),
+                };
+                vec![
+                    Line::from(Span::styled(
+                        format!("  autoCompact        {}", onoff(auto_compaction)),
+                        if *cursor == 0 {
+                            Style::default().fg(Color::Black).bg(Color::Cyan)
+                        } else {
+                            Style::default()
+                        },
+                    )),
+                    Line::from(Span::styled(
+                        format!("  autoRetry          {}", onoff(auto_retry)),
+                        if *cursor == 1 {
+                            Style::default().fg(Color::Black).bg(Color::Cyan)
+                        } else {
+                            Style::default()
+                        },
+                    )),
+                    Line::from(Span::styled(
+                        format!(
+                            "  model              {}",
+                            model.as_deref().unwrap_or("—")
+                        ),
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                    Line::from(Span::styled(
+                        "  enter 切换开关 · esc 关闭（简化版，详见 Docs/slash-commands.md）",
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                ]
+            };
+            let inner_h = (rows.len() as u16 + 2).max(5);
+            let width = (area.width.saturating_mul(70) / 100).max(50);
+            let rect = Rect {
+                x: area.x + area.width.saturating_sub(width) / 2,
+                y: area.y + area.height.saturating_sub(inner_h) / 2,
+                width,
+                height: inner_h,
+            };
+            frame.render_widget(Clear, rect);
+            frame.render_widget(
+                Paragraph::new(rows).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Settings（简化） "),
+                ),
+                rect,
+            );
+        }
+        Overlay::Trust { cursor, current } => {
+            let state = match current {
+                Some(true) => "已信任",
+                Some(false) => "已拒绝",
+                None => "未记录",
+            };
+            let options = ["✓ 信任本项目", "× 清除信任记录", "Esc 关闭"];
+            let inner_h = (options.len() as u16 + 2).max(5);
+            let width = (area.width.saturating_mul(50) / 100).max(34);
+            let rect = Rect {
+                x: area.x + area.width.saturating_sub(width) / 2,
+                y: area.y + area.height.saturating_sub(inner_h) / 2,
+                width,
+                height: inner_h,
+            };
+            frame.render_widget(Clear, rect);
+            let lines: Vec<Line> = options
+                .iter()
+                .enumerate()
+                .map(|(i, opt)| {
+                    let selected = i == *cursor && i < 2;
+                    let style = if selected {
+                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                    } else if i == 2 {
+                        Style::default().fg(Color::DarkGray)
+                    } else {
+                        Style::default()
+                    };
+                    Line::from(Span::styled(format!("  {opt}"), style))
+                })
+                .collect();
+            frame.render_widget(
+                Paragraph::new(lines).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(" Trust（当前: {state}） ")),
+                ),
+                rect,
+            );
+        }
+        Overlay::Hotkeys { cursor } => {
+            let rows = hotkeys_rows();
+            let inner_h = (rows.len() as u16 + 3)
+                .min(area.height.saturating_sub(2))
+                .max(6);
+            let width = area.width.saturating_mul(80) / 100;
+            let rect = Rect {
+                x: area.x + area.width.saturating_sub(width) / 2,
+                y: area.y + area.height.saturating_sub(inner_h) / 2,
+                width,
+                height: inner_h,
+            };
+            frame.render_widget(Clear, rect);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(" Hotkeys  ↑↓ 滚动 ");
+            // 滚动窗口（选中行可见）+ 高亮
+            let visible_h = rect.height.saturating_sub(2) as usize;
+            let start = cursor.saturating_sub(visible_h.saturating_sub(1))
+                .min(rows.len().saturating_sub(visible_h));
+            let lines: Vec<Line> = rows[start..]
+                .iter()
+                .take(visible_h)
+                .enumerate()
+                .map(|(i, (group, key, desc))| {
+                    let selected = start + i == *cursor;
+                    let style = if selected {
+                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                    } else if group.is_some() {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default()
+                    };
+                    let text = match group {
+                        Some(g) => format!("── {g} ──"),
+                        None => format!("  {key:<16}{desc}"),
+                    };
+                    Line::from(Span::styled(text, style))
+                })
+                .collect();
+            frame.render_widget(
+                Paragraph::new(lines).block(block),
+                rect,
+            );
         }
         Overlay::Info {
             title,

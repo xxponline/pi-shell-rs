@@ -124,6 +124,20 @@ impl EditorBuffer {
 
     // ---------- 内容编辑（入 undo） ----------
 
+    /// 用新文本替换指定行并设置光标（补全应用等整行改写）。
+    ///
+    /// 输入: row — 行号；text — 新行内容；cursor_col — 新光标字符下标（夹取）
+    /// 输出: 无返回值；副作用为快照、改行、移光标
+    pub fn set_line(&mut self, row: usize, text: String, cursor_col: usize) {
+        if row >= self.lines.len() {
+            return;
+        }
+        self.push_undo();
+        self.lines[row] = text;
+        self.col = cursor_col.min(self.lines[row].chars().count());
+        self.after_yank = false;
+    }
+
     /// 在光标处插入一个字符。
     ///
     /// 输入: c — 待插入字符

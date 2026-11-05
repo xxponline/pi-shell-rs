@@ -4,6 +4,7 @@
 //! channel, reduces RPC events into a [`SessionState`], and renders a three-
 //! region layout: header / scrollable chat / input editor.
 
+mod autocomplete;
 mod chat;
 mod commands;
 mod editor;
@@ -93,6 +94,15 @@ pub struct App {
     session_file: Option<String>,
     /// compaction 进行中本地排队的提交文本（压缩结束按序补发）。
     compact_queue: Vec<String>,
+    /// 斜杠补全菜单状态（spec：斜杠命令候选触发与过滤）。
+    completion: autocomplete::CompletionState,
+    /// /model 参数补全的可用模型缓存（`provider/id`；惰性拉取一次）。
+    models_cache: Vec<String>,
+    /// /thinking 参数补全的可用级别缓存（惰性拉取一次）。
+    levels_cache: Vec<String>,
+    /// 模型/级别缓存是否已请求（防重复拉取）。
+    models_requested: bool,
+    levels_requested: bool,
     /// thinking 是否展开（ctrl+t 切换，默认折叠）。
     show_thinking: bool,
     /// 工具输出是否展开（ctrl+o 切换，默认折叠）。
@@ -124,6 +134,11 @@ impl App {
             last_ctrl_c: None,
             session_file: None,
             compact_queue: Vec::new(),
+            completion: autocomplete::CompletionState::default(),
+            models_cache: Vec::new(),
+            levels_cache: Vec::new(),
+            models_requested: false,
+            levels_requested: false,
             show_thinking: false,
             expand_tools: false,
             debug_log,
@@ -225,6 +240,8 @@ impl App {
                 Ok(UiEvent::AsyncData { kind, seq, data }) => {
                     self.log_event("async", &format!("{kind:?} seq={seq}"));
                     self.handle_async_data(kind, seq, &data);
+                    // 缓存类数据到达后重算补全（如 /model 参数候选）
+                    self.refresh_completion();
                     self.draw(terminal)?;
                 }
                 Ok(UiEvent::ParseError(raw)) => {
@@ -240,6 +257,11 @@ impl App {
                 Ok(UiEvent::SendFailed(err)) => {
                     self.log_event("send_failed", &err);
                     self.notice = Some((err, Color::Red));
+                    self.draw(terminal)?;
+                }
+                Ok(UiEvent::OpenModelSelect) => {
+                    self.log_event("info", "open model select (fallback)");
+                    self.open_model_select(commander, report_tx);
                     self.draw(terminal)?;
                 }
                 Ok(UiEvent::Info(text)) => {
@@ -621,6 +643,549 @@ impl App {
         }
     }
 
+    /// /copy：取最后一条 assistant 文本（get_last_assistant_text），
+    /// 经 OSC52 转义序列写入终端剪贴板；无内容红条（spec：复制与信息展示命令）。
+    ///
+    /// 输入: commander/report_tx — 发送与回报通道
+    /// 输出: 无返回值；副作用为清空输入（已由分发层）并异步取文本
+    fn cmd_copy(&mut self, commander: &CommandSender, report_tx: &Sender<UiEvent>) {
+        self.log_event("slash", "copy");
+        Self::spawn_async(
+            commander,
+            report_tx,
+            serde_json::json!({"type": "get_last_assistant_text"}),
+            AsyncKind::CopyText,
+            0,
+            None,
+        );
+    }
+
+    /// 标准 base64 编码（含 padding；OSC52 载荷用）。
+    ///
+    /// 输入: data — 原始字节
+    /// 输出: base64 字符串
+    fn base64_encode(data: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+        for chunk in data.chunks(3) {
+            let b0 = chunk[0] as u32;
+            let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+            let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+            let n = (b0 << 16) | (b1 << 8) | b2;
+            out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+            out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+            out.push(if chunk.len() > 1 {
+                ALPHABET[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                ALPHABET[n as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    /// OSC52 剪贴板转义序列（`ESC ] 52 ; c ; <base64> BEL`）。
+    ///
+    /// 输入: text — 要复制的文本
+    /// 输出: 完整转义序列字符串
+    fn osc52_sequence(text: &str) -> String {
+        format!("\x1b]52;c;{}\x07", Self::base64_encode(text.as_bytes()))
+    }
+
+    /// 定位 pi 的 CHANGELOG.md：env 覆盖（测试）→ PI_BIN 所在目录上溯
+    /// （npm/bun 安装布局）→ 仓库内 pi 源码树。
+    ///
+    /// 输入: 无（读环境变量与文件系统）
+    /// 输出: Some(路径) / None（未找到）
+    fn resolve_changelog_path() -> Option<std::path::PathBuf> {
+        if let Ok(p) = std::env::var("PI_RUST_TUI_CHANGELOG") {
+            let path = std::path::PathBuf::from(p);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+        let bin = pi_rust_tui::rpc::resolve_binary();
+        if let Ok(real) = std::fs::canonicalize(&bin) {
+            let mut dir = real.parent().map(std::path::Path::to_path_buf);
+            for _ in 0..8 {
+                let d = dir?;
+                let candidate = d.join("CHANGELOG.md");
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+                dir = d.parent().map(std::path::Path::to_path_buf);
+            }
+        }
+        let repo = std::path::Path::new("pi/packages/coding-agent/CHANGELOG.md");
+        if repo.is_file() {
+            return Some(repo.to_path_buf());
+        }
+        None
+    }
+
+    /// 从 CHANGELOG 文本取最新条目：首个 `## ` 小节（无小节则整篇），
+    /// 超过 60 行截断并标注。
+    ///
+    /// 输入: content — CHANGELOG.md 全文
+    /// 输出: 最新条目的行列表（可为空）
+    fn newest_changelog_lines(content: &str) -> Vec<String> {
+        let mut lines = content.lines();
+        let mut started = false;
+        let mut out: Vec<String> = Vec::new();
+        for line in lines.by_ref() {
+            if !started {
+                if line.starts_with("## ") {
+                    started = true;
+                    out.push(line.trim_start_matches('#').trim().to_string());
+                }
+                continue; // `# ` 标题行与前言跳过
+            }
+            if line.starts_with("## ") {
+                break; // 下一个版本小节 → 最新条目结束
+            }
+            out.push(line.to_string());
+        }
+        if out.is_empty() {
+            // 无 ## 结构：退化为整篇（统一走下方截断）
+            out = content.lines().map(String::from).collect();
+        }
+        if out.len() > 60 {
+            out.truncate(60);
+            out.push("…（已截断，完整内容见 CHANGELOG.md）".into());
+        }
+        out
+    }
+
+    /// /changelog：读 pi 包内 CHANGELOG.md 最新条目渲染进消息区（逐行
+    /// Notice）；文件缺失黄条提示（spec：复制与信息展示命令）。
+    ///
+    /// 输入: self — 应用状态
+    /// 输出: 无返回值；副作用为追加本地通知条目或设置缺失提示
+    fn cmd_changelog(&mut self) {
+        self.log_event("slash", "changelog");
+        let Some(path) = Self::resolve_changelog_path() else {
+            self.notice = Some(("未找到 CHANGELOG.md（pi 包不完整？）".into(), Color::Yellow));
+            return;
+        };
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            self.notice = Some(("CHANGELOG.md 读取失败".into(), Color::Yellow));
+            return;
+        };
+        let body = Self::newest_changelog_lines(&content);
+        if body.is_empty() {
+            self.notice = Some(("No changelog entries found.".into(), Color::Yellow));
+            return;
+        }
+        use pi_rust_tui::session::Entry;
+        self.state.transcript.push(Entry::Notice {
+            kind: "changelog".into(),
+            text: "── What's New ──".into(),
+        });
+        for line in body {
+            self.state.transcript.push(Entry::Notice {
+                kind: "changelog".into(),
+                text: line,
+            });
+        }
+        self.notice = Some(("✓ changelog 已显示".into(), Color::Green));
+    }
+
+    /// /reload：空闲时重读本地配置（会话目录设置 + 补全缓存失效）并绿条
+    /// 提示、触发重绘；流式/压缩中黄条拒绝（spec：配置重读）。
+    ///
+    /// 输入: self — 应用状态
+    /// 输出: 无返回值；副作用为提示与缓存复位
+    fn cmd_reload(&mut self) {
+        self.log_event("slash", "reload");
+        if self.state.phase == Phase::Streaming {
+            self.notice = Some(("等待当前响应完成后再 reload".into(), Color::Yellow));
+            return;
+        }
+        if self.state.compacting {
+            self.notice = Some(("等待压缩完成后再 reload".into(), Color::Yellow));
+            return;
+        }
+        // 重读会话目录设置（resolve_sessions_dir 每次现算，此处使其立即
+        // 生效的可见动作是：参数补全缓存失效，下次 /model / /thinking 重拉）
+        self.models_cache.clear();
+        self.levels_cache.clear();
+        self.models_requested = false;
+        self.levels_requested = false;
+        let dir = crate::app::sessions::resolve_sessions_dir();
+        self.log_event("slash", &format!("reload sessions_dir={}", dir.display()));
+        self.notice = Some((format!("✓ 配置已重新加载（sessions: {}）", dir.display()), Color::Green));
+    }
+
+    /// trust.json 路径（对齐 pi `~/.pi/agent/trust.json`）。
+    ///
+    /// 输入: 无（读 HOME）
+    /// 输出: 文件路径
+    fn trust_file_path() -> std::path::PathBuf {
+        // 测试可用专用 env 覆盖（避免并行测试改 HOME 造成路径竞态）
+        if let Ok(p) = std::env::var("PI_RUST_TUI_TRUST_FILE") {
+            return std::path::PathBuf::from(p);
+        }
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        std::path::Path::new(&home).join(".pi/agent/trust.json")
+    }
+
+    /// 读取 trust.json 为 (key → decision) 映射；缺失返回空、损坏返回
+    /// 空并由调用方提示（pi 侧损坏会抛错，我们降级不崩溃）。
+    ///
+    /// 输入: path — trust.json 路径
+    /// 输出: 规范化的 JSON 对象（非对象视为无效 → 空）
+    fn read_trust_file(path: &std::path::Path) -> serde_json::Map<String, serde_json::Value> {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return serde_json::Map::new();
+        };
+        match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(serde_json::Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        }
+    }
+
+    /// 写回 trust.json（原子写：tmp + rename，父目录自动创建）。
+    ///
+    /// 输入: path — 文件路径；map — 完整映射
+    /// 输出: Ok(()) / Err(写入失败)
+    fn write_trust_file(
+        path: &std::path::Path,
+        map: &serde_json::Map<String, serde_json::Value>,
+    ) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(map).unwrap_or_default())?;
+        std::fs::rename(&tmp, path)
+    }
+
+    /// 当前 cwd 的规范化键（对齐 pi normalizeCwd：canonicalize 解析软链）。
+    ///
+    /// 输入: 无
+    /// 输出: 规范化路径字符串
+    fn current_cwd_key() -> String {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        std::fs::canonicalize(&cwd)
+            .unwrap_or(cwd)
+            .to_string_lossy()
+            .to_string()
+    }
+
+    /// /export [路径]：无参/`.jsonl` 复制当前会话文件（默认
+    /// `<cwd>/session-<id>.jsonl`）；非 `.jsonl` 走 export_html RPC。
+    /// 无会话文件红条（spec：会话导出）。
+    ///
+    /// 输入: args — 输出路径（可空）；commander/report_tx — 发送与回报
+    /// 输出: 无返回值；副作用为复制文件或异步导出 HTML
+    fn cmd_export(&mut self, args: &str, commander: &CommandSender, report_tx: &Sender<UiEvent>) {
+        self.log_event("slash", &format!("export: {args}"));
+        let Some(src) = self.session_file.clone() else {
+            self.notice = Some(("无当前会话文件可导出".into(), Color::Red));
+            return;
+        };
+        let src_path = std::path::Path::new(&src);
+        if !src_path.is_file() {
+            self.notice = Some((format!("会话文件不存在: {src}"), Color::Red));
+            return;
+        }
+        let target = if args.is_empty() {
+            Self::default_export_path(&src, &std::env::current_dir().unwrap_or_default())
+        } else {
+            std::path::PathBuf::from(args)
+        };
+        let target_str = target.to_string_lossy().to_string();
+        if args.is_empty() || target_str.ends_with(".jsonl") {
+            match std::fs::copy(src_path, &target) {
+                Ok(n) => {
+                    self.notice = Some((
+                        format!("✓ 已导出 {} 字节 → {}", n, target.display()),
+                        Color::Green,
+                    ));
+                    self.log_event("slash", &format!("export jsonl → {}", target.display()));
+                }
+                Err(e) => {
+                    self.notice = Some((format!("Failed to export session: {e}"), Color::Red));
+                }
+            }
+        } else {
+            // HTML（或其它扩展名，对齐 pi：非 jsonl 即 HTML）
+            Self::spawn_async(
+                commander,
+                report_tx,
+                serde_json::json!({"type": "export_html", "outputPath": target_str}),
+                AsyncKind::ExportDone,
+                0,
+                None,
+            );
+        }
+    }
+
+    /// 默认导出路径：`<cwd>/session-<sessionId>.jsonl`（id 取会话文件名
+    /// `ts_sessionId.jsonl` 的第二段，缺失则 `export`）。
+    ///
+    /// 输入: session_file — 当前会话文件路径；cwd — 输出目录
+    /// 输出: 默认导出文件路径
+    fn default_export_path(session_file: &str, cwd: &std::path::Path) -> std::path::PathBuf {
+        let stem = std::path::Path::new(session_file)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        let sid = stem.split('_').nth(1).unwrap_or("export");
+        cwd.join(format!("session-{sid}.jsonl"))
+    }
+
+    /// /import <路径>：无参显示用法；带参校验（存在、.jsonl、首行可解析）
+    /// 后弹二次确认（复制与切换在确认后）；校验失败红条、不开浮层。
+    ///
+    /// 输入: args — 源 jsonl 路径；self — 置确认浮层
+    /// 输出: 无返回值
+    fn cmd_import(&mut self, args: &str) {
+        self.log_event("slash", &format!("import: {args}"));
+        if args.is_empty() {
+            self.notice = Some(("Usage: /import <path.jsonl>".into(), Color::Yellow));
+            return;
+        }
+        let src = std::path::Path::new(args);
+        if !args.ends_with(".jsonl") || !src.is_file() {
+            self.notice = Some((format!("源文件不存在或非 .jsonl: {args}"), Color::Red));
+            return;
+        }
+        if crate::app::sessions::parse_session_file(src).is_none() {
+            self.notice = Some((format!("源文件非法（首行非 JSON）: {args}"), Color::Red));
+            return;
+        }
+        self.overlay = Some(Overlay::ImportConfirm {
+            path: args.to_string(),
+            cursor: 0,
+        });
+    }
+
+    /// 执行导入（确认后）：校验源文件（存在、.jsonl、首行可解析）→ 复制进
+    /// 当前项目会话目录 → 切换链重建；任一步失败仅提示、不改状态。
+    ///
+    /// 输入: source — 源 jsonl 路径；commander/report_tx — 发送与回报
+    /// 输出: 无返回值
+    fn apply_import(&mut self, source: &str, commander: &CommandSender, report_tx: &Sender<UiEvent>) {
+        let src = std::path::Path::new(source);
+        if !source.ends_with(".jsonl") || !src.is_file() {
+            self.notice = Some((format!("导入失败：源文件不存在或非 .jsonl: {source}"), Color::Red));
+            return;
+        }
+        if crate::app::sessions::parse_session_file(src).is_none() {
+            self.notice = Some((format!("导入失败：文件非法（首行非 JSON）: {source}"), Color::Red));
+            return;
+        }
+        let (dir, _) = crate::app::sessions::project_sessions_dir();
+        let file_name = src.file_name().expect("文件名已校验");
+        let dest = dir.join(file_name);
+        // 源已在项目会话目录：跳过自拷贝（fs::copy 同文件会截断），直接切换
+        let src_real = std::fs::canonicalize(src).unwrap_or_else(|_| src.to_path_buf());
+        let dest_real = std::fs::canonicalize(&dest).unwrap_or(dest.clone());
+        if src_real == dest_real {
+            self.log_event("slash", "import: source already in project dir, skip copy");
+        } else if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::copy(src, &dest)) {
+            self.notice = Some((format!("导入失败: {e}"), Color::Red));
+            return;
+        } else {
+            self.log_event("slash", &format!("import copy → {}", dest.display()));
+        }
+        // 切换到导入的会话（复用统一切换链：get_state + get_messages 重建）
+        Self::spawn_session_chain(
+            commander,
+            report_tx,
+            serde_json::json!({"type": "switch_session", "sessionPath": dest.to_string_lossy()}),
+            "import",
+            Some("✓ 已导入并切换"),
+        );
+    }
+
+    /// /scoped-models：打开只读模型范围浮层（loading → get_available_models）。
+    ///
+    /// 输入: commander/report_tx — 发送与回报通道
+    /// 输出: 无返回值；副作用为置 ScopedModels 浮层并异步拉列表
+    fn open_scoped_models(&mut self, commander: &CommandSender, report_tx: &Sender<UiEvent>) {
+        self.log_event("slash", "scoped-models");
+        self.overlay_seq += 1;
+        let seq = self.overlay_seq;
+        self.overlay = Some(Overlay::ScopedModels {
+            models: vec![],
+            loading: true,
+            seq,
+            cursor: 0,
+        });
+        Self::spawn_async(
+            commander,
+            report_tx,
+            serde_json::json!({"type": "get_available_models"}),
+            AsyncKind::ScopedModels,
+            seq,
+            None,
+        );
+    }
+
+    /// /settings：打开简化设置浮层（loading → get_state 回填开关与模型）。
+    ///
+    /// 输入: commander/report_tx — 发送与回报通道
+    /// 输出: 无返回值；副作用为置 Settings 浮层并异步拉 get_state
+    fn open_settings(&mut self, commander: &CommandSender, report_tx: &Sender<UiEvent>) {
+        self.log_event("slash", "settings");
+        self.overlay_seq += 1;
+        let seq = self.overlay_seq;
+        self.overlay = Some(Overlay::Settings {
+            cursor: 0,
+            loading: true,
+            seq,
+            auto_compaction: None,
+            auto_retry: None,
+            model: None,
+        });
+        Self::spawn_async(
+            commander,
+            report_tx,
+            serde_json::json!({"type": "get_state"}),
+            AsyncKind::SettingsState,
+            seq,
+            None,
+        );
+    }
+
+    /// 应用设置浮层选中项：0 = autoCompact、1 = autoRetry（翻转并发送）。
+    ///
+    /// 输入: overlay — 当前浮层（读开关状态）；idx — 行号；
+    ///       commander/report_tx — 发送与回报
+    /// 输出: 无返回值；副作用为发送 set_auto_* 并更新浮层状态
+    fn apply_settings(
+        &mut self,
+        overlay: &Overlay,
+        idx: usize,
+        commander: &CommandSender,
+        report_tx: &Sender<UiEvent>,
+    ) {
+        let Overlay::Settings {
+            auto_compaction,
+            auto_retry,
+            ..
+        } = overlay
+        else {
+            return;
+        };
+        match idx {
+            0 => {
+                let next = !auto_compaction.unwrap_or(false);
+                if let Some(Overlay::Settings { auto_compaction, .. }) = self.overlay.as_mut() {
+                    *auto_compaction = Some(next);
+                }
+                Self::spawn_async(
+                    commander,
+                    report_tx,
+                    serde_json::json!({"type": "set_auto_compaction", "enabled": next}),
+                    AsyncKind::CommandDone,
+                    0,
+                    None,
+                );
+                self.log_event("slash", &format!("settings auto_compaction={next}"));
+            }
+            1 => {
+                let next = !auto_retry.unwrap_or(false);
+                if let Some(Overlay::Settings { auto_retry, .. }) = self.overlay.as_mut() {
+                    *auto_retry = Some(next);
+                }
+                Self::spawn_async(
+                    commander,
+                    report_tx,
+                    serde_json::json!({"type": "set_auto_retry", "enabled": next}),
+                    AsyncKind::CommandDone,
+                    0,
+                    None,
+                );
+                self.log_event("slash", &format!("settings auto_retry={next}"));
+            }
+            _ => {}
+        }
+    }
+
+    /// /trust：读当前项目的信任记录并打开决策浮层（Enter 应用）。
+    ///
+    /// 输入: self — 应用状态
+    /// 输出: 无返回值；副作用为置 Trust 浮层
+    fn open_trust(&mut self) {
+        self.log_event("slash", "trust");
+        let path = Self::trust_file_path();
+        let map = Self::read_trust_file(&path);
+        let key = Self::current_cwd_key();
+        let current = map.get(&key).and_then(|v| v.as_bool());
+        self.overlay = Some(Overlay::Trust { cursor: 0, current });
+    }
+
+    /// 应用信任决策：idx 0 = 信任（true）、1 = 清除（删除键）。
+    ///
+    /// 输入: idx — 浮层选中项
+    /// 输出: 无返回值；副作用为写回 trust.json 与提示
+    fn apply_trust(&mut self, idx: usize) {
+        let path = Self::trust_file_path();
+        let mut map = Self::read_trust_file(&path);
+        let key = Self::current_cwd_key();
+        match idx {
+            0 => {
+                map.insert(key.clone(), serde_json::Value::Bool(true));
+                match Self::write_trust_file(&path, &map) {
+                    Ok(()) => {
+                        self.notice = Some((format!("✓ 已信任 {key}"), Color::Green));
+                        self.log_event("slash", &format!("trust set {key}"));
+                    }
+                    Err(e) => {
+                        self.notice = Some((format!("信任写入失败: {e}"), Color::Red));
+                    }
+                }
+            }
+            1 => {
+                map.remove(&key);
+                match Self::write_trust_file(&path, &map) {
+                    Ok(()) => {
+                        self.notice = Some(("✓ 已清除信任记录".into(), Color::Green));
+                        self.log_event("slash", &format!("trust clear {key}"));
+                    }
+                    Err(e) => {
+                        self.notice = Some((format!("信任写入失败: {e}"), Color::Red));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// /hotkeys：打开键位表浮层（数据见 overlay::hotkeys_rows）。
+    ///
+    /// 输入: self — 应用状态
+    /// 输出: 无返回值；副作用为置 Hotkeys 浮层
+    fn open_hotkeys(&mut self) {
+        self.log_event("slash", "hotkeys");
+        self.overlay = Some(Overlay::Hotkeys { cursor: 0 });
+    }
+
+    /// 桩命令：本地拦截后给出黄条原因提示（/share /bug 网络上报类、
+    /// /login /logout 交互登录类），不发送任何命令。
+    ///
+    /// 输入: name — 命令名（不含 `/`）
+    /// 输出: 无返回值；副作用为设置黄色通知（spec：未支持命令提示桩）
+    fn cmd_stub(&mut self, name: &str) {
+        let reason = match name {
+            "share" => "暂不支持：/share 需要网络上报（Radius artifact / GitHub gist）",
+            "bug" => "暂不支持：/bug 需要网络上报到 Pi 开发者",
+            "login" => "未实现交互式登录（依赖 ~/.pi/agent/auth.json 预登录）",
+            "logout" => "未实现交互式登录（移除凭据请直接编辑 auth.json）",
+            _ => "暂不支持",
+        };
+        self.log_event("slash", &format!("stub {name}: {reason}"));
+        self.notice = Some((format!("🚫 {reason}"), Color::Yellow));
+    }
+
     /// /quit：置退出标志并清空输入。
     ///
     /// 输入: 无
@@ -671,6 +1236,7 @@ impl App {
         // ctrl+c 全局优先（浮层之下也生效）：单击清空输入，500ms 内双击退出。
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.handle_ctrl_c();
+            self.completion.close(); // 输入被清空，菜单随之失效
             return;
         }
 
@@ -692,6 +1258,13 @@ impl App {
                     self.apply_overlay(&overlay, idx, commander, report_tx);
                     self.close_overlay();
                 }
+                OverlayOutcome::Toggle(idx) => {
+                    self.log_event("overlay", &format!("toggle #{idx}"));
+                    // 设置类切换：应用后保持浮层打开
+                    let o = overlay;
+                    self.apply_overlay(&o, idx, commander, report_tx);
+                    self.overlay = Some(o);
+                }
                 OverlayOutcome::Delete(idx) => {
                     self.log_event("overlay", &format!("delete #{idx}"));
                     self.request_delete_session(&overlay, idx, report_tx);
@@ -703,7 +1276,49 @@ impl App {
                     self.overlay = Some(o);
                 }
             }
+            self.refresh_completion();
             return;
+        }
+
+        // 补全菜单打开时优先消费导航/应用键（spec：菜单键位与应用）
+        let mut skip_completion_refresh = false;
+        if self.completion.open
+            && (key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT)
+        {
+            match key.code {
+                KeyCode::Up => {
+                    self.completion_move(-1);
+                    return;
+                }
+                KeyCode::Down => {
+                    self.completion_move(1);
+                    return;
+                }
+                KeyCode::PageUp => {
+                    self.completion_move(-5);
+                    return;
+                }
+                KeyCode::PageDown => {
+                    self.completion_move(5);
+                    return;
+                }
+                KeyCode::Esc => {
+                    // spec：Esc 只关菜单，不清输入不提交
+                    self.completion.close();
+                    return;
+                }
+                KeyCode::Tab => {
+                    // spec：Tab 应用补全后关菜单（不触发提交）
+                    self.apply_completion_selection();
+                    skip_completion_refresh = true;
+                    return;
+                }
+                KeyCode::Enter if key.modifiers == KeyModifiers::NONE => {
+                    // spec：回车先应用补全再立即提交该行（对齐 pi fall-through）
+                    self.apply_completion_selection();
+                }
+                _ => {}
+            }
         }
 
         let intent = Self::key_intent(key, self.state.phase == Phase::Streaming);
@@ -748,6 +1363,275 @@ impl App {
             }
             _ => {}
         }
+        // 每次按键后按光标前文本重算补全（Tab 刚应用完保持关闭，等下次输入）
+        if !skip_completion_refresh {
+            self.update_completion(commander, report_tx);
+        }
+    }
+
+    /// 按当前光标前文本重算补全菜单（无 RPC）。
+    ///
+    /// 输入: self — 应用状态（读编辑器与缓存）
+    /// 输出: 无返回值；副作用为更新 completion（浮层打开时强制关闭）
+    fn refresh_completion(&mut self) {
+        if self.overlay.is_some() {
+            self.completion.close();
+            return;
+        }
+        let row = self.editor.row();
+        let line = self.editor.lines()[row].clone();
+        let col = self.editor.col();
+        let byte = line
+            .char_indices()
+            .nth(col)
+            .map(|(b, _)| b)
+            .unwrap_or(line.len());
+        let text_before = &line[..byte];
+        match autocomplete::suggestions(text_before, &self.models_cache, &self.levels_cache) {
+            Some((kind, prefix, items)) => {
+                let query = match &kind {
+                    autocomplete::CompletionKind::Command => prefix.trim_start_matches('/').to_string(),
+                    autocomplete::CompletionKind::Argument(_) => prefix.clone(),
+                };
+                let selected = autocomplete::best_match_index(&items, &query);
+                self.completion = autocomplete::CompletionState {
+                    open: true,
+                    prefix,
+                    items,
+                    selected,
+                    kind: Some(kind),
+                };
+            }
+            None => self.completion.close(),
+        }
+    }
+
+    /// 重算补全，参数候选缓存为空时惰性拉取（各一次）。
+    ///
+    /// 输入: commander/report_tx — 发送与回报通道
+    /// 输出: 无返回值；副作用为可能异步发起 get_available_* 请求
+    fn update_completion(&mut self, commander: &CommandSender, report_tx: &Sender<UiEvent>) {
+        self.refresh_completion();
+        // 从光标文本判定数据需求（缓存为空时菜单尚未打开，kind 不可用）
+        let row = self.editor.row();
+        let line = self.editor.lines()[row].clone();
+        let col = self.editor.col();
+        let byte = line
+            .char_indices()
+            .nth(col)
+            .map(|(b, _)| b)
+            .unwrap_or(line.len());
+        let need = autocomplete::arg_need(&line[..byte]);
+        let need_models = need == Some("model");
+        if need_models && self.models_cache.is_empty() && !self.models_requested {
+            self.models_requested = true;
+            Self::spawn_async(
+                commander,
+                report_tx,
+                serde_json::json!({"type": "get_available_models"}),
+                AsyncKind::ArgCacheModels,
+                0,
+                None,
+            );
+        }
+        let need_levels = need == Some("thinking");
+        if need_levels && self.levels_cache.is_empty() && !self.levels_requested {
+            self.levels_requested = true;
+            Self::spawn_async(
+                commander,
+                report_tx,
+                serde_json::json!({"type": "get_available_thinking_levels"}),
+                AsyncKind::ArgCacheLevels,
+                0,
+                None,
+            );
+        }
+    }
+
+    /// 移动菜单选中项（夹取边界）。
+    ///
+    /// 输入: delta — +1 下移 / -1 上移 / ±N 翻页
+    /// 输出: 无返回值；副作用为更新 completion.selected
+    fn completion_move(&mut self, delta: i32) {
+        let len = self.completion.items.len() as i32;
+        if len == 0 {
+            return;
+        }
+        let next = (self.completion.selected as i32 + delta).clamp(0, len - 1);
+        self.completion.selected = next as usize;
+        self.log_event("key", &format!("completion select {next}"));
+    }
+
+    /// 应用当前选中补全到编辑器（替换前缀），随后关闭菜单。
+    ///
+    /// 输入: self — 应用状态（编辑器与菜单）
+    /// 输出: 无返回值；副作用为改写当前行与光标、关闭菜单
+    fn apply_completion_selection(&mut self) {
+        let Some(kind) = self.completion.kind.clone() else {
+            self.completion.close();
+            return;
+        };
+        let Some(item) = self.completion.items.get(self.completion.selected).cloned() else {
+            self.completion.close();
+            return;
+        };
+        let row = self.editor.row();
+        let line = self.editor.lines()[row].clone();
+        let (new_line, new_cursor) = autocomplete::apply_completion(
+            &line,
+            self.editor.col(),
+            &self.completion.prefix,
+            &item.value,
+            &kind,
+        );
+        self.editor.set_line(row, new_line, new_cursor);
+        self.log_event("key", &format!("completion apply {}", item.value));
+        self.completion.close();
+    }
+
+    /// /model [搜索]：无参开选择器；带参做精确匹配（`provider/id` 或 `id`，
+    /// 大小写不敏感）命中直接 set_model 并绿条提示，无命中回退选择器。
+    ///
+    /// 输入: args — 搜索词（可空）；commander/report_tx — 发送与回报
+    /// 输出: 无返回值；副作用为开浮层或异步匹配切换
+    fn cmd_model(&mut self, args: &str, commander: &CommandSender, report_tx: &Sender<UiEvent>) {
+        self.log_event("slash", &format!("model: {args}"));
+        if args.is_empty() {
+            self.open_model_select(commander, report_tx);
+            return;
+        }
+        let search = args.to_string();
+        let report = report_tx.clone();
+        let cmd = commander.clone();
+        thread::spawn(move || {
+            let list = cmd.send_command(
+                serde_json::json!({"type": "get_available_models"}),
+                Duration::from_secs(30),
+                ResponsePolicy::RequireSuccess,
+            );
+            let data = match list {
+                Ok(d) => d,
+                Err(e) => {
+                    let _ = report.send(UiEvent::SendFailed(e.to_string()));
+                    return;
+                }
+            };
+            let q = search.to_lowercase();
+            let models: Vec<(String, String)> = data
+                .get("models")
+                .and_then(|m| m.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|m| {
+                            let provider = m.get("provider").and_then(|x| x.as_str())?;
+                            let id = m.get("id").and_then(|x| x.as_str())?;
+                            Some((provider.to_string(), id.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let hit = models.iter().find(|(provider, id)| {
+                format!("{provider}/{id}").to_lowercase() == q || id.to_lowercase() == q
+            });
+            match hit {
+                Some((provider, id)) => {
+                    let applied = cmd.send_command(
+                        serde_json::json!({"type": "set_model", "provider": provider, "modelId": id}),
+                        Duration::from_secs(30),
+                        ResponsePolicy::RequireSuccess,
+                    );
+                    match applied {
+                        Ok(_) => {
+                            // 回填状态行模型名 + 绿条提示
+                            let _ = report.send(UiEvent::AsyncData {
+                                kind: AsyncKind::ModelApplied,
+                                seq: 0,
+                                data: serde_json::json!({"name": format!("{provider}/{id}")}),
+                            });
+                            let _ = report.send(UiEvent::Info(format!("Model: {provider}/{id}")));
+                        }
+                        Err(e) => {
+                            let _ = report.send(UiEvent::SendFailed(e.to_string()));
+                        }
+                    }
+                }
+                None => {
+                    let _ = report.send(UiEvent::Info(
+                        "未找到匹配模型，打开选择器".to_string(),
+                    ));
+                    let _ = report.send(UiEvent::OpenModelSelect);
+                }
+            }
+        });
+    }
+
+    /// /thinking [级别]：无参开级别列表；带参精确匹配（大小写不敏感）直接
+    /// 应用，未知级别红条列出全部可用级别（spec：thinking 入口与未知级别）。
+    ///
+    /// 输入: args — 级别名（可空）；commander/report_tx — 发送与回报
+    /// 输出: 无返回值；副作用为开浮层或异步应用
+    fn cmd_thinking(&mut self, args: &str, commander: &CommandSender, report_tx: &Sender<UiEvent>) {
+        self.log_event("slash", &format!("thinking: {args}"));
+        if args.is_empty() {
+            self.open_thinking_select(commander, report_tx);
+            return;
+        }
+        let want = args.to_string();
+        let report = report_tx.clone();
+        let cmd = commander.clone();
+        thread::spawn(move || {
+            let list = cmd.send_command(
+                serde_json::json!({"type": "get_available_thinking_levels"}),
+                Duration::from_secs(30),
+                ResponsePolicy::RequireSuccess,
+            );
+            let data = match list {
+                Ok(d) => d,
+                Err(e) => {
+                    let _ = report.send(UiEvent::SendFailed(e.to_string()));
+                    return;
+                }
+            };
+            let levels: Vec<String> = data
+                .get("levels")
+                .and_then(|l| l.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let q = want.to_lowercase();
+            let hit = levels.iter().find(|l| l.to_lowercase() == q);
+            match hit {
+                Some(level) => {
+                    let applied = cmd.send_command(
+                        serde_json::json!({"type": "set_thinking_level", "level": level}),
+                        Duration::from_secs(30),
+                        ResponsePolicy::RequireSuccess,
+                    );
+                    match applied {
+                        Ok(_) => {
+                            let _ = report.send(UiEvent::AsyncData {
+                                kind: AsyncKind::ThinkingApplied,
+                                seq: 0,
+                                data: serde_json::json!(level.clone()),
+                            });
+                            let _ = report.send(UiEvent::Info(format!("thinking: {level}")));
+                        }
+                        Err(e) => {
+                            let _ = report.send(UiEvent::SendFailed(e.to_string()));
+                        }
+                    }
+                }
+                None => {
+                    let _ = report.send(UiEvent::SendFailed(format!(
+                        "Unknown thinking level \"{want}\". Available levels: {}",
+                        levels.join(", ")
+                    )));
+                }
+            }
+        });
     }
 
     /// 打开模型选择器：置 loading 浮层并异步拉取模型列表（带序号防过期）。
@@ -1243,6 +2127,15 @@ impl App {
         report_tx: &Sender<UiEvent>,
     ) {
         match overlay {
+            Overlay::ImportConfirm { path, .. } => {
+                if idx == 0 {
+                    self.apply_import(path, commander, report_tx);
+                } else {
+                    self.notice = Some(("Import cancelled".into(), Color::Yellow));
+                }
+            }
+            Overlay::Settings { .. } => self.apply_settings(overlay, idx, commander, report_tx),
+            Overlay::Trust { .. } => self.apply_trust(idx),
             Overlay::Tree { rows, .. } => {
                 if let Some(row) = rows.get(idx) {
                     let entry_id = row.id.clone();
@@ -1490,6 +2383,118 @@ impl App {
                         *loading = false;
                 }
             }
+            AsyncKind::ArgCacheModels => {
+                // /model 参数补全缓存：provider/id 列表（与选择器同源数据）
+                self.models_cache = data
+                    .get("models")
+                    .and_then(|m| m.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|m| {
+                                let provider = m.get("provider").and_then(|x| x.as_str())?;
+                                let id = m.get("id").and_then(|x| x.as_str())?;
+                                Some(format!("{provider}/{id}"))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.log_event("async", &format!("models cache {}", self.models_cache.len()));
+            }
+            AsyncKind::ArgCacheLevels => {
+                self.levels_cache = data
+                    .get("levels")
+                    .and_then(|l| l.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.log_event("async", &format!("levels cache {}", self.levels_cache.len()));
+            }
+            AsyncKind::CopyText => {
+                let text = data.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                if text.is_empty() {
+                    self.notice = Some(("暂无可复制的 assistant 回复".into(), Color::Red));
+                } else {
+                    use std::io::Write as _;
+                    let seq = Self::osc52_sequence(text);
+                    let mut stdout = std::io::stdout();
+                    let _ = stdout.write_all(seq.as_bytes());
+                    let _ = stdout.flush();
+                    self.notice = Some((
+                        format!("✓ 已复制 {} 字符到剪贴板", text.chars().count()),
+                        Color::Green,
+                    ));
+                    self.log_event("slash", &format!("copy {} chars", text.chars().count()));
+                }
+            }
+            AsyncKind::SettingsState => {
+                let mut filled = None;
+                if let Some(Overlay::Settings {
+                    loading,
+                    seq: s,
+                    auto_compaction,
+                    model,
+                    ..
+                }) = self.overlay.as_mut()
+                    && *s == seq
+                {
+                    *auto_compaction = data.get("autoCompactionEnabled").and_then(|v| v.as_bool());
+                    *model = match data.get("model") {
+                        Some(serde_json::Value::String(m)) => Some(m.clone()),
+                        Some(obj) => obj
+                            .get("name")
+                            .or_else(|| obj.get("id"))
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        None => None,
+                    };
+                    *loading = false;
+                    filled = Some(*auto_compaction);
+                }
+                if let Some(v) = filled {
+                    self.log_event("async", &format!("settings state compacting={v:?}"));
+                }
+            }
+            AsyncKind::ScopedModels => {
+                let mut count = None;
+                if let Some(Overlay::ScopedModels {
+                    models,
+                    loading,
+                    seq: s,
+                    ..
+                }) = self.overlay.as_mut()
+                    && *s == seq
+                {
+                    *models = data
+                        .get("models")
+                        .and_then(|m| m.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|m| {
+                                    let provider = m.get("provider").and_then(|x| x.as_str())?;
+                                    let id = m.get("id").and_then(|x| x.as_str())?;
+                                    Some(format!("{provider}/{id}"))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    *loading = false;
+                    count = Some(models.len());
+                }
+                if let Some(n) = count {
+                    self.log_event("async", &format!("scoped models {n}"));
+                }
+            }
+            AsyncKind::ExportDone => {
+                let path = data
+                    .get("path")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("(未知路径)");
+                self.notice = Some((format!("✓ 已导出 HTML → {path}"), Color::Green));
+                self.log_event("slash", &format!("export_html → {path}"));
+            }
             AsyncKind::Stats => {
                 if let Some(Overlay::Info {
                     lines,
@@ -1542,6 +2547,11 @@ impl App {
             overlay: self.overlay.as_ref(),
             current_session: self.session_file.as_deref(),
             local_queue: &self.compact_queue,
+            completion: if self.completion.open {
+                Some(&self.completion)
+            } else {
+                None
+            },
         };
         terminal.draw(|frame| view::render(frame, &self.state, &ui))?;
         Ok(())
@@ -2893,6 +3903,939 @@ done
         let mut app = App::new();
         app.flush_compact_queue(&commander, &tx); // 空队列不 panic、无副作用
         assert!(app.compact_queue.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stub_commands_intercept_locally_without_rpc() {
+        // spec：未支持命令提示桩——拦截、黄条、不发任何 RPC
+        let (client, dir, log) = recording_commander("stub", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        for (cmd, keyword) in [
+            ("/login", "预登录"),
+            ("/logout", "auth.json"),
+            ("/share", "网络上报"),
+            ("/bug", "网络上报"),
+        ] {
+            app.editor.replace(cmd);
+            assert!(
+                crate::app::commands::dispatch(&mut app, &commander, &tx, cmd),
+                "{cmd} 应命中本地命令"
+            );
+            assert!(app.editor.is_empty(), "{cmd} 执行后输入清空");
+            let (text, color) = app.notice.clone().unwrap_or_default();
+            assert!(text.contains(keyword), "{cmd} 提示应含 {keyword}: {text}");
+            assert_eq!(color, Color::Yellow, "{cmd} 应为黄条");
+            assert!(!app.should_quit);
+        }
+
+        // 未发送任何 RPC：日志文件应始终为空
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let sent = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(sent.trim().is_empty(), "桩命令不应发送 RPC，实际: {sent}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 斜杠补全菜单（spec：菜单键位与应用） ──
+
+    /// 逐字键入文本（每键走完整 handle_key 路径）。
+    fn type_text(app: &mut App, cmd: &CommandSender, tx: &Sender<UiEvent>, text: &str) {
+        for ch in text.chars() {
+            app.handle_key(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                cmd,
+                tx,
+            );
+        }
+    }
+
+    #[test]
+    fn completion_menu_opens_on_slash_and_navigates() {
+        let (client, dir, _log) = recording_commander("cmenu", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        type_text(&mut app, &commander, &tx, "/");
+        assert!(app.completion.open, "行首 / 应开菜单");
+        assert_eq!(app.completion.items.len(), 24, "应列出全部 24 个命令");
+        assert_eq!(app.completion.selected, 0);
+
+        // ↓/↑/翻页
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &commander, &tx);
+        assert_eq!(app.completion.selected, 1);
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE), &commander, &tx);
+        assert_eq!(app.completion.selected, 6);
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &commander, &tx);
+        assert_eq!(app.completion.selected, 5);
+        // 边界夹取
+        for _ in 0..30 {
+            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &commander, &tx);
+        }
+        assert_eq!(app.completion.selected, 0, "上边界夹取");
+
+        // Esc 只关菜单、不清输入（spec）
+        app.editor.replace("/th");
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &commander, &tx);
+        assert!(app.completion.open);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &commander, &tx);
+        assert!(!app.completion.open, "Esc 关菜单");
+        assert_eq!(app.editor.text(), "/thi", "Esc 不清输入");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn completion_best_match_and_typing_refresh() {
+        let (client, dir, _log) = recording_commander("cbest", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        type_text(&mut app, &commander, &tx, "/thi");
+        assert!(app.completion.open);
+        assert_eq!(app.completion.items[0].value, "thinking", "thi 首项应为 thinking");
+        assert_eq!(app.completion.selected, 0, "预选最佳匹配");
+        assert!(app.completion.items[0]
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("<level>"), "说明列含参数提示");
+
+        // 继续输入不存在的字符 → 无匹配收起
+        for ch in "zz".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &commander, &tx);
+        }
+        assert!(!app.completion.open, "无匹配收起");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn completion_tab_applies_without_submit() {
+        let (client, dir, log) = recording_commander("ctab", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        type_text(&mut app, &commander, &tx, "/resu");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &commander, &tx);
+        assert_eq!(app.editor.text(), "/resume ", "Tab 应用并补空格");
+        assert_eq!(app.editor.col(), 8, "光标在空格后");
+        assert!(!app.completion.open, "应用后关菜单");
+        // Tab 不提交：无 prompt 发出
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let sent = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(!sent.contains("prompt"), "Tab 不应发送: {sent}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn completion_enter_applies_then_submits() {
+        let (client, dir, _log) = recording_commander("center", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        type_text(&mut app, &commander, &tx, "/resu");
+        assert!(app.completion.open);
+        // 回车 = 应用补全 + 立即提交（/resume → 打开会话选择器）
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commander, &tx);
+        assert!(
+            matches!(app.overlay, Some(Overlay::SessionSelect { .. })),
+            "提交 /resume 应打开会话选择器: {:?}",
+            app.overlay
+        );
+        assert!(app.editor.is_empty(), "提交后输入清空");
+        assert!(!app.completion.open);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn completion_closes_when_overlay_opens_and_non_slash() {
+        let (client, dir, _log) = recording_commander("cclose", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        type_text(&mut app, &commander, &tx, "/");
+        assert!(app.completion.open);
+        // ctrl+l 打开模型选择器 → 菜单关闭
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+            &commander,
+            &tx,
+        );
+        assert!(app.overlay.is_some(), "ctrl+l 开浮层");
+        assert!(!app.completion.open, "浮层打开时补全关闭");
+
+        // 关浮层后输入普通文本 → 不触发
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &commander, &tx);
+        type_text(&mut app, &commander, &tx, "hello");
+        assert!(!app.completion.open, "普通文本不触发");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn completion_arg_lazy_fetch_filters_and_applies() {
+        // 假 pi：按命令回不同数据（models / levels）
+        let dir = std::env::temp_dir().join(format!(
+            "argcache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = r#"#!/bin/sh
+log="__LOG__"
+while IFS= read -r line; do
+  printf '%s
+' "$line" >> "$log"
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *get_available_models*)
+      printf '{"type":"response","id":"%s","success":true,"data":{"models":[{"provider":"openai","id":"gpt-5.4","name":"GPT-5.4"},{"provider":"anthropic","id":"claude-opus","name":"Opus"}]}}\n' "$id" ;;
+    *get_available_thinking_levels*)
+      printf '{"type":"response","id":"%s","success":true,"data":{"levels":["off","low","high"]}}\n' "$id" ;;
+    *) printf '{"type":"response","id":"%s","success":true}\n' "$id" ;;
+  esac
+done
+"#;
+        let path = dir.join("pi.sh");
+        std::fs::write(&path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let client = pi_rust_tui::rpc::RpcClient::spawn(path.to_str().unwrap(), &[]).unwrap();
+        let commander = client.command_sender();
+        let (tx, rx) = std::sync::mpsc::channel::<UiEvent>();
+
+        let mut app = App::new();
+        // 键入 "/model "（空格后触发参数补全；缓存空 → 先拉取、菜单暂不显示）
+        for ch in "/model ".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &commander, &tx);
+        }
+        assert!(app.models_requested, "应触发一次模型拉取");
+        assert!(!app.completion.open, "缓存到达前菜单未开");
+
+        // 模拟事件循环：收到 ArgCache 数据 → 填缓存 → 重算
+        let ev = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("应收到 ArgCacheModels");
+        match ev {
+            UiEvent::AsyncData { kind, seq, data } => {
+                assert_eq!(kind, AsyncKind::ArgCacheModels);
+                app.handle_async_data(kind, seq, &data);
+                app.refresh_completion();
+            }
+            other => panic!("意外事件: {other:?}"),
+        }
+        assert!(app.completion.open, "缓存到达后菜单应开");
+        assert_eq!(app.completion.items.len(), 2, "全部模型候选");
+
+        // 继续输入过滤
+        for ch in "gpt".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &commander, &tx);
+        }
+        assert_eq!(app.completion.items.len(), 1);
+        assert_eq!(app.completion.items[0].value, "openai/gpt-5.4");
+
+        // Tab 应用参数（不加空格）
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &commander, &tx);
+        assert_eq!(app.editor.text(), "/model openai/gpt-5.4");
+        assert!(!app.completion.open);
+
+        // /thinking 同理走级别缓存
+        app.editor.replace("");
+        for ch in "/thinking ".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &commander, &tx);
+        }
+        assert!(app.levels_requested, "应触发级别拉取");
+        let ev = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("应收到 ArgCacheLevels");
+        if let UiEvent::AsyncData { kind, seq, data } = ev {
+            assert_eq!(kind, AsyncKind::ArgCacheLevels);
+            app.handle_async_data(kind, seq, &data);
+            app.refresh_completion();
+        }
+        assert_eq!(app.completion.items.len(), 3, "级别候选 off/low/high");
+
+        // 无参数补全的命令空格后不弹、不拉取
+        app.editor.replace("");
+        for ch in "/copy x".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &commander, &tx);
+        }
+        assert!(!app.completion.open, "/copy 空格后不弹菜单");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── /copy 剪贴板（spec：复制与信息展示命令） ──
+
+    #[test]
+    fn base64_and_osc52_sequence() {
+        // 已知向量（含 padding 与多字节）
+        assert_eq!(App::base64_encode(b""), "");
+        assert_eq!(App::base64_encode(b"f"), "Zg==");
+        assert_eq!(App::base64_encode(b"fo"), "Zm8=");
+        assert_eq!(App::base64_encode(b"foo"), "Zm9v");
+        assert_eq!(App::base64_encode("中".as_bytes()), "5Lit");
+        let seq = App::osc52_sequence("hi");
+        assert!(seq.starts_with("\x1b]52;c;"), "OSC52 头: {seq:?}");
+        assert!(seq.ends_with("\x07"), "BEL 结尾: {seq:?}");
+        assert!(seq.contains("aGk="), "hi 的 base64: {seq:?}");
+    }
+
+    #[test]
+    fn copy_command_sends_and_empty_reply_is_red() {
+        let (client, dir, log) = recording_commander("copy", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        // 分发 → 异步取最后回复
+        app.editor.replace("/copy");
+        assert!(crate::app::commands::dispatch(&mut app, &commander, &tx, "/copy"));
+        assert!(app.editor.is_empty());
+        let content = read_log_until(&log, "get_last_assistant_text", 2000).expect("应发出取文本命令");
+
+        // 空回复 → 红条
+        app.handle_async_data(
+            AsyncKind::CopyText,
+            0,
+            &serde_json::json!({"text": ""}),
+        );
+        let (text, color) = app.notice.clone().expect("空回复应有通知");
+        assert!(text.contains("暂无可复制"), "{text}");
+        assert_eq!(color, Color::Red);
+        let _ = content;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── /hotkeys 键位表浮层（spec：复制与信息展示命令） ──
+
+    #[test]
+    fn hotkeys_command_opens_overlay_and_esc_closes() {
+        let (client, dir, _log) = recording_commander("hotkeys", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        app.editor.replace("/hotkeys");
+        assert!(crate::app::commands::dispatch(&mut app, &commander, &tx, "/hotkeys"));
+        assert!(matches!(app.overlay, Some(Overlay::Hotkeys { .. })), "应打开键位表");
+        assert!(app.editor.is_empty());
+
+        // ↑↓ 滚动
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &commander, &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &commander, &tx);
+        match &app.overlay {
+            Some(Overlay::Hotkeys { cursor }) => assert_eq!(*cursor, 2),
+            other => panic!("{other:?}"),
+        }
+        // Esc / Enter 关闭
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &commander, &tx);
+        assert!(app.overlay.is_none(), "Esc 关闭");
+
+        // 回车也关闭
+        crate::app::commands::dispatch(&mut app, &commander, &tx, "/hotkeys");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commander, &tx);
+        assert!(app.overlay.is_none(), "回车关闭");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hotkeys_rows_cover_real_bindings() {
+        // 数据自检：关键绑定都在表里（防文档与实现漂移）
+        let rows = crate::app::overlay::hotkeys_rows();
+        let text: String = rows.iter().map(|(_, k, d)| format!("{k} {d}\n")).collect();
+        for needle in ["enter", "alt+enter", "ctrl+c", "ctrl+d", "shift+enter", "ctrl+l", "alt+t", "shift+tab", "tab", "/ + 输入"] {
+            assert!(text.contains(needle), "键位表缺 {needle}");
+        }
+        assert!(text.contains("Docs/slash-commands.md"), "应指引完整命令文档");
+    }
+
+    // ── /changelog（spec：复制与信息展示命令） ──
+
+    #[test]
+    fn newest_changelog_extracts_first_section() {
+        let content = "# Changelog\n\n## 1.2.0 - newest\n\n- fix a\n- feat b\n\n## 1.1.0 - older\n\n- old item\n";
+        let lines = App::newest_changelog_lines(content);
+        assert_eq!(lines[0], "1.2.0 - newest", "取最新小节标题: {lines:?}");
+        assert!(lines.iter().any(|l| l.contains("feat b")), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("old item")), "不含旧版本: {lines:?}");
+
+        // 无 ## 结构 → 退化前 60 行
+        let plain = "line1\nline2";
+        let out = App::newest_changelog_lines(plain);
+        assert_eq!(out, vec!["line1".to_string(), "line2".to_string()]);
+
+        // 超长截断
+        let long: String = "x\n".repeat(80);
+        let out = App::newest_changelog_lines(&long);
+        assert!(out.len() <= 61, "截断后行数: {}", out.len());
+        assert!(out.last().unwrap().contains("截断"));
+    }
+
+    #[test]
+    fn changelog_command_renders_into_transcript_or_warns() {
+        let (client, dir, _log) = recording_commander("changelog", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        // 用 env 覆盖指向临时文件（set_var 在 Rust 2024 为 unsafe）
+        let tmp = std::env::temp_dir().join(format!("changelog-test-{}.md", std::process::id()));
+        std::fs::write(&tmp, "# Changelog\n\n## 9.9.9 - test\n\n- hello change\n").unwrap();
+        unsafe { std::env::set_var("PI_RUST_TUI_CHANGELOG", &tmp) };
+
+        let before = app.state.transcript.len();
+        app.cmd_changelog();
+        assert!(app.state.transcript.len() > before, "应追加 changelog 条目");
+        let text: String = format!("{:?}", &app.state.transcript[before..]);
+        assert!(text.contains("9.9.9"), "应含最新版本: {text}");
+        assert!(text.contains("hello change"), "应含条目内容: {text}");
+        let (notice, color) = app.notice.clone().unwrap();
+        assert!(notice.contains("changelog"), "{notice}");
+        assert_eq!(color, Color::Green);
+
+        // 命令分发路径
+        app.editor.replace("/changelog");
+        assert!(crate::app::commands::dispatch(&mut app, &commander, &tx, "/changelog"));
+        assert!(app.editor.is_empty());
+
+        unsafe { std::env::remove_var("PI_RUST_TUI_CHANGELOG") };
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── /trust 信任记录（对照 pi trust.json 格式） ──
+
+    #[test]
+    fn trust_roundtrip_and_overlay_flow() {
+        let home = std::env::temp_dir().join(format!("trust-home-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let trust_path = home.join(".pi/agent/trust.json");
+        unsafe { std::env::set_var("PI_RUST_TUI_TRUST_FILE", &trust_path) };
+
+        let path = App::trust_file_path();
+        assert_eq!(path, trust_path, "env 覆盖生效");
+
+        // 缺失 → 空
+        let map = App::read_trust_file(&path);
+        assert!(map.is_empty());
+
+        // 写入 → 读回（格式：{ "<cwd>": true } 纯对象）
+        let mut map = serde_json::Map::new();
+        map.insert("/some/project".into(), serde_json::Value::Bool(true));
+        App::write_trust_file(&path, &map).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["/some/project"], serde_json::Value::Bool(true), "格式对齐 pi: {text}");
+        let back = App::read_trust_file(&path);
+        assert_eq!(back.get("/some/project"), Some(&serde_json::Value::Bool(true)));
+
+        // 清除
+        let mut map = back;
+        map.remove("/some/project");
+        App::write_trust_file(&path, &map).unwrap();
+        assert!(App::read_trust_file(&path).is_empty(), "清除后为空");
+
+        // 浮层流程：打开（未记录）→ Enter 信任 → 文件记录 → 重开显示已信任 → 清除
+        let (client, dir, _log) = recording_commander("trust", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        app.editor.replace("/trust");
+        assert!(crate::app::commands::dispatch(&mut app, &commander, &tx, "/trust"));
+        assert!(app.editor.is_empty());
+        match &app.overlay {
+            Some(Overlay::Trust { current: None, .. }) => {}
+            other => panic!("应显示未记录: {other:?}"),
+        }
+        // Enter → 应用 idx0（信任）
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commander, &tx);
+        assert!(app.overlay.is_none(), "应用后关闭");
+        let cwd = App::current_cwd_key();
+        let map = App::read_trust_file(&path);
+        assert_eq!(map.get(&cwd), Some(&serde_json::Value::Bool(true)), "cwd 应被信任");
+        let (notice, color) = app.notice.clone().unwrap();
+        assert!(notice.contains("已信任"), "{notice}");
+        assert_eq!(color, Color::Green);
+
+        // 重开 → Some(true)；下移到清除 → Enter
+        crate::app::commands::dispatch(&mut app, &commander, &tx, "/trust");
+        match &app.overlay {
+            Some(Overlay::Trust { current: Some(true), .. }) => {}
+            other => panic!("应显示已信任: {other:?}"),
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &commander, &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commander, &tx);
+        let map = App::read_trust_file(&path);
+        assert!(map.get(&cwd).is_none(), "清除后无记录: {map:?}");
+
+        unsafe { std::env::remove_var("PI_RUST_TUI_TRUST_FILE") };
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── /reload（spec：配置重读） ──
+
+    #[test]
+    fn reload_refuses_when_streaming_or_compacting() {
+        let (client, dir, _log) = recording_commander("reload1", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        // 流式 → 黄条拒绝
+        app.state.phase = Phase::Streaming;
+        assert!(crate::app::commands::dispatch(&mut app, &commander, &tx, "/reload"));
+        let (text, color) = app.notice.clone().unwrap();
+        assert!(text.contains("当前响应"), "{text}");
+        assert_eq!(color, Color::Yellow);
+        assert_eq!(app.state.phase, Phase::Streaming, "流式不受影响");
+
+        // 压缩中 → 黄条拒绝
+        app.state.phase = Phase::Idle;
+        app.state.compacting = true;
+        crate::app::commands::dispatch(&mut app, &commander, &tx, "/reload");
+        let (text, color) = app.notice.clone().unwrap();
+        assert!(text.contains("压缩"), "{text}");
+        assert_eq!(color, Color::Yellow);
+
+        // 空闲 → 绿条 + 缓存失效
+        app.state.compacting = false;
+        app.models_requested = true;
+        app.levels_requested = true;
+        app.models_cache.push("x/y".into());
+        crate::app::commands::dispatch(&mut app, &commander, &tx, "/reload");
+        let (text, color) = app.notice.clone().unwrap();
+        assert!(text.contains("已重新加载"), "{text}");
+        assert_eq!(color, Color::Green);
+        assert!(app.models_cache.is_empty() && app.levels_cache.is_empty(), "缓存失效");
+        assert!(!app.models_requested && !app.levels_requested, "允许重拉");
+        assert!(app.editor.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── /model /thinking 入口与精确匹配（spec） ──
+
+    /// 造一个支持 model/thinking 全分支的假 pi。
+    fn selector_fake_pi(tag: &str) -> (pi_rust_tui::rpc::RpcClient, std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "sel-{}-{}",
+            tag,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("recv.log");
+        let script = r#"#!/bin/sh
+log="__LOG__"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$log"
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *get_available_models*)
+      printf '{"type":"response","id":"%s","success":true,"data":{"models":[{"provider":"openai","id":"gpt-5.4","name":"GPT"},{"provider":"anthropic","id":"claude-opus","name":"Opus"}]}}\n' "$id" ;;
+    *get_available_thinking_levels*)
+      printf '{"type":"response","id":"%s","success":true,"data":{"levels":["off","low","high"]}}\n' "$id" ;;
+    *) printf '{"type":"response","id":"%s","success":true}\n' "$id" ;;
+  esac
+done
+"#
+        .replace("__LOG__", &log.display().to_string());
+        let path = dir.join("pi.sh");
+        std::fs::write(&path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let client = pi_rust_tui::rpc::RpcClient::spawn(path.to_str().unwrap(), &[]).unwrap();
+        (client, dir, log)
+    }
+
+    #[test]
+    fn model_command_opens_selector_without_args() {
+        let (client, dir, _log) = selector_fake_pi("noargs");
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+        app.editor.replace("/model");
+        assert!(crate::app::commands::dispatch(&mut app, &commander, &tx, "/model"));
+        assert!(
+            matches!(app.overlay, Some(Overlay::ModelSelect { loading: true, .. })),
+            "无参应打开选择器: {:?}",
+            app.overlay
+        );
+        assert!(app.editor.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn model_command_exact_match_sets_model() {
+        let (client, dir, log) = selector_fake_pi("exact");
+        let commander = client.command_sender();
+        let (tx, rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        // id 精确匹配（大小写不敏感）
+        app.editor.replace("/model GPT-5.4");
+        assert!(crate::app::commands::dispatch(&mut app, &commander, &tx, "/model GPT-5.4"));
+
+        // 等待 ModelApplied + Info
+        let mut saw_model = false;
+        let mut saw_info = false;
+        for _ in 0..10 {
+            match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                Ok(UiEvent::AsyncData { kind: AsyncKind::ModelApplied, seq, data }) => {
+                    app.handle_async_data(AsyncKind::ModelApplied, seq, &data);
+                    saw_model = true;
+                }
+                Ok(UiEvent::Info(text)) => {
+                    assert!(text.contains("Model: openai/gpt-5.4"), "{text}");
+                    saw_info = true;
+                }
+                Ok(_) => {}
+                Err(_) => {}
+            }
+            if saw_model && saw_info {
+                break;
+            }
+        }
+        assert!(saw_model && saw_info, "应收到模型回填与提示");
+        assert_eq!(app.state.model.as_deref(), Some("openai/gpt-5.4"), "状态行更新");
+        let content = read_log_until(&log, "set_model", 1000).expect("应发出 set_model");
+        assert!(content.contains(r#""provider":"openai""#), "{content}");
+
+        // provider/id 形式也精确命中
+        app.editor.replace("/model anthropic/claude-opus");
+        crate::app::commands::dispatch(&mut app, &commander, &tx, "/model anthropic/claude-opus");
+        let content = read_log_until(&log, "anthropic", 2000).expect("第二次 set_model");
+        assert!(content.contains("claude-opus"), "{content}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn model_command_no_match_falls_back_to_selector() {
+        let (client, dir, _log) = selector_fake_pi("nomatch");
+        let commander = client.command_sender();
+        let (tx, rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        crate::app::commands::dispatch(&mut app, &commander, &tx, "/model no-such-model");
+        let mut saw_open = false;
+        for _ in 0..10 {
+            match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                Ok(UiEvent::Info(text)) => {
+                    assert!(text.contains("未找到"), "{text}");
+                }
+                Ok(UiEvent::OpenModelSelect) => {
+                    // 模拟事件循环：打开选择器
+                    app.open_model_select(&commander, &tx);
+                    saw_open = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        assert!(saw_open, "无匹配应回退打开选择器");
+        assert!(matches!(app.overlay, Some(Overlay::ModelSelect { .. })));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn thinking_command_applies_or_reports_unknown_level() {
+        let (client, dir, log) = selector_fake_pi("think");
+        let commander = client.command_sender();
+        let (tx, rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        // 精确匹配应用
+        crate::app::commands::dispatch(&mut app, &commander, &tx, "/thinking HIGH");
+        let mut applied = false;
+        let mut info = false;
+        for _ in 0..10 {
+            match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                Ok(UiEvent::AsyncData { kind: AsyncKind::ThinkingApplied, seq, data }) => {
+                    app.handle_async_data(AsyncKind::ThinkingApplied, seq, &data);
+                    applied = true;
+                }
+                Ok(UiEvent::Info(text)) => {
+                    assert!(text.contains("thinking: high"), "{text}");
+                    info = true;
+                }
+                Ok(_) => {}
+                Err(_) => {}
+            }
+            if applied && info {
+                break;
+            }
+        }
+        assert!(applied && info, "应应用级别");
+        assert_eq!(app.state.thinking_level.as_deref(), Some("high"), "状态行更新");
+        let content = read_log_until(&log, "set_thinking_level", 1000).expect("应发出 set_thinking_level");
+        assert!(content.contains(r#""level":"high""#), "{content}");
+
+        // 未知级别 → 红条列出可用项
+        crate::app::commands::dispatch(&mut app, &commander, &tx, "/thinking bogus");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut err = None;
+        while std::time::Instant::now() < deadline && err.is_none() {
+            if let Ok(UiEvent::SendFailed(msg)) = rx.recv_timeout(std::time::Duration::from_millis(300)) {
+                err = Some(msg);
+            }
+        }
+        let err = err.expect("未知级别应红条");
+        assert!(err.contains("Unknown thinking level"), "{err}");
+        assert!(err.contains("off") && err.contains("high"), "应列出可用级别: {err}");
+
+        // 无参 → 打开级别列表
+        crate::app::commands::dispatch(&mut app, &commander, &tx, "/thinking");
+        assert!(
+            matches!(app.overlay, Some(Overlay::ThinkingSelect { loading: true, .. })),
+            "{:?}",
+            app.overlay
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── /settings 简化浮层（spec：简化设置与模型范围展示） ──
+
+    #[test]
+    fn settings_opens_toggles_and_closes() {
+        let (client, dir, log) = recording_commander("settings", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        // 打开 → loading + get_state 拉取
+        app.editor.replace("/settings");
+        assert!(crate::app::commands::dispatch(&mut app, &commander, &tx, "/settings"));
+        assert!(app.editor.is_empty());
+        match &app.overlay {
+            Some(Overlay::Settings { loading: true, .. }) => {}
+            other => panic!("{other:?}"),
+        }
+        read_log_until(&log, "get_state", 2000).expect("应拉 get_state");
+
+        // 数据回填（模拟事件循环处理）
+        let seq = match &app.overlay {
+            Some(Overlay::Settings { seq, .. }) => *seq,
+            other => panic!("{other:?}"),
+        };
+        app.handle_async_data(
+            AsyncKind::SettingsState,
+            seq,
+            &serde_json::json!({"autoCompactionEnabled": true, "model": "openai/gpt-5.4"}),
+        );
+        match &app.overlay {
+            Some(Overlay::Settings {
+                loading: false,
+                auto_compaction: Some(true),
+                model,
+                ..
+            }) => {
+                assert_eq!(model.as_deref(), Some("openai/gpt-5.4"));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // Enter 第 0 行 → set_auto_compaction(false 翻转)
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commander, &tx);
+        let content = read_log_until(&log, "set_auto_compaction", 2000).expect("应发送开关");
+        assert!(content.contains(r#""enabled":false"#), "{content}");
+
+        // 下移到 autoRetry + Enter → set_auto_retry
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &commander, &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commander, &tx);
+        let content = read_log_until(&log, "set_auto_retry", 2000).expect("应发送 retry 开关");
+        assert!(content.contains(r#""enabled":true"#), "{content}");
+
+        // Esc 关闭
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &commander, &tx);
+        assert!(app.overlay.is_none(), "Esc 关闭");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scoped_models_shows_readonly_list() {
+        let (client, dir, _log) = selector_fake_pi("scoped");
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        app.editor.replace("/scoped-models");
+        assert!(crate::app::commands::dispatch(&mut app, &commander, &tx, "/scoped-models"));
+        // 回填可用模型
+        let seq = match &app.overlay {
+            Some(Overlay::ScopedModels { seq, .. }) => *seq,
+            other => panic!("{other:?}"),
+        };
+        app.handle_async_data(
+            AsyncKind::ScopedModels,
+            seq,
+            &serde_json::json!({"models":[{"provider":"openai","id":"gpt-5.4"},{"provider":"anthropic","id":"claude-opus"}]}),
+        );
+        match &app.overlay {
+            Some(Overlay::ScopedModels { models, loading, .. }) => {
+                assert!(!*loading);
+                assert_eq!(models.len(), 2);
+            }
+            other => panic!("{other:?}"),
+        }
+        // 只读：↑↓/Esc 不发送任何命令（这里仅断言浮层仍在、Esc 关闭）
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &commander, &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &commander, &tx);
+        assert!(app.overlay.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── /export /import（spec：会话导出 / 会话导入） ──
+
+    #[test]
+    fn export_jsonl_copies_and_html_uses_rpc() {
+        let (client, dir, log) = recording_commander("export", r#"{"steering":[],"path":"/tmp/x.html"}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        // 无会话文件 → 红条
+        app.editor.replace("/export");
+        assert!(crate::app::commands::dispatch(&mut app, &commander, &tx, "/export"));
+        let (text, color) = app.notice.clone().unwrap();
+        assert!(text.contains("无当前会话文件"), "{text}");
+        assert_eq!(color, Color::Red);
+
+        // 默认路径纯函数
+        let cwd = std::path::Path::new("/tmp");
+        assert_eq!(
+            App::default_export_path("/x/1712345678_abcDEF123.jsonl", cwd),
+            std::path::Path::new("/tmp/session-abcDEF123.jsonl")
+        );
+        assert_eq!(
+            App::default_export_path("/x/no-underscore.jsonl", cwd),
+            std::path::Path::new("/tmp/session-export.jsonl")
+        );
+
+        // 指定 .jsonl → 本地复制
+        let src = dir.join("src.jsonl");
+        std::fs::write(&src, "{\"type\":\"message\"}\n").unwrap();
+        let dst = dir.join("out.jsonl");
+        app.session_file = Some(src.to_string_lossy().to_string());
+        app.editor.replace(&format!("/export {}", dst.display()));
+        assert!(crate::app::commands::dispatch(
+            &mut app,
+            &commander,
+            &tx,
+            &format!("/export {}", dst.display())
+        ));
+        let copied = std::fs::read_to_string(&dst).expect("应产出文件");
+        assert!(copied.contains("message"), "{copied}");
+        let (text, color) = app.notice.clone().unwrap();
+        assert!(text.contains("已导出"), "{text}");
+        assert_eq!(color, Color::Green);
+
+        // 非 .jsonl → export_html RPC
+        app.editor.replace("/export /tmp/out.html");
+        assert!(crate::app::commands::dispatch(&mut app, &commander, &tx, "/export /tmp/out.html"));
+        let content = read_log_until(&log, "export_html", 2000).expect("应发 export_html");
+        assert!(content.contains("/tmp/out.html"), "{content}");
+
+        // ExportDone → 绿条路径提示
+        app.handle_async_data(
+            AsyncKind::ExportDone,
+            0,
+            &serde_json::json!({"path": "/tmp/out.html"}),
+        );
+        let (text, color) = app.notice.clone().unwrap();
+        assert!(text.contains("/tmp/out.html"), "{text}");
+        assert_eq!(color, Color::Green);
+
+        // 不可写目标 → 红条
+        app.editor.replace("/export /nonexistent-dir/x.jsonl");
+        crate::app::commands::dispatch(&mut app, &commander, &tx, "/export /nonexistent-dir/x.jsonl");
+        let (text, color) = app.notice.clone().unwrap();
+        assert!(text.contains("Failed to export"), "{text}");
+        assert_eq!(color, Color::Red);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_validates_then_confirms_then_switches() {
+        let (client, dir, log) = recording_commander("import", r#"{"cancelled":false}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        // 无参 → 用法提示
+        app.editor.replace("/import");
+        assert!(crate::app::commands::dispatch(&mut app, &commander, &tx, "/import"));
+        let (text, color) = app.notice.clone().unwrap();
+        assert!(text.contains("Usage"), "{text}");
+        assert_eq!(color, Color::Yellow);
+        assert!(app.overlay.is_none());
+
+        // 源不存在 → 红条不开浮层
+        crate::app::commands::dispatch(&mut app, &commander, &tx, "/import /no/such.jsonl");
+        let (text, color) = app.notice.clone().unwrap();
+        assert!(text.contains("不存在"), "{text}");
+        assert_eq!(color, Color::Red);
+        assert!(app.overlay.is_none(), "失败不开确认");
+
+        // 合法源 → 确认浮层；取消不复制不切换
+        let src = dir.join("import-src.jsonl");
+        std::fs::write(
+            &src,
+            "{\"type\":\"session\",\"cwd\":\"/tmp\"}\n{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n",
+        )
+        .unwrap();
+        crate::app::commands::dispatch(
+            &mut app,
+            &commander,
+            &tx,
+            &format!("/import {}", src.display()),
+        );
+        assert!(
+            matches!(app.overlay, Some(Overlay::ImportConfirm { cursor: 0, .. })),
+            "{:?}",
+            app.overlay
+        );
+        // 下移到"取消"回车 → 取消提示、无 RPC
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &commander, &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commander, &tx);
+        assert!(app.overlay.is_none(), "取消后关闭");
+        let (text, color) = app.notice.clone().unwrap();
+        assert!(text.contains("cancelled"), "{text}");
+        assert_eq!(color, Color::Yellow);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let sent = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(!sent.contains("switch_session"), "取消不切换: {sent}");
+
+        // 重新确认 → 复制进项目会话目录 + switch_session
+        crate::app::commands::dispatch(
+            &mut app,
+            &commander,
+            &tx,
+            &format!("/import {}", src.display()),
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commander, &tx);
+        assert!(app.overlay.is_none(), "确认后关闭");
+        let content = read_log_until(&log, "switch_session", 3000).expect("应发 switch_session");
+        assert!(content.contains("import-src.jsonl"), "目标为复制件: {content}");
+        let (dest_dir, _) = crate::app::sessions::project_sessions_dir();
+        assert!(dest_dir.join("import-src.jsonl").is_file(), "文件已复制进项目目录");
+        let _ = std::fs::remove_file(dest_dir.join("import-src.jsonl"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

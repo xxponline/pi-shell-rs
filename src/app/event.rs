@@ -25,6 +25,8 @@ pub enum UiEvent {
     RestoreQueued(serde_json::Value),
     /// 成功类提示（如"✓ 会话已删除"），显示为绿色通知。
     Info(String),
+    /// /model 参数无精确匹配时回退打开模型选择器。
+    OpenModelSelect,
     /// 一次性线程取回的异步数据（选择器加载/模型与级别应用结果）。
     AsyncData { kind: AsyncKind, seq: u64, data: serde_json::Value },
 }
@@ -58,6 +60,18 @@ pub enum AsyncKind {
     Tree,
     /// get_session_stats 响应：填充信息面板（按 seq）。
     Stats,
+    /// get_available_models 响应：填充 /model 参数补全缓存。
+    ArgCacheModels,
+    /// get_available_thinking_levels 响应：填充 /thinking 参数补全缓存。
+    ArgCacheLevels,
+    /// get_last_assistant_text 响应：/copy 写入剪贴板。
+    CopyText,
+    /// /settings 打开时的 get_state 响应：回填开关与模型只读行。
+    SettingsState,
+    /// /scoped-models 的 get_available_models 响应：填充只读列表。
+    ScopedModels,
+    /// export_html 响应：{path} → 绿条提示。
+    ExportDone,
 }
 
 /// Spawn the keyboard + RPC reader threads. Returns the receiving end and a

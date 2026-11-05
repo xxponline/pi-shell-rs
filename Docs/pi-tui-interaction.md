@@ -158,7 +158,7 @@ macOS 实现）。
 | 4 | alt+enter 空闲时 = 普通 Enter | ✅ 已对齐（空闲=prompt，流式=follow_up） | ~~中~~ 已完成 |
 | 5 | **双击 esc**（500ms）开 tree/fork（可设置） | 无 | 低（依赖 4b） |
 | 6 | `!cmd` bash 模式（边框变色、!! 排除上下文） | 无 | 中 |
-| 7 | 本地 slash 命令（26 个） | ✅ 设施已建 + 会话子集 9 个（/resume /tree /new /clone /fork /session /name /compact /quit）；其余 17 个随后续变更 | ~~分批~~ 部分完成 |
+| 7 | 本地 slash 命令（26 个） | ✅ 24 个内置命令全部落地（9 实现自 4b + 本 change 补齐 15：9 真实现 / 2 简化 / 4 桩），**斜杠补全菜单**同步复刻；详见 `Docs/slash-commands.md` | ~~分批~~ 已完成 |
 | 8 | 编辑器 Emacs 全套（词移动/删除、yank、undo、历史） | ✅ 已对齐（多行+光标+词行删除+kill-ring/yank+undo；历史 pi 默认未绑定→不做） | ~~高~~ 已完成 |
 | 9 | ctrl+g 外部编辑器、ctrl+x 复制、ctrl+v 粘贴图片 | 无 | 中 |
 | 10 | shift+enter 换行（编辑器内多行） | ✅ 已对齐（shift+enter/ctrl+j 换行，输入区动态增高） | ~~高~~ 已完成 |
@@ -179,6 +179,7 @@ macOS 实现）。
 
 - ~~差异 **#1、#2、#3、#4、#8、#10** → "操作逻辑对齐" change~~
   → ✅ 已由 change `align-interaction-semantics` 完成（真机 13 项验收通过）。
-- 差异 **#5、#7** 依赖 4b（会话树）与斜杠命令设施，随 4b 立项。
+- ~~差异 #5、#7 依赖 4b~~ → **#7 已由 change `add-remaining-slash-commands` 完成**
+  （24 命令 + 补全菜单）；**#5 双击 esc 开树**仍待立项。
 - **#6 bash 模式**依赖 `bash`/`abort_bash` RPC（已有命令），可独立小 change。
 - 其余低优先项按需后置。
