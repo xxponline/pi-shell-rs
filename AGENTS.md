@@ -15,6 +15,7 @@
 | `Docs/library-and-replay.md` | `rpc` / `session` 库模块 API 与离线回放用法 |
 | `Docs/tui-usage.md` | TUI 启动方式、键位、与原生 pi 的已知差异 |
 | `Docs/probe-usage.md` | 协议探针用法（抓取真实事件流归档） |
+| `Docs/pi-tui-interaction.md` | pi TUI 操作逻辑整理（分发模型/键位全表/差异清单——复刻基准） |
 | `openspec/specs/` | 持久能力规格（rpc-probe / rpc-client / session-state / tui-app） |
 
 ## 编码规范
