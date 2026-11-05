@@ -205,6 +205,12 @@ model/session/tree/thinking 选择器，extension_ui 9 种 method，write/grep/f
   extension UI 9 method + write/grep/find/ls 卡片
 - **4b 待立项**：session 选择器 / 会话树 / 新建·重命名·删除 / compact 流程
 
+操作逻辑对齐 ✅（change `align-interaction-semantics`）：按
+[`pi-tui-interaction.md`](./pi-tui-interaction.md) 差异清单完成 #1/2/3/4/8/10——
+流式 steer、ctrl+c/ctrl+d/esc 语义、队列恢复、多行编辑器（光标/词行删除/
+kill-ring/yank/undo）。剩余：#5 双击 esc、#6 bash 模式、#7 slash 命令、
+#9 剪贴板/外部编辑器等（见差异表）。
+
 ## 7. 既定技术决策记录
 
 - 运行时：探针已用 std 三线程（无 tokio）。主 TUI 的并发模型（继续 std +

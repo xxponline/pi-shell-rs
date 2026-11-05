@@ -152,16 +152,16 @@ macOS 实现）。
 
 | # | pi 行为 | 我们现状 | 优先级 |
 |---|---|---|---|
-| 1 | **Enter 流式中 = steer**（prompt 带 streamingBehavior） | 直接发 prompt（默认行为，未显式 steer） | 高·需验证语义 |
-| 2 | **ctrl+c = 清空，双击退出**；esc 空闲不退出 | ctrl+c 立即退出；esc 空闲=退出；q=退出 | 高·交互习惯 |
-| 3 | esc 流式 = abort **+ 恢复队列回编辑器** | 只发 abort | 中 |
-| 4 | alt+enter 空闲时 = 普通 Enter | 恒为 follow_up | 中 |
+| 1 | **Enter 流式中 = steer**（prompt 带 streamingBehavior） | ✅ 已对齐（流式 prompt 自动携带 steer） | ~~高~~ 已完成 |
+| 2 | **ctrl+c = 清空，双击退出**；esc 空闲不退出 | ✅ 已对齐（q 退化为普通字符，退出=ctrl+d 空/双击 ctrl+c） | ~~高~~ 已完成 |
+| 3 | esc 流式 = abort **+ 恢复队列回编辑器** | ✅ 已对齐（abort + clear_queue 回填） | ~~中~~ 已完成 |
+| 4 | alt+enter 空闲时 = 普通 Enter | ✅ 已对齐（空闲=prompt，流式=follow_up） | ~~中~~ 已完成 |
 | 5 | **双击 esc**（500ms）开 tree/fork（可设置） | 无 | 低（依赖 4b） |
 | 6 | `!cmd` bash 模式（边框变色、!! 排除上下文） | 无 | 中 |
 | 7 | 本地 slash 命令（26 个） | 无（斜杠设施未建） | 分批（/thinking 已用 alt+t 替代） |
-| 8 | 编辑器 Emacs 全套（词移动/删除、yank、undo、历史） | 字符+退格 | 高·体验核心 |
+| 8 | 编辑器 Emacs 全套（词移动/删除、yank、undo、历史） | ✅ 已对齐（多行+光标+词行删除+kill-ring/yank+undo；历史 pi 默认未绑定→不做） | ~~高~~ 已完成 |
 | 9 | ctrl+g 外部编辑器、ctrl+x 复制、ctrl+v 粘贴图片 | 无 | 中 |
-| 10 | shift+enter 换行（编辑器内多行） | 输入恒单行提交 | 高 |
+| 10 | shift+enter 换行（编辑器内多行） | ✅ 已对齐（shift+enter/ctrl+j 换行，输入区动态增高） | ~~高~~ 已完成 |
 | 11 | 扩展快捷键最高优先级 | 未实现 | 低 |
 | 12 | 选择列表分页（pageUp/Down）、历史键可覆盖 | 选择器仅 ↑↓ | 低 |
 | 13 | Windows 键位分支 | 仅 macOS | 忽略（个人项目） |
@@ -177,8 +177,8 @@ macOS 实现）。
 
 ## 7. 后续建议归属
 
-- 差异 **#1、#2、#3、#4、#8、#10**（提交/中断/编辑器语义）→ 适合合并为一个
-  **"操作逻辑对齐" change**（不加新功能，纯对齐交互语义 + 编辑器能力）。
+- ~~差异 **#1、#2、#3、#4、#8、#10** → "操作逻辑对齐" change~~
+  → ✅ 已由 change `align-interaction-semantics` 完成（真机 13 项验收通过）。
 - 差异 **#5、#7** 依赖 4b（会话树）与斜杠命令设施，随 4b 立项。
 - **#6 bash 模式**依赖 `bash`/`abort_bash` RPC（已有命令），可独立小 change。
 - 其余低优先项按需后置。

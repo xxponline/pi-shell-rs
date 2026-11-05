@@ -14,8 +14,12 @@ use crate::app::wrap::wrap_for_viewport;
 /// 一帧所需的全部 UI 附加输入（与会话状态解耦，便于测试构造）。
 #[derive(Default)]
 pub struct ViewUi<'a> {
-    /// 主输入框文本。
+    /// 主输入框文本（含 \n 的全文）。
     pub input: &'a str,
+    /// 输入框逻辑行数（决定动态高度）。
+    pub input_lines: usize,
+    /// 输入框光标（行, 列）；None 表示隐藏（如浮层打开时）。
+    pub input_cursor: Option<(usize, usize)>,
     /// 瞬时提示与颜色。
     pub notice: Option<(&'a str, Color)>,
     /// setStatus 的状态行附加文本。
@@ -40,6 +44,7 @@ pub fn render(frame: &mut Frame, state: &SessionState, ui: &ViewUi<'_>) {
     } else {
         ui.widget_lines.len() as u16 + 1
     };
+    let editor_h = editor_height(ui.input_lines.max(1));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -47,7 +52,7 @@ pub fn render(frame: &mut Frame, state: &SessionState, ui: &ViewUi<'_>) {
             Constraint::Min(1),               // chat
             Constraint::Length(queue_h),      // queue strip（空队列不占行）
             Constraint::Length(widget_h),     // extension widget（未设置不占行）
-            Constraint::Length(3),            // input
+            Constraint::Length(editor_h),     // input（随行数增长，上限 8）
         ])
         .split(area);
 
@@ -72,7 +77,25 @@ pub fn render(frame: &mut Frame, state: &SessionState, ui: &ViewUi<'_>) {
             chunks[3],
         );
     }
-    render_editor(frame, chunks[4], ui.input, state.phase);
+    // 浮层打开时隐藏终端光标（避免光标漂在浮层上）
+    let editor_ui = ViewUi {
+        input_cursor: if ui.overlay.is_some() {
+            None
+        } else {
+            ui.input_cursor
+        },
+        ..ViewUi {
+            input: ui.input,
+            input_lines: ui.input_lines,
+            input_cursor: ui.input_cursor,
+            notice: ui.notice,
+            status_text: ui.status_text,
+            widget_lines: ui.widget_lines,
+            flags: ui.flags,
+            overlay: ui.overlay,
+        }
+    };
+    render_editor(frame, chunks[4], &editor_ui, state.phase);
 
     if let Some(overlay) = ui.overlay {
         crate::app::overlay::render_overlay(frame, overlay);
@@ -223,16 +246,49 @@ fn render_chat(
     frame.render_widget(paragraph.block(Block::default().borders(Borders::NONE)), area);
 }
 
-fn render_editor(frame: &mut Frame, area: ratatui::layout::Rect, input: &str, phase: Phase) {
+/// 输入区高度：clamp(逻辑行数 + 2 边框, 3, 8)——随行数增长但不挤压消息区。
+///
+/// 输入: lines — 逻辑行数（至少 1）
+/// 输出: 输入框总高度（含上下边框）
+fn editor_height(lines: usize) -> u16 {
+    (lines as u16 + 2).clamp(3, 8)
+}
+
+/// 渲染输入框：多行文本 + 滚动偏移（保证光标可见）+ 终端光标定位。
+///
+/// 输入: frame — ratatui 帧；area — 输入框区域；ui — 视图输入（文本/行数/光标）；
+///       phase — 会话状态（决定边框提示）
+/// 输出: 无返回值；副作用为绘制输入框与（光标未隐藏时）设置终端光标
+fn render_editor(frame: &mut Frame, area: ratatui::layout::Rect, ui: &ViewUi<'_>, phase: Phase) {
     let hint = match phase {
         Phase::Streaming => "esc: abort",
-        Phase::Idle => "enter: send · q/esc: quit",
+        Phase::Idle => "enter: send · ctrl+d: quit",
     };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" input ({hint}) "));
-    let paragraph = Paragraph::new(input.to_string()).block(block);
-    frame.render_widget(paragraph, area);
+
+    // 可视内部区与滚动偏移（水平+垂直，保证光标列/行可见）
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let (cur_row, cur_col) = ui.input_cursor.unwrap_or((0, 0));
+    let row_off = (cur_row + 1).saturating_sub(inner_h);
+    let col_off = (cur_col + 1).saturating_sub(inner_w);
+    let visible: Vec<Line> = ui
+        .input
+        .split('\n')
+        .skip(row_off)
+        .take(inner_h.max(1))
+        .map(|l| Line::from(l.chars().skip(col_off).take(inner_w).collect::<String>()))
+        .collect();
+    frame.render_widget(Paragraph::new(visible).block(block), area);
+
+    // 终端光标定位（浮层打开时 input_cursor=None → 不设置）
+    if ui.input_cursor.is_some() && inner_w > 0 && area.height >= 2 {
+        let cx = area.x + 1 + (cur_col.saturating_sub(col_off)) as u16;
+        let cy = area.y + 1 + (cur_row.saturating_sub(row_off)) as u16;
+        frame.set_cursor_position((cx.min(area.x + area.width - 2), cy));
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -529,5 +585,104 @@ mod render_tests {
             }
         }
         assert!(!out2.contains("widget line 1"), "{out2}");
+    }
+
+    #[test]
+    fn editor_height_scales_and_caps() {
+        assert_eq!(editor_height(1), 3, "最小 3（含边框）");
+        assert_eq!(editor_height(6), 8, "6 行 → 6+2=8");
+        assert_eq!(editor_height(20), 8, "上限 8");
+        assert_eq!(editor_height(0), 3, "0 视为 1");
+    }
+
+    /// 渲染带输入元数据的一帧，返回 (缓冲文本, 终端光标)。
+    fn render_with_input(
+        state: &SessionState,
+        input: &str,
+        lines: usize,
+        cursor: Option<(usize, usize)>,
+        w: u16,
+        h: u16,
+    ) -> (String, (u16, u16)) {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let ui = ViewUi {
+                    input,
+                    input_lines: lines,
+                    input_cursor: cursor,
+                    ..ViewUi::default()
+                };
+                render(frame, state, &ui);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        let pos = terminal.get_cursor_position().unwrap_or_default();
+        (out, (pos.x, pos.y))
+    }
+
+    fn input_title_row(buf: &str) -> usize {
+        buf.lines()
+            .position(|l| l.contains("input ("))
+            .expect("input title row")
+    }
+
+    #[test]
+    fn dynamic_editor_height_keeps_message_visible() {
+        let mut state = SessionState::new();
+        state.handle(&serde_json::json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"HELLO-MARKER"}]}}));
+
+        // 1 行输入 → 输入框 3 高，标题在 y=27（30-3）
+        let (short, _) = render_with_input(&state, "a", 1, Some((0, 0)), 60, 30);
+        assert!(short.contains("HELLO-MARKER"), "消息区可见: {short}");
+        assert_eq!(input_title_row(&short), 27);
+
+        // 20 行输入 → 输入框 8 高（上限），标题上移到 y=22，消息区仍可见
+        let long_input = (0..20).map(|i| format!("L{i}")).collect::<Vec<_>>().join("\n");
+        let (long, _) = render_with_input(&state, &long_input, 20, Some((19, 2)), 60, 30);
+        assert!(long.contains("HELLO-MARKER"), "消息区仍可见: {long}");
+        assert_eq!(input_title_row(&long), 22, "20 行输入 → 高度 8");
+        assert!(long.contains("L19"), "末行渲染: {long}");
+    }
+
+    #[test]
+    fn cursor_visible_via_scroll_offsets() {
+        let state = SessionState::new();
+
+        // 长行：光标在行尾 → 水平偏移使尾部可见
+        let long_line = "x".repeat(200);
+        let input = format!("{long_line}TAIL-END");
+        let (buf, (cx, cy)) = render_with_input(&state, &input, 1, Some((0, input.chars().count() - 1)), 60, 30);
+        assert!(buf.contains("TAIL-END"), "行尾应因水平偏移可见");
+        // 光标应落在输入框内（y ∈ [27,30)，x ∈ [1,59)）
+        assert!((27..30).contains(&cy), "cursor y: {cy}");
+        assert!((1..59).contains(&cx), "cursor x: {cx}");
+
+        // 多行：光标在第 19 行 → 垂直偏移使末行可见
+        let many = (0..20).map(|i| format!("row-{i}")).collect::<Vec<_>>().join("\n");
+        let (buf2, (cx2, cy2)) = render_with_input(&state, &many, 20, Some((19, 4)), 60, 30);
+        assert!(buf2.contains("row-19"), "末行可见");
+        assert!(!buf2.contains("row-0\n"), "首行滚出可视区"); // 粗略断言
+        assert!((22..30).contains(&cy2), "cursor y in editor: {cy2}");
+        assert!(cx2 >= 1, "cursor x: {cx2}");
+
+        // 光标隐藏（浮层态）→ 不设置光标（位置为默认原点或上次值，不 panic）
+        let (_, _) = render_with_input(&state, "abc", 1, None, 40, 12);
+    }
+
+    #[test]
+    fn extreme_input_stress_no_panic() {
+        let state = SessionState::new();
+        let huge = (0..60).map(|i| format!("{i}{}", "字".repeat(200))).collect::<Vec<_>>().join("\n");
+        let (buf, _) = render_with_input(&state, &huge, 60, Some((59, 100)), 40, 15);
+        assert!(buf.contains("input ("), "输入框仍在");
     }
 }

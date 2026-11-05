@@ -8,17 +8,38 @@
 
 use std::io;
 use std::panic;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use crossterm::event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
 use crossterm::terminal::disable_raw_mode;
 use ratatui::DefaultTerminal;
+
+/// kitty 键盘增强是否已推送（restore 时弹出；静态供 panic hook 使用）。
+static KB_PUSHED: AtomicBool = AtomicBool::new(false);
 
 pub struct TerminalGuard {
     raw_enabled: bool,
 }
 
 impl TerminalGuard {
+    /// 进入 raw mode，并在终端支持时开启 kitty 键盘增强协议。
+    ///
+    /// 背景：`shift+enter`（13;2u）与 `ctrl+-`（45;5u，undo 键）等修饰键
+    /// 只有在增强协议下才会以正确键码上报；裸字节会被解析成别的键
+    /// （如 0x1f → ctrl+7）。不支持的终端忽略推送，键位优雅降级。
+    ///
+    /// 输入: 无
+    /// 输出: Ok(TerminalGuard)；启用 raw mode 失败时 Err
     pub fn enter() -> io::Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
+        // 查询需在 raw mode 下、事件线程启动前进行（内部会读 stdin 应答）。
+        if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+            let _ = crossterm::execute!(
+                io::stdout(),
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            );
+            KB_PUSHED.store(true, Ordering::SeqCst);
+        }
         install_panic_hook();
         Ok(Self {
             raw_enabled: true,
@@ -30,10 +51,14 @@ impl TerminalGuard {
         ratatui::init()
     }
 
-    /// Restore the terminal to its normal state (idempotent).
+    /// 恢复终端到正常状态（幂等）：退出 alt screen、退出 raw mode、
+    /// 若推送过 kitty 键盘增强则弹出。
     pub fn restore_now() {
         // ratatui::restore() leaves the alternate screen and disables raw mode.
         ratatui::restore();
+        if KB_PUSHED.swap(false, Ordering::SeqCst) {
+            let _ = crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
     }
 
     /// Normal-end restore: unwinds and disarms so `Drop` won't repeat it.

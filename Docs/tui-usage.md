@@ -53,21 +53,35 @@ cargo run                       # 默认运行 TUI（default-run）
 
 ## 键位
 
+> **键位语义已对齐原生 pi**（见 [`pi-tui-interaction.md`](./pi-tui-interaction.md)）。
+> 注意：`Shift+Enter` 与 `Ctrl+-`（undo）依赖 **kitty 键盘增强协议**（启动时自动探测，
+> iTerm2/kitty/wezterm 支持；不支持的终端请用 Ctrl+J 换行）。启动探测最多等待 2 秒。
+
 | 按键 | 行为 |
 |---|---|
-| 可打印字符 / 退格 | 编辑输入（超长会自动换行显示） |
-| Enter | 发送 prompt（空/全空白不发送）；发送后输入框清空 |
-| alt+Enter | 发送 follow_up（流式中排队，不打断当前生成） |
-| alt+Up | 取回全部排队消息到输入框（等价 clear_queue；队列空时无操作） |
+| 可打印字符 / 退格 | 编辑输入（多行缓冲，光标处编辑） |
+| Enter | 发送 prompt（空/空行不发送）；流式中 = **steer 打断重定向**（带 streamingBehavior） |
+| Shift+Enter / Ctrl+J | 换行（多行输入，输入区随行数增高、上限 8 行） |
+| Alt+Enter | 流式中排队 follow_up；**空闲时等同普通 Enter** |
+| Alt+Up | 取回全部排队消息到输入框（clear_queue；队列空时无操作） |
+| 光标 | ←→/Ctrl+B/F、↑↓ 跨行、Home/Ctrl+A、End/Ctrl+E、Alt+←→（词） |
+| 删除 | Delete（向后删）、Ctrl+W/Alt+Backspace（后删词）、Alt+D（前删词）、Ctrl+U（删至行首）、Ctrl+K（删至行尾） |
+| kill-ring | Ctrl+K/U/W/D 的删除入环；Ctrl+Y 粘贴、Alt+Y 回退粘贴（yank-pop） |
+| Undo | Ctrl+-（kitty 终端）撤销最近一次编辑 |
+| Ctrl+C | **单击=清空输入；500ms 内双击=退出** |
+| Ctrl+D | **仅输入为空时退出**（非空 = 光标处向后删字符） |
+| Esc（流式中） | 发送 abort **并恢复排队消息到输入框**，回到空闲 |
+| Esc（空闲） | **无操作**（不退出、不清空——对齐 pi） |
 | Ctrl+T | 切换 thinking 块展开/折叠（默认折叠为单行占位） |
 | Ctrl+O | 切换工具卡片输出展开/折叠（默认显示头行+前 3 行） |
 | Ctrl+L | 打开模型选择器（↑/↓ 导航，Enter 应用，Esc 取消） |
 | Ctrl+P / Shift+Ctrl+P | 循环切换模型（下一个 / 上一个） |
 | Shift+Tab | 循环 thinking 级别 |
 | Alt+T | 打开 thinking 级别列表选择 |
-| Esc（流式中） | 发送 abort 中断生成，回到空闲 |
-| Esc 或 q（空闲时） | 退出 |
-| Ctrl-C | 随时安全退出（恢复终端） |
+| Ctrl+F1 等 | F 系列与未绑定组合均被忽略（不插入字符） |
+
+**退出方式只有两种**：`Ctrl+D`（输入为空）与 `Ctrl+C` 双击。`q` 和空闲 `Esc` 不再退出
+（`q` 是普通字符——输入含 q 的单词不会误退出，与 pi 一致）。
 
 流式期间按 q **不会**退出（会作为文本进入输入框），与 pi 的"esc 中断优先"语义一致。
 
@@ -85,6 +99,10 @@ cargo run                       # 默认运行 TUI（default-run）
 - 扩展 `editor` 弹层为终端内最小多行编辑（Enter 提交 / Alt+Enter 换行），
   不含 pi 编辑器的 kill-ring/undo/外部 $EDITOR（Ctrl+G）等高级能力。
 - 选择器暂无输入即筛（fuzzy filter），靠 ↑/↓ 导航。
+- **Shift+Enter / Ctrl+- 依赖 kitty 键盘协议**（启动时探测，最多 2s；不支持的
+  终端上换行请用 Ctrl+J，undo 无替代键）。
+- 输入区超长单行按水平滚动显示（不视觉换行）；无输入历史/自动补全
+  （pi 的历史键默认也未绑定，tab 补全是后续独立变更）。
 
 ## 排查
 
