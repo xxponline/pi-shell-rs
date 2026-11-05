@@ -89,6 +89,7 @@ cargo run                       # 默认运行 TUI（default-run）
 | kill-ring | Ctrl+K/U/W/D 的删除入环；Ctrl+Y 粘贴、Alt+Y 回退粘贴（yank-pop） |
 | Undo | Ctrl+-（kitty 终端）撤销最近一次编辑 |
 | Ctrl+C | **单击=清空输入；500ms 内双击=退出** |
+| Esc ×2（空输入，500ms 内） | **打开会话树**（按 `doubleEscapeAction` 设置：tree/fork=开树，none=禁用；`/settings` 可改）——单次 Esc 无动作 |
 | Ctrl+D | **仅输入为空时退出**（非空 = 光标处向后删字符） |
 | Esc（流式中） | 发送 abort **并恢复排队消息到输入框**，回到空闲 |
 | Esc（空闲） | **无操作**（不退出、不清空——对齐 pi） |
@@ -102,7 +103,8 @@ cargo run                       # 默认运行 TUI（default-run）
 | Alt+T | 打开 thinking 级别列表选择 |
 | Ctrl+F1 等 | F 系列与未绑定组合均被忽略（不插入字符） |
 
-**退出方式只有两种**：`Ctrl+D`（输入为空）与 `Ctrl+C` 双击。`q` 和空闲 `Esc` 不再退出
+**退出方式只有两种**：`Ctrl+D`（输入为空）与 `Ctrl+C` 双击。`q` 不退出；空闲 `Esc`
+单击无动作、**双击（空输入）打开会话树**
 （`q` 是普通字符——输入含 q 的单词不会误退出，与 pi 一致）。
 
 流式期间按 q **不会**退出（会作为文本进入输入框），与 pi 的"esc 中断优先"语义一致。

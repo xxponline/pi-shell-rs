@@ -23,7 +23,7 @@
 
 | # | 命令 | 状态 | 行为与差异 |
 |---|---|---|---|
-| 1 | `/settings` | ⚠️ 简化 | autoCompact / autoRetry 两开关（`set_auto_compaction` / `set_auto_retry`）+ 当前模型只读行。pi 完整设置（默认模型编辑、图片尺寸、skills 开关等）未做——RPC 无全量 settings 读写方法 |
+| 1 | `/settings` | ⚠️ 简化 | autoCompact / autoRetry 两开关（`set_auto_compaction` / `set_auto_retry`）+ `doubleEsc` 动作行（`tree→fork→none` 循环，写回 `~/.pi/agent/settings.json` 的 `doubleEscapeAction`，保留其它键、损坏拒绝写入，立即生效）+ 当前模型只读行。pi 完整设置（默认模型编辑、图片尺寸、skills 开关等）未做——RPC 无全量 settings 读写方法；**只读全局 settings.json**（pi 的项目级 `.pi/settings.json` 覆盖未实现，与 sessionDir 读取一致） |
 | 2 | `/model [搜索]` | ✅ | 无参开选择器（同 ctrl+l）；精确匹配 `provider/id` 或 `id`（大小写不敏感）直接 `set_model` + 绿条；未命中回退选择器（对齐 pi）。参数补全 = 可用模型列表 |
 | 3 | `/tree` | ✅ | 会话树：导航 / 折叠 / 5 种过滤（ctrl+o）/ Enter 分支（4b） |
 | 4 | `/thinking [级别]` | ✅ | 无参开级别列表（同 alt+t）；精确匹配（大小写不敏感）直接应用；未知级别红条列出全部可用项。参数补全 = 可用级别 |
@@ -54,6 +54,9 @@
 - 单独 `/` 或全空白输入不触发分发
 - 消息中部出现的 `/` 不触发补全菜单
 - 彩蛋命令（`/arminsayshi`、`/dementedelves`）与 `/debug` 未实现（pi 内部调试项）
+- **双击 Esc**（空输入、500ms 内）按 `doubleEscapeAction` 开树——默认 `tree`；
+  `fork` 也开树（沿用 `/fork` = 树的简化，pi 的 fork 是"选择历史用户消息"）；
+  设置在 `/settings` 的 doubleEsc 行修改
 
 ## 相关文档
 

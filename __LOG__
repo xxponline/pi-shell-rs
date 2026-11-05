@@ -56,3 +56,15 @@
 {"id":"client-9","type":"get_available_thinking_levels"}
 {"id":"client-3","type":"get_available_models"}
 {"id":"client-11","type":"get_available_thinking_levels"}
+{"id":"client-4","type":"get_available_models"}
+{"id":"client-12","type":"get_available_thinking_levels"}
+{"id":"client-4","type":"get_available_models"}
+{"id":"client-11","type":"get_available_thinking_levels"}
+{"id":"client-2","type":"get_available_models"}
+{"id":"client-10","type":"get_available_thinking_levels"}
+{"id":"client-3","type":"get_available_models"}
+{"id":"client-10","type":"get_available_thinking_levels"}
+{"id":"client-2","type":"get_available_models"}
+{"id":"client-3","type":"get_available_thinking_levels"}
+{"id":"client-3","type":"get_available_models"}
+{"id":"client-10","type":"get_available_thinking_levels"}

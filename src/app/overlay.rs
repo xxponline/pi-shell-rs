@@ -89,6 +89,8 @@ pub enum Overlay {
         auto_compaction: Option<bool>,
         /// autoRetry 开关（RPC 无 getter，首次显示 —，切换后本地跟踪）。
         auto_retry: Option<bool>,
+        /// doubleEsc 动作（tree/fork/none，打开时现读 settings.json）。
+        double_esc: Option<String>,
         /// 当前模型（只读）。
         model: Option<String>,
     },
@@ -288,7 +290,7 @@ pub fn overlay_key(o: &mut Overlay, key: KeyEvent) -> OverlayOutcome {
                     OverlayOutcome::Handled
                 }
                 KeyCode::Down => {
-                    *cursor = (*cursor + 1).min(1); // 两行可切换（模型行只读）
+                    *cursor = (*cursor + 1).min(2); // 三行可切换（模型/提示行只读）
                     OverlayOutcome::Handled
                 }
                 KeyCode::Enter => OverlayOutcome::Toggle(*cursor),
@@ -820,6 +822,7 @@ pub fn render_overlay(frame: &mut Frame, overlay: &Overlay, current_session: Opt
             loading,
             auto_compaction,
             auto_retry,
+            double_esc,
             model,
             ..
         } => {
@@ -846,6 +849,14 @@ pub fn render_overlay(frame: &mut Frame, overlay: &Overlay, current_session: Opt
                     Line::from(Span::styled(
                         format!("  autoRetry          {}", onoff(auto_retry)),
                         if *cursor == 1 {
+                            Style::default().fg(Color::Black).bg(Color::Cyan)
+                        } else {
+                            Style::default()
+                        },
+                    )),
+                    Line::from(Span::styled(
+                        format!("  doubleEsc          {}", double_esc.as_deref().unwrap_or("—")),
+                        if *cursor == 2 {
                             Style::default().fg(Color::Black).bg(Color::Cyan)
                         } else {
                             Style::default()

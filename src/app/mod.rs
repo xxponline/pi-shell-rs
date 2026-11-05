@@ -12,6 +12,7 @@ mod event;
 mod markdown;
 mod overlay;
 mod sessions;
+mod settings_io;
 mod tree;
 mod terminal;
 mod tools;
@@ -103,6 +104,10 @@ pub struct App {
     /// 模型/级别缓存是否已请求（防重复拉取）。
     models_requested: bool,
     levels_requested: bool,
+    /// 设置文件路径覆盖（测试注入；None = 默认 ~/.pi/agent/settings.json）。
+    settings_path: Option<std::path::PathBuf>,
+    /// 上一次"空闲且空输入"的 Esc 时刻（双击窗口判定，500ms）。
+    last_escape: Option<std::time::Instant>,
     /// thinking 是否展开（ctrl+t 切换，默认折叠）。
     show_thinking: bool,
     /// 工具输出是否展开（ctrl+o 切换，默认折叠）。
@@ -139,6 +144,8 @@ impl App {
             levels_cache: Vec::new(),
             models_requested: false,
             levels_requested: false,
+            settings_path: None,
+            last_escape: None,
             show_thinking: false,
             expand_tools: false,
             debug_log,
@@ -1029,6 +1036,55 @@ impl App {
         );
     }
 
+    /// 双击 Esc 判定（对齐 pi `onEscape`）：动作非 none 且输入为空时，
+    /// 500ms 内第二次空闲 Esc 触发（tree/fork → 打开会话树，none → 不动作）；
+    /// 首次只记录时间戳，触发后复位。非空输入的 Esc 不触发也不刷新窗口。
+    ///
+    /// 输入: commander/report_tx — 打开会话树需要的通道
+    /// 输出: 无返回值；副作用为开树或记录时间戳（含日志）
+    fn handle_double_escape(&mut self, commander: &CommandSender, report_tx: &Sender<UiEvent>) {
+        use crate::app::settings_io::DoubleEscapeAction;
+        let action =
+            crate::app::settings_io::read_double_escape_action(&self.settings_path());
+        if action == DoubleEscapeAction::None {
+            // pi：action=none 时连窗口都不追踪
+            self.log_event("key", "esc (double-escape disabled)");
+            return;
+        }
+        // 仅空（含全空白）输入参与窗口——对齐 pi 的 empty editor 条件
+        if self.can_submit() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let triggered = match self.last_escape {
+            Some(prev) if now.duration_since(prev).as_millis() < 500 => {
+                self.last_escape = None; // 触发后复位（pi: lastEscapeTime = 0）
+                true
+            }
+            _ => {
+                self.last_escape = Some(now);
+                false
+            }
+        };
+        if !triggered {
+            self.log_event("key", "esc (first of double)");
+            return;
+        }
+        self.log_event("key", &format!("double-esc → {action:?}"));
+        // fork = 树（沿用 /fork 的既有简化，design D4）
+        self.open_tree(commander, report_tx);
+    }
+
+    /// 本 App 使用的设置文件路径（测试可注入覆盖）。
+    ///
+    /// 输入: self — 应用状态
+    /// 输出: settings.json 路径
+    fn settings_path(&self) -> std::path::PathBuf {
+        self.settings_path
+            .clone()
+            .unwrap_or_else(crate::app::settings_io::settings_file_path)
+    }
+
     /// /settings：打开简化设置浮层（loading → get_state 回填开关与模型）。
     ///
     /// 输入: commander/report_tx — 发送与回报通道
@@ -1037,12 +1093,18 @@ impl App {
         self.log_event("slash", "settings");
         self.overlay_seq += 1;
         let seq = self.overlay_seq;
+        let double_esc = Some(
+            crate::app::settings_io::read_double_escape_action(&self.settings_path())
+                .as_str()
+                .to_string(),
+        );
         self.overlay = Some(Overlay::Settings {
             cursor: 0,
             loading: true,
             seq,
             auto_compaction: None,
             auto_retry: None,
+            double_esc,
             model: None,
         });
         Self::spawn_async(
@@ -1062,7 +1124,7 @@ impl App {
     /// 输出: 无返回值；副作用为发送 set_auto_* 并更新浮层状态
     fn apply_settings(
         &mut self,
-        overlay: &Overlay,
+        overlay: &mut Overlay,
         idx: usize,
         commander: &CommandSender,
         report_tx: &Sender<UiEvent>,
@@ -1070,6 +1132,7 @@ impl App {
         let Overlay::Settings {
             auto_compaction,
             auto_retry,
+            double_esc,
             ..
         } = overlay
         else {
@@ -1078,9 +1141,7 @@ impl App {
         match idx {
             0 => {
                 let next = !auto_compaction.unwrap_or(false);
-                if let Some(Overlay::Settings { auto_compaction, .. }) = self.overlay.as_mut() {
-                    *auto_compaction = Some(next);
-                }
+                *auto_compaction = Some(next);
                 Self::spawn_async(
                     commander,
                     report_tx,
@@ -1093,9 +1154,7 @@ impl App {
             }
             1 => {
                 let next = !auto_retry.unwrap_or(false);
-                if let Some(Overlay::Settings { auto_retry, .. }) = self.overlay.as_mut() {
-                    *auto_retry = Some(next);
-                }
+                *auto_retry = Some(next);
                 Self::spawn_async(
                     commander,
                     report_tx,
@@ -1105,6 +1164,26 @@ impl App {
                     None,
                 );
                 self.log_event("slash", &format!("settings auto_retry={next}"));
+            }
+            2 => {
+                // doubleEsc：tree→fork→none 循环并写回 settings.json（立即生效）
+                use crate::app::settings_io::{self, DoubleEscapeAction};
+                let path = self.settings_path();
+                let current = DoubleEscapeAction::parse(double_esc.as_deref().unwrap_or(""))
+                    .unwrap_or(DoubleEscapeAction::Tree);
+                let next = current.next();
+                match settings_io::write_double_escape_action(&path, next) {
+                    Ok(()) => {
+                        *double_esc = Some(next.as_str().to_string());
+                        self.log_event("slash", &format!("settings doubleEsc={next:?}"));
+                    }
+                    Err(e) => {
+                        // 写失败：红条 + 行值回读文件（不显示未生效值）
+                        self.notice = Some((format!("doubleEsc 写入失败: {e}"), Color::Red));
+                        *double_esc =
+                            Some(settings_io::read_double_escape_action(&path).as_str().to_string());
+                    }
+                }
             }
             _ => {}
         }
@@ -1255,14 +1334,14 @@ impl App {
                 }
                 OverlayOutcome::Apply(idx) => {
                     self.log_event("overlay", &format!("apply #{idx}"));
-                    self.apply_overlay(&overlay, idx, commander, report_tx);
+                    self.apply_overlay(&mut overlay, idx, commander, report_tx);
                     self.close_overlay();
                 }
                 OverlayOutcome::Toggle(idx) => {
                     self.log_event("overlay", &format!("toggle #{idx}"));
-                    // 设置类切换：应用后保持浮层打开
-                    let o = overlay;
-                    self.apply_overlay(&o, idx, commander, report_tx);
+                    // 设置类切换：应用后保持浮层打开（改动写回同一个浮层值）
+                    let mut o = overlay;
+                    self.apply_overlay(&mut o, idx, commander, report_tx);
                     self.overlay = Some(o);
                 }
                 OverlayOutcome::Delete(idx) => {
@@ -1280,8 +1359,9 @@ impl App {
             return;
         }
 
-        // 补全菜单打开时优先消费导航/应用键（spec：菜单键位与应用）
-        let mut skip_completion_refresh = false;
+        // 补全菜单打开时优先消费导航/应用键（spec：菜单键位与应用）。
+        // 各消费键直接 return——天然跳过函数末尾的补全重算（Tab 应用后
+        // 保持菜单关闭，等下次输入再开）。
         if self.completion.open
             && (key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT)
         {
@@ -1308,9 +1388,8 @@ impl App {
                     return;
                 }
                 KeyCode::Tab => {
-                    // spec：Tab 应用补全后关菜单（不触发提交）
+                    // spec：Tab 应用补全后关菜单（不触发提交）；return 即跳过重算
                     self.apply_completion_selection();
-                    skip_completion_refresh = true;
                     return;
                 }
                 KeyCode::Enter if key.modifiers == KeyModifiers::NONE => {
@@ -1322,6 +1401,14 @@ impl App {
         }
 
         let intent = Self::key_intent(key, self.state.phase == Phase::Streaming);
+
+        // 空闲 Esc：双击判定（spec：双击 Esc 动作）。浮层/补全的 Esc 已在前序
+        // 分支消费（优先且不计入窗口），流式 Esc 走 Abort 不落此分支。
+        if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE && intent == KeyIntent::Ignore
+        {
+            self.handle_double_escape(commander, report_tx);
+            return;
+        }
         match self.apply_intent(key, intent) {
             Some(KeyIntent::Submit) => self.submit_as(commander, report_tx, "prompt"),
             Some(KeyIntent::SendFollowUp) => {
@@ -1363,10 +1450,8 @@ impl App {
             }
             _ => {}
         }
-        // 每次按键后按光标前文本重算补全（Tab 刚应用完保持关闭，等下次输入）
-        if !skip_completion_refresh {
-            self.update_completion(commander, report_tx);
-        }
+        // 每次按键后按光标前文本重算补全（菜单内消费键已在上方 return）
+        self.update_completion(commander, report_tx);
     }
 
     /// 按当前光标前文本重算补全菜单（无 RPC）。
@@ -2121,7 +2206,7 @@ impl App {
     /// 输出: 无返回值；副作用为异步发 set_model / set_thinking_level
     fn apply_overlay(
         &mut self,
-        overlay: &Overlay,
+        overlay: &mut Overlay,
         idx: usize,
         commander: &CommandSender,
         report_tx: &Sender<UiEvent>,
@@ -4836,6 +4921,312 @@ done
         let (dest_dir, _) = crate::app::sessions::project_sessions_dir();
         assert!(dest_dir.join("import-src.jsonl").is_file(), "文件已复制进项目目录");
         let _ = std::fs::remove_file(dest_dir.join("import-src.jsonl"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── doubleEsc 设置（design D3/D5：文件真源 + 浮层第三行） ──
+
+    #[test]
+    fn settings_overlay_reads_double_esc_initial_value() {
+        let dir = std::env::temp_dir().join(format!("de-init-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        let (client, cdir, _log) = recording_commander("de-init", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        // 文件缺失 → tree（默认）；路径经字段注入（无全局 env 竞态）
+        app.settings_path = Some(path.clone());
+        app.open_settings(&commander, &tx);
+        match &app.overlay {
+            Some(Overlay::Settings { double_esc: Some(v), .. }) => assert_eq!(v, "tree"),
+            other => panic!("{other:?}"),
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &commander, &tx);
+
+        // 文件为 none → 初值 none（临时路径注入）
+        std::fs::write(&path, r#"{"doubleEscapeAction":"none"}"#).unwrap();
+        app.open_settings(&commander, &tx);
+        match &app.overlay {
+            Some(Overlay::Settings { double_esc: Some(v), .. }) => assert_eq!(v, "none"),
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&cdir);
+    }
+
+    #[test]
+    fn settings_double_esc_row_renders_and_cursor_clamps() {
+        let dir = std::env::temp_dir().join(format!("de-render-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{"doubleEscapeAction":"fork"}"#).unwrap();
+
+        let (client, cdir, _log) = recording_commander("de-render", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+        // 直接构造已回填的浮层（渲染不依赖异步）
+        app.settings_path = Some(path.clone());
+        app.overlay = Some(Overlay::Settings {
+            cursor: 0,
+            loading: false,
+            seq: 1,
+            auto_compaction: Some(true),
+            auto_retry: None,
+            double_esc: Some("fork".into()),
+            model: Some("openai/gpt-5.4".into()),
+        });
+
+        // 渲染断言：浮层含 doubleEsc 行与当前值
+        let state = pi_rust_tui::session::SessionState::new();
+        let backend = ratatui::backend::TestBackend::new(90, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let ui = crate::app::view::ViewUi {
+                    overlay: app.overlay.as_ref(),
+                    ..Default::default()
+                };
+                crate::app::view::render(frame, &state, &ui);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("doubleEsc"), "浮层应含 doubleEsc 行:\n{text}");
+        assert!(text.contains("fork"), "应显示当前值: {text}");
+
+        // 光标下移夹取到 2（模型/提示行只读）
+        for _ in 0..5 {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &commander, &tx);
+        }
+        match &app.overlay {
+            Some(Overlay::Settings { cursor, .. }) => assert_eq!(*cursor, 2, "夹取到 doubleEsc 行"),
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&cdir);
+    }
+
+    #[test]
+    fn settings_double_esc_cycles_and_writes_back() {
+        let dir = std::env::temp_dir().join(format!("de-cycle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        // 预置含其它键的设置文件（验证保留）
+        std::fs::write(&path, r#"{"sessionDir":"/keep/me"}"#).unwrap();
+
+        let (client, cdir, _log) = recording_commander("de-cycle", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+        app.settings_path = Some(path.clone());
+        app.open_settings(&commander, &tx);
+        // 泵掉 get_state 响应 → 浮层退出 loading
+        let ev = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("SettingsState");
+        if let UiEvent::AsyncData { kind, seq, data } = ev {
+            assert_eq!(kind, AsyncKind::SettingsState);
+            app.handle_async_data(kind, seq, &data);
+        }
+
+        // 移到 doubleEsc 行（初始 tree）→ 三轮 Enter：fork → none → tree
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &commander, &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &commander, &tx);
+        let expect = [("fork", "fork"), ("none", "none"), ("tree", "tree")];
+        for (file_val, row_val) in expect {
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commander, &tx);
+            let text = std::fs::read_to_string(&path).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(v["doubleEscapeAction"], file_val, "文件值: {text}");
+            assert_eq!(v["sessionDir"], "/keep/me", "其它键保留: {text}");
+            match &app.overlay {
+                Some(Overlay::Settings { double_esc: Some(row), .. }) => {
+                    assert_eq!(row, row_val, "行值即时更新");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(app.overlay.is_some(), "切换后浮层保持打开（Toggle 语义）");
+
+        // 损坏文件 → 红条 + 行值回读（不假更新）
+        std::fs::write(&path, "{broken").unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commander, &tx);
+        let (notice, color) = app.notice.clone().expect("应有通知");
+        assert!(notice.contains("写入失败"), "{notice}");
+        assert_eq!(color, Color::Red);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{broken",
+            "损坏文件不被覆盖"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&cdir);
+    }
+
+    // ── 双击 Esc（spec：双击 Esc 动作） ──
+
+    /// 造一个带注入设置路径的 App 与假 pi 通道。
+    fn double_escape_ctx(
+        action: &str,
+    ) -> (App, CommandSender, Sender<UiEvent>, std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "dbl-esc-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings = dir.join("settings.json");
+        std::fs::write(
+            &settings,
+            format!(r#"{{"doubleEscapeAction":"{action}"}}"#),
+        )
+        .unwrap();
+        let (client, cdir, _log) = recording_commander("dbl", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+        app.settings_path = Some(settings);
+        let _ = cdir;
+        (app, commander, tx, dir, std::path::PathBuf::new())
+    }
+
+    fn press_esc(app: &mut App, cmd: &CommandSender, tx: &Sender<UiEvent>) {
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), cmd, tx);
+    }
+
+    #[test]
+    fn double_escape_opens_tree_within_window() {
+        let (mut app, cmd, tx, dir, _) = double_escape_ctx("tree");
+        // 首次：无动作、记录时间戳
+        press_esc(&mut app, &cmd, &tx);
+        assert!(app.overlay.is_none(), "单次 Esc 无动作");
+        assert!(app.last_escape.is_some(), "记录时间戳");
+        // 50ms 内第二次 → 开树
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        press_esc(&mut app, &cmd, &tx);
+        assert!(
+            matches!(app.overlay, Some(Overlay::Tree { .. })),
+            "双击开树: {:?}",
+            app.overlay
+        );
+        assert!(app.last_escape.is_none(), "触发后时间戳复位");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn double_escape_timeout_does_not_trigger() {
+        let (mut app, cmd, tx, dir, _) = double_escape_ctx("tree");
+        press_esc(&mut app, &cmd, &tx);
+        // 超过 500ms（取 650ms，4 倍余量内仍远超窗口）
+        std::thread::sleep(std::time::Duration::from_millis(650));
+        press_esc(&mut app, &cmd, &tx);
+        assert!(app.overlay.is_none(), "超时不触发");
+        assert!(app.last_escape.is_some(), "第二次作为新的首击");
+        // 紧接着第三次（在新窗口内）→ 触发
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        press_esc(&mut app, &cmd, &tx);
+        assert!(matches!(app.overlay, Some(Overlay::Tree { .. })), "新窗口内触发");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn double_escape_fork_maps_to_tree_and_none_disables() {
+        // fork → 树（design D4 简化）
+        let (mut app, cmd, tx, dir, _) = double_escape_ctx("fork");
+        press_esc(&mut app, &cmd, &tx);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        press_esc(&mut app, &cmd, &tx);
+        assert!(
+            matches!(app.overlay, Some(Overlay::Tree { .. })),
+            "fork 动作也开树: {:?}",
+            app.overlay
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // none → 完全不动作（也不追踪窗口）
+        let (mut app, cmd, tx, dir, _) = double_escape_ctx("none");
+        press_esc(&mut app, &cmd, &tx);
+        assert!(app.overlay.is_none());
+        assert!(app.last_escape.is_none(), "none 不追踪窗口");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        press_esc(&mut app, &cmd, &tx);
+        assert!(app.overlay.is_none(), "none 双击也不动作");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn double_escape_requires_empty_input_and_skips_nonempty_refresh() {
+        let (mut app, cmd, tx, dir, _) = double_escape_ctx("tree");
+        // 非空输入：双击不触发
+        app.editor.replace("draft text");
+        press_esc(&mut app, &cmd, &tx);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        press_esc(&mut app, &cmd, &tx);
+        assert!(app.overlay.is_none(), "非空输入不触发");
+        assert!(app.last_escape.is_none(), "非空 Esc 不记录窗口");
+
+        // 空输入首击 → 带文本 Esc（不刷新）→ 清空后窗口内再击 → 触发
+        app.editor.replace("");
+        press_esc(&mut app, &cmd, &tx);
+        assert!(app.last_escape.is_some());
+        app.editor.replace("typed in between");
+        press_esc(&mut app, &cmd, &tx); // 非空：不刷新时间戳
+        app.editor.replace("");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        press_esc(&mut app, &cmd, &tx);
+        assert!(
+            matches!(app.overlay, Some(Overlay::Tree { .. })),
+            "中间非空 Esc 不应刷新窗口: {:?}",
+            app.overlay
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn escape_priority_streaming_overlay_completion_not_counted() {
+        let (mut app, cmd, tx, dir, _) = double_escape_ctx("tree");
+
+        // 1) 流式 Esc → Abort，不记录窗口
+        app.state.phase = Phase::Streaming;
+        app.editor.replace("");
+        press_esc(&mut app, &cmd, &tx);
+        assert!(app.last_escape.is_none(), "流式 Esc 不进双击窗口");
+        app.state.phase = Phase::Idle;
+
+        // 2) 浮层 Esc → 关浮层，不记录窗口
+        app.open_session_selector(&tx);
+        assert!(app.overlay.is_some());
+        press_esc(&mut app, &cmd, &tx);
+        assert!(app.overlay.is_none(), "浮层 Esc 关闭");
+        assert!(app.last_escape.is_none(), "浮层 Esc 不进双击窗口");
+
+        // 3) 补全菜单 Esc → 关菜单，不记录窗口
+        for ch in "/re".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &cmd, &tx);
+        }
+        assert!(app.completion.open, "菜单已开");
+        press_esc(&mut app, &cmd, &tx);
+        assert!(!app.completion.open, "菜单 Esc 关闭");
+        assert!(app.last_escape.is_none(), "菜单 Esc 不进双击窗口");
+
+        // 4) 回归：清空输入（菜单 Esc 保留输入）后，一次空闲 Esc 仍只是首击
+        app.editor.replace("");
+        assert!(app.last_escape.is_none(), "step3 后应无窗口");
+        press_esc(&mut app, &cmd, &tx);
+        assert!(app.last_escape.is_some(), "首击应记录");
+        assert!(app.overlay.is_none(), "首击不开树: {:?}", app.overlay);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
