@@ -263,7 +263,13 @@ impl App {
                 }
                 Ok(UiEvent::SendFailed(err)) => {
                     self.log_event("send_failed", &err);
-                    self.notice = Some((err, Color::Red));
+                    // bash 传输级失败：复位运行态（单命令门控下归属明确）
+                    if self.state.bash_running {
+                        self.state.abort_bash_state();
+                        self.notice = Some((format!("bash 执行失败: {err}"), Color::Red));
+                    } else {
+                        self.notice = Some((err, Color::Red));
+                    }
                     self.draw(terminal)?;
                 }
                 Ok(UiEvent::OpenModelSelect) => {
@@ -1406,6 +1412,21 @@ impl App {
         // 分支消费（优先且不计入窗口），流式 Esc 走 Abort 不落此分支。
         if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE && intent == KeyIntent::Ignore
         {
+            // bash 运行中：中止执行（含非空输入；对齐 pi 的 onEscape 次序，
+            // 优先于双击判定且不计入双击窗口）
+            if self.state.bash_running {
+                self.log_event("key", "esc → abort_bash");
+                let cmd = commander.clone();
+                thread::spawn(move || {
+                    // 中止失败容忍：原 bash 请求会正常返回结果
+                    let _ = cmd.send_command(
+                        serde_json::json!({"type": "abort_bash"}),
+                        Duration::from_secs(10),
+                        ResponsePolicy::RequireSuccess,
+                    );
+                });
+                return;
+            }
             self.handle_double_escape(commander, report_tx);
             return;
         }
@@ -1950,7 +1971,52 @@ impl App {
         }
         let message = self.editor.text();
         let message = message.trim().to_string();
-        // compaction 进行中：本地排队（pi 的 prompt 在压缩中直接拒绝，必须客户端排队）
+        // 1) 斜杠分发（pi 次序：斜杠先于 ! 与压缩队列——压缩期也立即执行，
+        //    斜杠非 prompt 不受压缩拒绝约束；dispatch 命中即清空输入）
+        if command == "prompt"
+            && crate::app::commands::dispatch(self, commander, report_tx, &message)
+        {
+            self.log_event("submit", &format!("local command: {message}"));
+            return;
+        }
+        // 2) ! / !! bash 分流（仅 prompt 路径；`!` 空体落到常规发送）
+        if command == "prompt" && message.starts_with('!') {
+            let excluded = message.starts_with("!!");
+            let cmd = if excluded {
+                message[2..].trim()
+            } else {
+                message[1..].trim()
+            };
+            if !cmd.is_empty() {
+                if self.state.bash_running {
+                    // spec：运行中警告且输入保留不清空
+                    self.notice = Some((
+                        "A bash command is already running. Press Esc to cancel it first.".into(),
+                        Color::Yellow,
+                    ));
+                    self.log_event("submit", "bash running: keep input");
+                    return;
+                }
+                self.editor.replace("");
+                self.state.start_bash(cmd, excluded);
+                self.log_event("submit", &format!("bash (excluded={excluded}): {cmd}"));
+                Self::spawn_async(
+                    commander,
+                    report_tx,
+                    serde_json::json!({
+                        "type": "bash",
+                        "command": cmd,
+                        "excludeFromContext": excluded,
+                    }),
+                    AsyncKind::BashDone,
+                    0,
+                    None,
+                );
+                return;
+            }
+            // `!` 无命令体 → 普通消息继续
+        }
+        // 3) compaction 进行中：本地排队（pi 的 prompt 在压缩中直接拒绝，必须客户端排队）
         if self.state.compacting {
             if message.is_empty() {
                 self.log_event("submit", "skipped: empty input (compact queue)");
@@ -1965,16 +2031,8 @@ impl App {
             self.log_event("submit", &format!("queued during compact: {message}"));
             return;
         }
-        // 本地命令与正常发送都先清空输入（spec：命令执行后输入清空）
+        // 常规发送：清空输入（spec：命令执行后输入清空）
         self.editor.replace("");
-        // 斜杠分发：仅普通 prompt 路径（Enter 与空闲 alt+enter 共用）；
-        // 流式 alt+enter 的 follow_up 路径不拦截（对齐 pi）。
-        if command == "prompt"
-            && crate::app::commands::dispatch(self, commander, report_tx, &message)
-        {
-            self.log_event("submit", &format!("local command: {message}"));
-            return;
-        }
         self.log_event("submit", &format!("{command} sent: {message}"));
         let payload = Self::build_command_payload(
             command,
@@ -2415,6 +2473,13 @@ impl App {
             AsyncKind::ThinkingApplied => {
                 if let Some(level) = data.as_str() {
                     self.state.thinking_level = Some(level.to_string());
+                }
+            }
+            AsyncKind::BashDone => {
+                // bash 结果落条目（running 门控：传输失败已复位时忽略迟到结果）
+                if self.state.bash_running {
+                    self.state.finish_bash(data);
+                    self.log_event("slash", "bash finished");
                 }
             }
             AsyncKind::CommandDone => {
@@ -5228,6 +5293,140 @@ done
         press_esc(&mut app, &cmd, &tx);
         assert!(app.last_escape.is_some(), "首击应记录");
         assert!(app.overlay.is_none(), "首击不开树: {:?}", app.overlay);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── !cmd bash 模式（spec：bash 模式提交与运行） ──
+
+    #[test]
+    fn slash_runs_during_compaction_instead_of_queue() {
+        // 提交次序修正：压缩期斜杠立即执行（不再入队）——对齐 pi
+        let (client, dir, _log) = recording_commander("cpx-slash", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+        app.state.compacting = true;
+
+        app.editor.replace("/tree");
+        app.submit_as(&commander, &tx, "prompt");
+        assert!(matches!(app.overlay, Some(Overlay::Tree { .. })), "压缩期斜杠应立即执行: {:?}", app.overlay);
+        assert!(app.compact_queue.is_empty(), "斜杠不入压缩队列");
+        assert!(app.editor.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bang_submit_sends_bash_and_lands_entry() {
+        let (client, dir, log) = recording_commander("bang", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        // !cmd → bash RPC（非 prompt）
+        app.editor.replace("!echo hi");
+        app.submit_as(&commander, &tx, "prompt");
+        assert!(app.editor.is_empty(), "执行后清空");
+        assert!(app.state.bash_running, "置运行态");
+        let content = read_log_until(&log, "\"type\":\"bash\"", 2000).expect("应发 bash");
+        assert!(content.contains("echo hi"), "{content}");
+        assert!(content.contains(r#""excludeFromContext":false"#), "{content}");
+        assert!(!content.contains("\"type\":\"prompt\""), "不发 prompt: {content}");
+
+        // 分片累积 + 结果落条目
+        app.state.handle(&serde_json::json!({"type":"bash_execution_update","delta":"hi\n"}));
+        app.handle_async_data(
+            AsyncKind::BashDone,
+            0,
+            &serde_json::json!({"output":"hi\n","exitCode":0,"cancelled":false}),
+        );
+        assert!(!app.state.bash_running);
+        match app.state.transcript.last().unwrap() {
+            pi_rust_tui::session::Entry::Bash { command, output, exit_code, .. } => {
+                assert_eq!(command, "echo hi");
+                assert_eq!(output, "hi\n");
+                assert_eq!(*exit_code, Some(0));
+            }
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn double_bang_marks_excluded_and_bare_bang_sends_prompt() {
+        let (client, dir, log) = recording_commander("dbang", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        // !! → excludeFromContext=true
+        app.editor.replace("!!secret cmd");
+        app.submit_as(&commander, &tx, "prompt");
+        let content = read_log_until(&log, "secret cmd", 2000).expect("应发 bash");
+        assert!(content.contains(r#""excludeFromContext":true"#), "{content}");
+        assert!(app.state.bash_excluded, "运行态标记 excluded");
+        app.state.abort_bash_state();
+
+        // `!` 空体 → 普通 prompt
+        app.editor.replace("!");
+        app.submit_as(&commander, &tx, "prompt");
+        let content = read_log_until(&log, "\"type\":\"prompt\"", 2000).expect("空 ! 应发 prompt");
+        assert!(content.contains(r#""message":"!"#), "{content}");
+        assert!(!app.state.bash_running);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bash_running_gates_second_submit_and_keeps_input() {
+        let (client, dir, log) = recording_commander("bgate", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        app.editor.replace("!sleep 100");
+        app.submit_as(&commander, &tx, "prompt");
+        let first = read_log_until(&log, "sleep 100", 2000).expect("首条 bash");
+
+        // 运行中再提交 → 黄条 + 输入保留 + 不发第二条
+        app.editor.replace("!pwd");
+        app.submit_as(&commander, &tx, "prompt");
+        let (text, color) = app.notice.clone().expect("应有警告");
+        assert!(text.contains("already running"), "{text}");
+        assert_eq!(color, Color::Yellow);
+        assert_eq!(app.editor.text(), "!pwd", "输入保留不清空");
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let now = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(now.matches(r#""type":"bash""#).count(), 1, "不发第二条 bash: {now}");
+        let _ = first;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn esc_aborts_running_bash_and_skips_double_escape() {
+        let (client, dir, log) = recording_commander("babort", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        app.editor.replace("!sleep 99");
+        app.submit_as(&commander, &tx, "prompt");
+        read_log_until(&log, "sleep 99", 2000).unwrap();
+
+        // Esc（输入非空也生效，对齐 pi）→ abort_bash，且不进双击窗口
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &commander, &tx);
+        let content = read_log_until(&log, "abort_bash", 2000).expect("应发 abort_bash");
+        assert!(content.contains("abort_bash"), "{content}");
+        assert!(app.last_escape.is_none(), "不计入双击窗口");
+        assert!(app.overlay.is_none(), "不开树");
+
+        // 流式时 Esc 仍是中止生成（不发 abort_bash 于本分支）
+        app.state.abort_bash_state();
+        app.state.phase = Phase::Streaming;
+        let before = std::fs::read_to_string(&log).unwrap_or_default();
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &commander, &tx);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let after = std::fs::read_to_string(&log).unwrap_or_default();
+        let abort_count = after.matches("abort_bash").count() - before.matches("abort_bash").count();
+        assert_eq!(abort_count, 0, "流式 Esc 不走 bash 中止");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

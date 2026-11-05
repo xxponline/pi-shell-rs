@@ -345,8 +345,15 @@ fn render_editor(frame: &mut Frame, area: ratatui::layout::Rect, ui: &ViewUi<'_>
         Phase::Streaming => "esc: abort",
         Phase::Idle => "enter: send · ctrl+d: quit",
     };
+    // bash 模式提示：输入以 ! 起始时边框变黄（对齐 pi getBashModeBorderColor 语义）
+    let bash_mode = ui.input.trim_start().starts_with('!');
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_style(if bash_mode {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        })
         .title(format!(" input ({hint}) "));
 
     // 可视内部区与滚动偏移（水平+垂直，保证光标列/行可见）
@@ -955,5 +962,48 @@ mod render_tests {
         assert!(buf.contains("import"), "窗口尾部应含下标 6 的 import:\n{buf}");
         assert!(!buf.contains("settings"), "首项已滚出窗口: {buf}");
         assert!(buf.contains("(11/24)"), "计数应反映选中项: {buf}");
+    }
+
+    #[test]
+    fn editor_border_turns_yellow_in_bash_mode() {
+        let state = SessionState::new();
+        // 普通输入：边框非黄
+        let (text, _) = render_with_input(&state, "ls", 1, Some((0, 2)), 60, 12);
+        // ! 起始（含前导空格）：边框黄——通过单元格样式断言
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let ui = ViewUi {
+                    input: "!echo hi",
+                    input_lines: 1,
+                    input_cursor: Some((0, 9)),
+                    ..ViewUi::default()
+                };
+                render(frame, &state, &ui);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // 输入框左上角（底起 3 行高 → y=9）边框单元格应为黄色
+        let cell = &buf[(0, 9)];
+        assert_eq!(cell.style().fg, Some(Color::Yellow), "bash 模式边框应为黄色");
+
+        // 恢复普通输入 → 非黄
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal
+            .draw(|frame| {
+                let ui = ViewUi {
+                    input: "echo hi",
+                    input_lines: 1,
+                    input_cursor: Some((0, 7)),
+                    ..ViewUi::default()
+                };
+                render(frame, &state, &ui);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let cell = &buf[(0, 9)];
+        assert_ne!(cell.style().fg, Some(Color::Yellow), "普通输入边框非黄");
+        let _ = text;
     }
 }

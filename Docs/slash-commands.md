@@ -54,6 +54,8 @@
 - 单独 `/` 或全空白输入不触发分发
 - 消息中部出现的 `/` 不触发补全菜单
 - 彩蛋命令（`/arminsayshi`、`/dementedelves`）与 `/debug` 未实现（pi 内部调试项）
+- **`!`/`!!` 不是斜杠命令**：`!cmd` 走 bash 执行（`!!` 不进上下文），见
+  `tui-usage.md` 的 bash 模式一节；普通消息以 `!` 开头会被执行（pi 既有语义）
 - **双击 Esc**（空输入、500ms 内）按 `doubleEscapeAction` 开树——默认 `tree`；
   `fork` 也开树（沿用 `/fork` = 树的简化，pi 的 fork 是"选择历史用户消息"）；
   设置在 `/settings` 的 doubleEsc 行修改

@@ -70,6 +70,17 @@ pub enum Entry {
     },
     /// Non-message notices (compaction, auto-retry, queue changes, ...).
     Notice { kind: String, text: String },
+    /// 用户 bash 执行（`!cmd`；含流式输出的最终结果）。
+    Bash {
+        command: String,
+        output: String,
+        exit_code: Option<i64>,
+        cancelled: bool,
+        truncated: bool,
+        full_output_path: Option<String>,
+        /// `!!` 发出：结果不进模型上下文。
+        excluded: bool,
+    },
 }
 
 impl Entry {
@@ -95,6 +106,13 @@ pub struct SessionState {
     pub transcript: Vec<Entry>,
     /// 手动压缩进行中（供上层拦截输入提交）。
     pub compacting: bool,
+    /// 用户 bash 执行中（单命令门控；UI 侧 Esc 中止与提交警告读它）。
+    pub bash_running: bool,
+    /// 运行中的 bash 命令文本与已累积输出（结果到达后落为条目并清空）。
+    pub bash_command: String,
+    pub bash_output: String,
+    /// 运行中命令是否 `!!`（不进上下文；live 渲染标记用）。
+    pub bash_excluded: bool,
 
     /// Current turn counter (incremented on turn_start; 0 before first turn).
     current_turn: usize,
@@ -120,6 +138,66 @@ impl SessionState {
     /// 输入: data — get_messages 的 data 对象 {messages: [...]}；缺失按空数组处理
     /// 输出: 无返回值；transcript 被整体替换，phase=Idle、inflight/队列/
     ///       compacting/usage 清空；system 与无法解析的消息跳过，不 panic
+    /// 标记用户 bash 开始（App 发送 `bash` RPC 时调用）。
+    ///
+    /// 输入: command — 命令文本；excluded — 是否 `!!`（不进上下文）
+    /// 输出: 无返回值；副作用为置运行态并清空输出缓冲
+    pub fn start_bash(&mut self, command: &str, excluded: bool) {
+        self.bash_running = true;
+        self.bash_command = command.to_string();
+        self.bash_excluded = excluded;
+        self.bash_output.clear();
+    }
+
+    /// bash 结果到达：落为 transcript 条目并复位运行态。
+    ///
+    /// 输入: result — BashResult（output/exitCode/cancelled/truncated/
+    ///       fullOutputPath；字段缺失按默认）
+    /// 输出: 无返回值；副作用为追加 Entry::Bash、清空运行缓冲
+    pub fn finish_bash(&mut self, result: &Value) {
+        if !self.bash_running {
+            return; // 迟到结果（传输失败已复位）：忽略，避免空命令条目
+        }
+        let output = result
+            .get("output")
+            .and_then(|o| o.as_str())
+            .unwrap_or("")
+            .to_string();
+        // 结果输出兜底：分片事件缺失时用响应里的完整输出
+        let output = if output.is_empty() && !self.bash_output.is_empty() {
+            std::mem::take(&mut self.bash_output)
+        } else {
+            output
+        };
+        self.transcript.push(Entry::Bash {
+            command: std::mem::take(&mut self.bash_command),
+            output,
+            exit_code: result.get("exitCode").and_then(|c| c.as_i64()),
+            cancelled: result.get("cancelled").and_then(|c| c.as_bool()).unwrap_or(false),
+            truncated: result.get("truncated").and_then(|t| t.as_bool()).unwrap_or(false),
+            full_output_path: result
+                .get("fullOutputPath")
+                .and_then(|p| p.as_str())
+                .map(String::from),
+            excluded: self.bash_excluded,
+        });
+        self.bash_running = false;
+        self.bash_output.clear();
+        self.bash_excluded = false;
+    }
+
+    /// 传输级失败时复位运行态（bash 未拿到结果；单命令门控下由调用方
+    /// 判定 SendFailed 归属）。
+    ///
+    /// 输入: 无
+    /// 输出: 无返回值；副作用为清运行态（缓冲丢弃）
+    pub fn abort_bash_state(&mut self) {
+        self.bash_running = false;
+        self.bash_output.clear();
+        self.bash_command.clear();
+        self.bash_excluded = false;
+    }
+
     pub fn load_messages(&mut self, data: &Value) {
         let empty = Vec::new();
         let msgs = data
@@ -174,12 +252,43 @@ impl SessionState {
                 Some("toolResult") => {
                     Self::merge_tool_result_message(&mut new_transcript, msg);
                 }
+                Some("bashExecution") => {
+                    // 用户 bash 历史（缺字段按默认，不 panic）
+                    new_transcript.push(Entry::Bash {
+                        command: msg
+                            .get("command")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        output: msg
+                            .get("output")
+                            .and_then(|o| o.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        exit_code: msg.get("exitCode").and_then(|c| c.as_i64()),
+                        cancelled: msg.get("cancelled").and_then(|c| c.as_bool()).unwrap_or(false),
+                        truncated: msg.get("truncated").and_then(|t| t.as_bool()).unwrap_or(false),
+                        full_output_path: msg
+                            .get("fullOutputPath")
+                            .and_then(|p| p.as_str())
+                            .map(String::from),
+                        excluded: msg
+                            .get("excludeFromContext")
+                            .and_then(|e| e.as_bool())
+                            .unwrap_or(false),
+                    });
+                }
                 _ => {} // system 及其它类型跳过
             }
         }
 
         self.transcript = new_transcript;
         self.phase = Phase::Idle;
+        // 运行中的 bash 随重建一并复位（快照即真源）
+        self.bash_running = false;
+        self.bash_output.clear();
+        self.bash_command.clear();
+        self.bash_excluded = false;
         self.inflight.clear();
         self.inflight_appended = false;
         self.pending_tools.clear();
@@ -396,10 +505,16 @@ impl SessionState {
                     text,
                 });
             }
+            // 用户 bash 输出分片：追加到运行缓冲（单命令门控，忽略事件 id）
+            "bash_execution_update" => {
+                if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
+                    self.bash_output.push_str(delta);
+                }
+            }
             // Captured but not modeled in depth this phase:
             "summarization_retry_scheduled"
             | "summarization_retry_attempt_start" | "summarization_retry_finished"
-            | "entry_appended" | "bash_execution_update" | "agent_end" => {}
+            | "entry_appended" | "agent_end" => {}
             _ => {}
         }
     }
@@ -1417,5 +1532,108 @@ mod tests {
             _ => None,
         }).expect("abort notice");
         assert!(last.1.contains("中止"), "{}", last.1);
+    }
+
+    // ── 用户 bash 归约与重建（spec：bash 执行归约与重建） ──
+
+    #[test]
+    fn bash_update_accumulates_and_result_lands_entry() {
+        let mut st = SessionState::new();
+        st.start_bash("ls -la", false);
+        assert!(st.bash_running);
+
+        // 分片累积
+        st.handle(&serde_json::json!({"type":"bash_execution_update","id":"client-9","delta":"line1\n"}));
+        st.handle(&serde_json::json!({"type":"bash_execution_update","id":"client-9","delta":"line2\n"}));
+        assert_eq!(st.bash_output, "line1\nline2\n", "输出缓冲累积");
+
+        // 结果落条目、缓冲与运行态复位
+        let before = st.transcript.len();
+        st.finish_bash(&serde_json::json!({
+            "output": "line1\nline2\n", "exitCode": 0,
+            "cancelled": false, "truncated": false
+        }));
+        assert!(!st.bash_running && st.bash_output.is_empty());
+        assert_eq!(st.transcript.len(), before + 1);
+        match &st.transcript[before] {
+            Entry::Bash { command, output, exit_code, cancelled, excluded, .. } => {
+                assert_eq!(command, "ls -la");
+                assert_eq!(output, "line1\nline2\n");
+                assert_eq!(*exit_code, Some(0));
+                assert!(!*cancelled && !*excluded);
+            }
+            other => panic!("应为 Bash 条目: {other:?}"),
+        }
+        assert_eq!(st.phase, Phase::Idle, "不影响 phase");
+    }
+
+    #[test]
+    fn bash_cancelled_excluded_and_output_fallback() {
+        let mut st = SessionState::new();
+        // !! 命令 + 分片有量但响应 output 为空 → 用分片兜底
+        st.start_bash("!!secret", true);
+        st.handle(&serde_json::json!({"type":"bash_execution_update","delta":"live output"}));
+        st.finish_bash(&serde_json::json!({"output":"","exitCode":130,"cancelled":true}));
+        match st.transcript.last().unwrap() {
+            Entry::Bash { command, output, exit_code, cancelled, excluded, .. } => {
+                assert_eq!(command, "!!secret");
+                assert_eq!(output, "live output", "分片兜底");
+                assert_eq!(*exit_code, Some(130));
+                assert!(*cancelled, "取消态");
+                assert!(*excluded, "不进上下文标记");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!st.bash_running);
+
+        // abort_bash_state 复位（传输失败路径）
+        st.start_bash("sleep 100", false);
+        st.bash_output.push_str("partial");
+        st.abort_bash_state();
+        assert!(!st.bash_running && st.bash_output.is_empty() && st.bash_command.is_empty());
+
+        // 迟到结果（已复位后到达）→ 忽略，不产生空命令条目
+        let before = st.transcript.len();
+        st.finish_bash(&serde_json::json!({"output":"late","exitCode":0}));
+        assert_eq!(st.transcript.len(), before, "迟到结果被忽略");
+    }
+
+    #[test]
+    fn load_messages_rebuilds_bash_history() {
+        let mut st = SessionState::new();
+        st.start_bash("mid-run", false); // 运行态应被重建复位
+        st.load_messages(&serde_json::json!({"messages": [
+            {"role":"system","content":"sys"},
+            {"role":"user","content":[{"type":"text","text":"run it"}]},
+            {"role":"bashExecution","command":"ls","output":"a\nb","exitCode":0,
+             "cancelled":false,"truncated":false,"excludeFromContext":true},
+            {"role":"bashExecution","command":"broken"},  // 缺字段不 panic
+            {"role":"assistant","content":[{"type":"text","text":"done"}]}
+        ]}));
+        assert!(!st.bash_running, "重建复位运行态");
+        let kinds: Vec<&str> = st.transcript.iter().map(|e| match e {
+            Entry::User { .. } => "user",
+            Entry::Bash { .. } => "bash",
+            Entry::Assistant { .. } => "assistant",
+            _ => "other",
+        }).collect();
+        assert_eq!(kinds, vec!["user", "bash", "bash", "assistant"], "顺序: {kinds:?}");
+        match &st.transcript[1] {
+            Entry::Bash { command, output, exit_code, excluded, .. } => {
+                assert_eq!(command, "ls");
+                assert_eq!(output, "a\nb");
+                assert_eq!(*exit_code, Some(0));
+                assert!(*excluded, "excludeFromContext 映射");
+            }
+            other => panic!("{other:?}"),
+        }
+        match &st.transcript[2] {
+            Entry::Bash { command, exit_code, output, .. } => {
+                assert_eq!(command, "broken");
+                assert_eq!(*exit_code, None, "缺 exitCode → None");
+                assert!(output.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

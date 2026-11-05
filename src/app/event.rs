@@ -70,6 +70,8 @@ pub enum AsyncKind {
     SettingsState,
     /// /scoped-models 的 get_available_models 响应：填充只读列表。
     ScopedModels,
+    /// bash 命令结果（BashResult）→ 落 Entry::Bash。
+    BashDone,
     /// export_html 响应：{path} → 绿条提示。
     ExportDone,
 }

@@ -34,13 +34,120 @@ pub fn chat_lines(state: &SessionState, flags: RenderFlags) -> Vec<Line<'static>
             Entry::Notice { kind, text } => {
                 lines.push(notice_line(kind, text));
             }
+            Entry::Bash {
+                command,
+                output,
+                exit_code,
+                cancelled,
+                truncated,
+                full_output_path,
+                excluded,
+            } => append_bash(
+                &mut lines,
+                command,
+                output,
+                *exit_code,
+                *cancelled,
+                *truncated,
+                full_output_path.as_deref(),
+                *excluded,
+                false,
+            ),
         }
     }
     // 流式中尚未落盘的内容。
     if state.is_in_flight() {
         append_blocks(&mut lines, state.in_flight(), flags);
     }
+    // 运行中的用户 bash（分片实时增长）。
+    if state.bash_running {
+        let excluded = state.bash_excluded;
+        let command = state.bash_command.clone();
+        let output = state.bash_output.clone();
+        append_bash(&mut lines, &command, &output, None, false, false, None, excluded, true);
+    }
     lines
+}
+
+/// bash 输出渲染行数上限（超出保留末尾并提示；pi 侧另有整体截断策略）。
+const BASH_OUTPUT_MAX_LINES: usize = 500;
+
+/// 追加一条 bash 渲染：命令行 + 输出（弱化、行数上限）+ 状态行。
+///
+/// 输入: out — 目标行；command/output — 命令与输出；exit_code/cancelled/
+///       truncated/full_output_path — 结果态；excluded — `!!` 不进上下文；
+///       live — 运行中（状态行替换为运行标记）
+/// 输出: 无返回值；副作用为 push 若干行
+#[allow(clippy::too_many_arguments)]
+fn append_bash(
+    out: &mut Vec<Line<'static>>,
+    command: &str,
+    output: &str,
+    exit_code: Option<i64>,
+    cancelled: bool,
+    truncated: bool,
+    full_output_path: Option<&str>,
+    excluded: bool,
+    live: bool,
+) {
+    let mut cmd_spans = vec![Span::styled(
+        format!("$ {command}"),
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    )];
+    if excluded {
+        cmd_spans.push(Span::styled(
+            "（不进上下文）",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    out.push(Line::from(cmd_spans));
+
+    // 输出行（超上限保留末尾）
+    let all: Vec<&str> = output.split('\n').collect();
+    let total = all.len();
+    let start = total.saturating_sub(BASH_OUTPUT_MAX_LINES);
+    if start > 0 {
+        out.push(Line::from(Span::styled(
+            format!("…（已截断 {} 行）", start),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    for (i, row) in all[start..].iter().enumerate() {
+        if row.is_empty() && start + i == total - 1 {
+            continue; // 仅跳过结尾换行产生的最后一个空元素（保留中间空行）
+        }
+        out.push(Line::from(Span::styled(
+            (*row).to_string(),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    // 状态行
+    let status = if live {
+        Span::styled("⟳ 运行中…（esc 中止）", Style::default().fg(Color::Yellow))
+    } else if cancelled {
+        Span::styled("cancelled", Style::default().fg(Color::Yellow))
+    } else {
+        match exit_code {
+            Some(0) => Span::styled("exit 0", Style::default().fg(Color::Green)),
+            Some(code) => Span::styled(
+                format!("exit {code}"),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            None => Span::styled("done", Style::default().fg(Color::DarkGray)),
+        }
+    };
+    let mut status_spans = vec![status];
+    if truncated {
+        status_spans.push(Span::styled(
+            match full_output_path {
+                Some(p) => format!(" · truncated → {p}"),
+                None => " · truncated".to_string(),
+            },
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    out.push(Line::from(status_spans));
 }
 
 /// 按通知类型生成样式行：error 红色加粗、retry 黄色、其余弱化斜体灰。
@@ -306,5 +413,112 @@ mod tests {
         assert_eq!(fg(&info), Some(Color::DarkGray));
         let retry_text: String = retry.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(retry_text.contains("[retry] 重试 1/3: boom"));
+    }
+
+    #[test]
+    fn bash_entry_and_live_rendering() {
+        use pi_rust_tui::session::Entry;
+        let mut st = SessionState::new();
+
+        // 完成态：exit 0 + 状态行 + 不进上下文标记
+        st.transcript.push(Entry::Bash {
+            command: "ls".into(),
+            output: "a.rs\nb.rs".into(),
+            exit_code: Some(0),
+            cancelled: false,
+            truncated: false,
+            full_output_path: None,
+            excluded: true,
+        });
+        // 失败态：非零退出 + 截断路径
+        st.transcript.push(Entry::Bash {
+            command: "make".into(),
+            output: "error".into(),
+            exit_code: Some(2),
+            cancelled: false,
+            truncated: true,
+            full_output_path: Some("/tmp/full.log".into()),
+            excluded: false,
+        });
+        // 取消态
+        st.transcript.push(Entry::Bash {
+            command: "sleep 99".into(),
+            output: String::new(),
+            exit_code: Some(130),
+            cancelled: true,
+            truncated: false,
+            full_output_path: None,
+            excluded: false,
+        });
+        let lines = chat_lines(&st, RenderFlags::default());
+        let text: String = lines
+            .iter()
+            .map(|l| {
+                let mut s = String::new();
+                for sp in &l.spans {
+                    s.push_str(sp.content.as_ref());
+                }
+                s.push('\n');
+                s
+            })
+            .collect();
+        assert!(text.contains("$ ls"), "{text}");
+        assert!(text.contains("（不进上下文）"), "{text}");
+        assert!(text.contains("exit 0"), "{text}");
+        assert!(text.contains("exit 2"), "{text}");
+        assert!(text.contains("truncated → /tmp/full.log"), "{text}");
+        assert!(text.contains("cancelled"), "{text}");
+
+        // 运行中 live 块
+        let mut st2 = SessionState::new();
+        st2.start_bash("ping", false);
+        st2.bash_output.push_str("64 bytes from x\n");
+        let lines = chat_lines(&st2, RenderFlags::default());
+        let text: String = lines
+            .iter()
+            .map(|l| {
+                let mut s = String::new();
+                for sp in &l.spans {
+                    s.push_str(sp.content.as_ref());
+                }
+                s.push('\n');
+                s
+            })
+            .collect();
+        assert!(text.contains("$ ping"), "{text}");
+        assert!(text.contains("64 bytes from x"), "live 输出实时显示: {text}");
+        assert!(text.contains("运行中"), "{text}");
+        assert!(!text.contains("exit 0"), "live 无完成态");
+    }
+
+    #[test]
+    fn bash_output_line_cap_keeps_tail() {
+        use pi_rust_tui::session::Entry;
+        let mut st = SessionState::new();
+        let big: String = (0..600).map(|i| format!("row{i}\n")).collect();
+        st.transcript.push(Entry::Bash {
+            command: "big".into(),
+            output: big,
+            exit_code: Some(0),
+            cancelled: false,
+            truncated: false,
+            full_output_path: None,
+            excluded: false,
+        });
+        let lines = chat_lines(&st, RenderFlags::default());
+        let text: String = lines
+            .iter()
+            .map(|l| {
+                let mut s = String::new();
+                for sp in &l.spans {
+                    s.push_str(sp.content.as_ref());
+                }
+                s.push('\n');
+                s
+            })
+            .collect();
+        assert!(text.contains("已截断"), "超限提示: {text}");
+        assert!(text.contains("row599"), "保留末尾");
+        assert!(!text.contains("row0\n"), "丢弃开头（或至少不含首行）");
     }
 }
