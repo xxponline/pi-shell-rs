@@ -40,9 +40,15 @@ cargo run                       # 默认运行 TUI（default-run）
 │ exit 0                             │  展开态含结果/diff（Ctrl+O 切换）
 └────────────────────────────────────┘
 [queue] 排队中的 follow_up 消息        ← 队列带（空队列不占行，最多 2 行）
+[widget] 扩展 setWidget 的行              ← widget 区（未设置不占行）
 ┌ input (enter: send · q/esc: quit) ┐  输入框
 │ 输入的文本                         │
 └───────────────────────────────────┘
+
+浮层（居中覆盖，Esc 关闭后底层无损）：
+┌─ Model (ctrl+l) ─────────────┐   模型/thinking 选择器、
+│ > MiMo-V2.6-Pro   (provider) │   扩展 select/confirm/input/editor
+└──────────────────────────────┘   对话（editor 为多行：Enter 提交·Alt+Enter 换行）
 ```
 
 ## 键位
@@ -55,6 +61,10 @@ cargo run                       # 默认运行 TUI（default-run）
 | alt+Up | 取回全部排队消息到输入框（等价 clear_queue；队列空时无操作） |
 | Ctrl+T | 切换 thinking 块展开/折叠（默认折叠为单行占位） |
 | Ctrl+O | 切换工具卡片输出展开/折叠（默认显示头行+前 3 行） |
+| Ctrl+L | 打开模型选择器（↑/↓ 导航，Enter 应用，Esc 取消） |
+| Ctrl+P / Shift+Ctrl+P | 循环切换模型（下一个 / 上一个） |
+| Shift+Tab | 循环 thinking 级别 |
+| Alt+T | 打开 thinking 级别列表选择 |
 | Esc（流式中） | 发送 abort 中断生成，回到空闲 |
 | Esc 或 q（空闲时） | 退出 |
 | Ctrl-C | 随时安全退出（恢复终端） |
@@ -69,7 +79,12 @@ cargo run                       # 默认运行 TUI（default-run）
 - 消息区只自动跟随最新内容，暂不支持向上滚动回看。
 - Windows 键位差异（pi 在 Windows 用 ctrl+q 等）未做平台分支——当前只按
   macOS 键位实现。
-- 工具卡片覆盖 read/bash/edit（write/grep/find/ls 等走通用卡片兜底）。
+- 工具卡片覆盖 read/bash/edit/write/grep/find/ls（其余走通用卡片兜底）。
+- **Alt+T 打开 thinking 列表**是我们自选的键（原生 pi 走 `/thinking` 斜杠命令，
+  我们暂无斜杠命令基础设施）；级别循环 Shift+Tab 与 pi 一致。
+- 扩展 `editor` 弹层为终端内最小多行编辑（Enter 提交 / Alt+Enter 换行），
+  不含 pi 编辑器的 kill-ring/undo/外部 $EDITOR（Ctrl+G）等高级能力。
+- 选择器暂无输入即筛（fuzzy filter），靠 ↑/↓ 导航。
 
 ## 排查
 

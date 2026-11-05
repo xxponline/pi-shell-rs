@@ -7,6 +7,7 @@
 mod chat;
 mod event;
 mod markdown;
+mod overlay;
 mod terminal;
 mod tools;
 mod view;
@@ -20,8 +21,11 @@ use std::time::Duration;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use pi_rust_tui::rpc::{CommandSender, ResponsePolicy, RpcClient};
 use pi_rust_tui::session::{Phase, SessionState};
+use ratatui::style::Color;
+use std::collections::VecDeque;
 
-use crate::app::event::UiEvent;
+use crate::app::event::{AsyncKind, UiEvent};
+use crate::app::overlay::{overlay_key, Overlay, OverlayOutcome};
 use crate::app::terminal::TerminalGuard;
 
 /// 按键意图（`key_intent` 的纯映射产物，便于单测）。
@@ -39,6 +43,15 @@ enum KeyIntent {
     SendFollowUp,
     /// 取回全部排队消息（alt+up → clear_queue）
     Dequeue,
+    /// 打开模型选择器（ctrl+l）
+    OpenModelSelect,
+    /// 打开 thinking 级别选择器（alt+t）
+    OpenThinkingSelect,
+    /// 模型循环（ctrl+p 下一个 / shift+ctrl+p 上一个）
+    CycleModelNext,
+    CycleModelPrev,
+    /// thinking 级别循环（shift+tab）
+    CycleThinking,
     /// 中止生成（流式 esc）
     Abort,
     /// 普通编辑（可打印字符 / 退格）
@@ -52,8 +65,19 @@ pub struct App {
     state: SessionState,
     input: String,
     /// 最近的瞬时提示（parse 错误、发送失败等）。
-    notice: Option<String>,
+    /// 瞬时提示与颜色（error 红 / warning 黄 / info 默认色）。
+    notice: Option<(String, Color)>,
     should_quit: bool,
+    /// setStatus 的状态行附加文本。
+    status_text: Option<String>,
+    /// setWidget 的编辑器上方行（空 = 隐藏）。
+    widget_lines: Vec<String>,
+    /// 当前浮层。
+    overlay: Option<Overlay>,
+    /// 排队的扩展对话浮层（串行处理）。
+    pending_overlays: VecDeque<Overlay>,
+    /// 选择器异步数据序号（丢弃过期响应）。
+    overlay_seq: u64,
     /// thinking 是否展开（ctrl+t 切换，默认折叠）。
     show_thinking: bool,
     /// 工具输出是否展开（ctrl+o 切换，默认折叠）。
@@ -77,6 +101,11 @@ impl App {
             input: String::new(),
             notice: None,
             should_quit: false,
+            status_text: None,
+            widget_lines: Vec::new(),
+            overlay: None,
+            pending_overlays: VecDeque::new(),
+            overlay_seq: 0,
             show_thinking: false,
             expand_tools: false,
             debug_log,
@@ -157,22 +186,32 @@ impl App {
                 }
                 Ok(UiEvent::Rpc(raw)) => {
                     self.log_event("rpc", &raw.to_string());
-                    self.state.handle(&raw);
+                    if raw.get("type").and_then(|t| t.as_str()) == Some("extension_ui_request") {
+                        // 扩展 UI 请求走 App 层分发，不进 session 归约。
+                        self.handle_extension_request(&raw);
+                    } else {
+                        self.state.handle(&raw);
+                    }
+                    self.draw(terminal)?;
+                }
+                Ok(UiEvent::AsyncData { kind, seq, data }) => {
+                    self.log_event("async", &format!("{kind:?} seq={seq}"));
+                    self.handle_async_data(kind, seq, &data);
                     self.draw(terminal)?;
                 }
                 Ok(UiEvent::ParseError(raw)) => {
                     self.log_event("parse_error", &raw);
-                    self.notice = Some(format!("[parse_error] {raw}"));
+                    self.notice = Some((format!("[parse_error] {raw}"), Color::Red));
                     self.draw(terminal)?;
                 }
                 Ok(UiEvent::Closed) => {
                     self.log_event("closed", "stdout closed");
-                    self.notice = Some("pi 连接已关闭".to_string());
+                    self.notice = Some(("pi 连接已关闭".to_string(), Color::Red));
                     self.should_quit = true;
                 }
                 Ok(UiEvent::SendFailed(err)) => {
                     self.log_event("send_failed", &err);
-                    self.notice = Some(err);
+                    self.notice = Some((err, Color::Red));
                     self.draw(terminal)?;
                 }
                 Ok(UiEvent::RestoreQueued(data)) => {
@@ -198,6 +237,34 @@ impl App {
         commander: &CommandSender,
         report_tx: &Sender<UiEvent>,
     ) {
+        // ctrl+c 全局优先（浮层之下也生效）。
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return;
+        }
+
+        // 浮层优先消费按键（含关闭/应用），绝不落入主键位表。
+        if let Some(mut overlay) = self.overlay.take() {
+            match overlay_key(&mut overlay, key) {
+                OverlayOutcome::Handled => {
+                    self.overlay = Some(overlay);
+                }
+                OverlayOutcome::Close { reply } => {
+                    self.log_event("overlay", "closed");
+                    if let Some(reply) = reply {
+                        self.send_reply(&reply, commander, report_tx);
+                    }
+                    self.close_overlay();
+                }
+                OverlayOutcome::Apply(idx) => {
+                    self.log_event("overlay", &format!("apply #{idx}"));
+                    self.apply_overlay(&overlay, idx, commander, report_tx);
+                    self.close_overlay();
+                }
+            }
+            return;
+        }
+
         let intent = Self::key_intent(key, self.state.phase == Phase::Streaming);
         match self.apply_intent(key, intent) {
             Some(KeyIntent::Submit) => self.submit_as(commander, report_tx, "prompt"),
@@ -209,8 +276,147 @@ impl App {
                 false,
             ),
             Some(KeyIntent::Dequeue) => self.request_dequeue(commander, report_tx),
+            Some(KeyIntent::OpenModelSelect) => self.open_model_select(commander, report_tx),
+            Some(KeyIntent::OpenThinkingSelect) => {
+                self.open_thinking_select(commander, report_tx)
+            }
+            Some(KeyIntent::CycleModelNext) => {
+                Self::spawn_async(
+                    commander,
+                    report_tx,
+                    serde_json::json!({"type": "cycle_model"}),
+                    AsyncKind::CycleModel,
+                    0,
+                    None,
+                );
+            }
+            Some(KeyIntent::CycleModelPrev) => {
+                self.cycle_model_prev(commander, report_tx);
+            }
+            Some(KeyIntent::CycleThinking) => {
+                Self::spawn_async(
+                    commander,
+                    report_tx,
+                    serde_json::json!({"type": "cycle_thinking_level"}),
+                    AsyncKind::CycleThinking,
+                    0,
+                    None,
+                );
+            }
             _ => {}
         }
+    }
+
+    /// 打开模型选择器：置 loading 浮层并异步拉取模型列表（带序号防过期）。
+    fn open_model_select(&mut self, commander: &CommandSender, report_tx: &Sender<UiEvent>) {
+        self.log_event("overlay", "open model select");
+        self.overlay_seq += 1;
+        let seq = self.overlay_seq;
+        self.overlay = Some(Overlay::ModelSelect {
+            items: vec![],
+            loading: true,
+            cursor: 0,
+            seq,
+        });
+        Self::spawn_async(
+            commander,
+            report_tx,
+            serde_json::json!({"type": "get_available_models"}),
+            AsyncKind::Models,
+            seq,
+            None,
+        );
+    }
+
+    /// 打开 thinking 级别选择器（同上，数据为级别列表）。
+    fn open_thinking_select(&mut self, commander: &CommandSender, report_tx: &Sender<UiEvent>) {
+        self.log_event("overlay", "open thinking select");
+        self.overlay_seq += 1;
+        let seq = self.overlay_seq;
+        self.overlay = Some(Overlay::ThinkingSelect {
+            levels: vec![],
+            loading: true,
+            cursor: 0,
+            seq,
+        });
+        Self::spawn_async(
+            commander,
+            report_tx,
+            serde_json::json!({"type": "get_available_thinking_levels"}),
+            AsyncKind::ThinkingLevels,
+            seq,
+            None,
+        );
+    }
+
+    /// 模型上一个循环：RPC 无 backward 命令，经模型列表定位当前项的前一项
+    /// 后 set_model（单线程内完成两跳）。
+    fn cycle_model_prev(&self, commander: &CommandSender, report_tx: &Sender<UiEvent>) {
+        let current = self.state.model.clone();
+        let report = report_tx.clone();
+        let cmd = commander.clone();
+        thread::spawn(move || {
+            let list = cmd.send_command(
+                serde_json::json!({"type": "get_available_models"}),
+                Duration::from_secs(30),
+                ResponsePolicy::RequireSuccess,
+            );
+            let models = match list {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = report.send(UiEvent::SendFailed(e.to_string()));
+                    return;
+                }
+            };
+            let Some(arr) = models.get("models").and_then(|m| m.as_array()) else {
+                return;
+            };
+            let items: Vec<(String, String, String)> = arr
+                .iter()
+                .filter_map(|m| {
+                    Some((
+                        m.get("provider")?.as_str()?.to_string(),
+                        m.get("id")?.as_str()?.to_string(),
+                        m.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                    ))
+                })
+                .collect();
+            if items.is_empty() {
+                let _ = report.send(UiEvent::AsyncData {
+                    kind: AsyncKind::CycleModel,
+                    seq: 0,
+                    data: serde_json::Value::Null,
+                });
+                return;
+            }
+            // 定位当前项（按显示名匹配），无匹配则从末尾开始（回到最后一个）。
+            let cur_idx = current
+                .as_deref()
+                .and_then(|name| items.iter().position(|(_, _, n)| n == name))
+                .unwrap_or(items.len() - 1);
+            let prev = if cur_idx == 0 {
+                items.len() - 1
+            } else {
+                cur_idx - 1
+            };
+            let (provider, id, _) = &items[prev];
+            match cmd.send_command(
+                serde_json::json!({"type": "set_model", "provider": provider, "modelId": id}),
+                Duration::from_secs(30),
+                ResponsePolicy::RequireSuccess,
+            ) {
+                Ok(data) => {
+                    let _ = report.send(UiEvent::AsyncData {
+                        kind: AsyncKind::ModelApplied,
+                        seq: 0,
+                        data,
+                    });
+                }
+                Err(e) => {
+                    let _ = report.send(UiEvent::SendFailed(e.to_string()));
+                }
+            }
+        });
     }
 
     /// 纯按键 → 意图映射（不触碰状态，便于单测）。
@@ -233,6 +439,15 @@ impl App {
             Enter if alt => KeyIntent::SendFollowUp,
             Enter => KeyIntent::Submit,
             Up if alt => KeyIntent::Dequeue,
+            Char('l') if ctrl && !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                KeyIntent::OpenModelSelect
+            }
+            Char('p') if ctrl && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                KeyIntent::CycleModelPrev
+            }
+            Char('p') if ctrl => KeyIntent::CycleModelNext,
+            Char('t') if alt => KeyIntent::OpenThinkingSelect,
+            BackTab => KeyIntent::CycleThinking,
             Backspace | Char(_) => KeyIntent::Edit,
             _ => KeyIntent::Ignore,
         }
@@ -273,7 +488,12 @@ impl App {
             KeyIntent::Submit
             | KeyIntent::Abort
             | KeyIntent::SendFollowUp
-            | KeyIntent::Dequeue => Some(intent),
+            | KeyIntent::Dequeue
+            | KeyIntent::OpenModelSelect
+            | KeyIntent::OpenThinkingSelect
+            | KeyIntent::CycleModelNext
+            | KeyIntent::CycleModelPrev
+            | KeyIntent::CycleThinking => Some(intent),
         }
     }
 
@@ -387,14 +607,323 @@ impl App {
         });
     }
 
-    fn draw(&self, terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
-        let flags = crate::app::chat::RenderFlags {
-            show_thinking: self.show_thinking,
-            expand_tools: self.expand_tools,
+    /// 分发一条 extension_ui_request：对话 4 种入浮层，被动 5 种立即应用（不回发）。
+    ///
+    /// 输入: raw — 请求 JSON 对象
+    /// 输出: 无返回值；副作用为入队浮层或更新 App UI 状态
+    fn handle_extension_request(&mut self, raw: &serde_json::Value) {
+        let id = raw.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+        let method = raw.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        let str_field = |k: &str| -> String {
+            raw.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string()
         };
-        terminal.draw(|frame| {
-            view::render(frame, &self.state, &self.input, self.notice.as_deref(), flags);
-        })?;
+        match method {
+            "select" => {
+                let options = raw
+                    .get("options")
+                    .and_then(|o| o.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.push_dialog(Overlay::ExtSelect {
+                    id,
+                    title: str_field("title"),
+                    options,
+                    cursor: 0,
+                });
+            }
+            "confirm" => self.push_dialog(Overlay::ExtConfirm {
+                id,
+                title: str_field("title"),
+                message: str_field("message"),
+                confirm_selected: true,
+            }),
+            "input" => self.push_dialog(Overlay::ExtInput {
+                id,
+                title: str_field("title"),
+                placeholder: str_field("placeholder"),
+                buffer: String::new(),
+            }),
+            "editor" => {
+                let prefill = raw.get("prefill").and_then(|v| v.as_str()).unwrap_or("");
+                let lines: Vec<String> = if prefill.is_empty() {
+                    vec![String::new()]
+                } else {
+                    prefill.lines().map(String::from).collect()
+                };
+                // 光标置于 prefill 末尾（追加编辑的自然起点）。
+                let row = lines.len() - 1;
+                let col = lines[row].chars().count();
+                self.push_dialog(Overlay::ExtEditor {
+                    id,
+                    title: str_field("title"),
+                    lines,
+                    row,
+                    col,
+                });
+            }
+            "notify" => {
+                let color = match raw.get("notifyType").and_then(|t| t.as_str()) {
+                    Some("error") => Color::Red,
+                    Some("warning") => Color::Yellow,
+                    _ => Color::Reset,
+                };
+                self.notice = Some((str_field("message"), color));
+            }
+            "setStatus" => {
+                self.status_text = raw
+                    .get("statusText")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+            }
+            "setWidget" => {
+                self.widget_lines = match raw.get("widgetLines") {
+                    Some(serde_json::Value::Array(arr)) => arr
+                        .iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+            }
+            "setTitle" => {
+                let title = str_field("title");
+                let _ = crossterm::execute!(
+                    std::io::stdout(),
+                    crossterm::terminal::SetTitle(title)
+                );
+            }
+            "set_editor_text" => {
+                self.input = str_field("text");
+            }
+            other => {
+                self.log_event("extension_ui", &format!("ignored method {other}"));
+            }
+        }
+    }
+
+    /// 把对话浮层压入当前槽或排队（串行处理，与 pi 的 withUIPrompt 一致）。
+    fn push_dialog(&mut self, overlay: Overlay) {
+        if self.overlay.is_none() {
+            self.overlay = Some(overlay);
+        } else {
+            self.pending_overlays.push_back(overlay);
+        }
+    }
+
+    /// 关闭当前浮层并让排队中的下一个顶上。
+    fn close_overlay(&mut self) {
+        self.overlay = self.pending_overlays.pop_front();
+    }
+
+    /// 选择器确认：把选中项转成对应 RPC 命令，异步执行并回填状态。
+    ///
+    /// 输入: overlay — 应用时的浮层快照；idx — 选中下标；
+    ///       commander/report_tx — 命令句柄与结果回报通道
+    /// 输出: 无返回值；副作用为异步发 set_model / set_thinking_level
+    fn apply_overlay(
+        &mut self,
+        overlay: &Overlay,
+        idx: usize,
+        commander: &CommandSender,
+        report_tx: &Sender<UiEvent>,
+    ) {
+        match overlay {
+            Overlay::ModelSelect { items, seq, .. } => {
+                if let Some(item) = items.get(idx) {
+                    let command = serde_json::json!({
+                        "type": "set_model",
+                        "provider": item.provider,
+                        "modelId": item.id
+                    });
+                    Self::spawn_async(
+                        commander,
+                        report_tx,
+                        command,
+                        AsyncKind::ModelApplied,
+                        *seq,
+                        None,
+                    );
+                }
+            }
+            Overlay::ThinkingSelect { levels, seq, .. } => {
+                if let Some(level) = levels.get(idx) {
+                    let command =
+                        serde_json::json!({"type": "set_thinking_level", "level": level});
+                    // set_thinking_level 响应无 data，携带级别字符串回填。
+                    Self::spawn_async(
+                        commander,
+                        report_tx,
+                        command,
+                        AsyncKind::ThinkingApplied,
+                        *seq,
+                        Some(level.clone()),
+                    );
+                }
+            }
+            // 扩展对话浮层不走此路径（由 Close reply 处理）。
+            _ => {}
+        }
+    }
+
+    /// 一次性线程执行命令，结果经 AsyncData / SendFailed 回到主循环。
+    ///
+    /// 输入: commander — 命令句柄；report_tx — 回报通道；command — 命令对象；
+    ///       kind — 异步数据类别；seq — 选择器序号；attach — 附加到 data 的载荷
+    ///       （响应本身无 data 时使用，如 set_thinking_level 的级别）
+    /// 输出: 无返回值；副作用为异步发命令
+    fn spawn_async(
+        commander: &CommandSender,
+        report_tx: &Sender<UiEvent>,
+        command: serde_json::Value,
+        kind: AsyncKind,
+        seq: u64,
+        attach: Option<String>,
+    ) {
+        let report = report_tx.clone();
+        let cmd = commander.clone();
+        thread::spawn(move || {
+            match cmd.send_command(command, Duration::from_secs(60), ResponsePolicy::RequireSuccess)
+            {
+                Ok(data) => {
+                    let data = match attach {
+                        Some(extra) => serde_json::Value::String(extra),
+                        None => data,
+                    };
+                    let _ = report.send(UiEvent::AsyncData { kind, seq, data });
+                }
+                Err(e) => {
+                    let _ = report.send(UiEvent::SendFailed(e.to_string()));
+                }
+            }
+        });
+    }
+
+    /// 发送 extension_ui_response（原始行，不经 id 路由）。
+    ///
+    /// 输入: reply — 回复载荷；commander — 提供 send_raw 的命令句柄；
+    ///       report_tx — 失败回报通道
+    /// 输出: 无返回值；副作用为入队一条原始行
+    fn send_reply(
+        &self,
+        reply: &serde_json::Value,
+        commander: &CommandSender,
+        report_tx: &Sender<UiEvent>,
+    ) {
+        if let Err(e) = commander.send_raw(reply) {
+            let _ = report_tx.send(UiEvent::SendFailed(e.to_string()));
+        }
+    }
+
+    /// 消费异步数据：填充选择器 / 回填模型与 thinking 状态。
+    ///
+    /// 输入: kind — 数据类别；seq — 选择器序号（用于丢弃过期响应）；
+    ///       data — 载荷
+    /// 输出: 无返回值；副作用为更新 overlay/state/notice
+    fn handle_async_data(&mut self, kind: AsyncKind, seq: u64, data: &serde_json::Value) {
+        match kind {
+            AsyncKind::Models => {
+                if let Some(Overlay::ModelSelect {
+                    items, loading, seq: s, ..
+                }) = self.overlay.as_mut()
+                    && *s == seq
+                {
+                        *items = data
+                            .get("models")
+                            .and_then(|m| m.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|m| {
+                                        Some(crate::app::overlay::ModelItem {
+                                            provider: m
+                                                .get("provider")
+                                                .and_then(|x| x.as_str())?
+                                                .to_string(),
+                                            id: m.get("id").and_then(|x| x.as_str())?.to_string(),
+                                            name: m
+                                                .get("name")
+                                                .and_then(|x| x.as_str())
+                                                .unwrap_or_default()
+                                                .to_string(),
+                                        })
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        *loading = false;
+                }
+            }
+            AsyncKind::ThinkingLevels => {
+                if let Some(Overlay::ThinkingSelect {
+                    levels, loading, seq: s, ..
+                }) = self.overlay.as_mut()
+                    && *s == seq
+                {
+                        *levels = data
+                            .get("levels")
+                            .and_then(|l| l.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|x| x.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        *loading = false;
+                }
+            }
+            AsyncKind::ModelApplied => {
+                if let Some(name) = data
+                    .get("name")
+                    .or_else(|| data.get("id"))
+                    .and_then(|x| x.as_str())
+                {
+                    self.state.model = Some(name.to_string());
+                }
+            }
+            AsyncKind::CycleModel => {
+                if data.is_null() {
+                    self.notice = Some(("无可用模型".to_string(), Color::Yellow));
+                } else if let Some(name) = data
+                    .pointer("/model/name")
+                    .or_else(|| data.pointer("/model/id"))
+                    .and_then(|x| x.as_str())
+                {
+                    self.state.model = Some(name.to_string());
+                    if let Some(level) = data.get("thinkingLevel").and_then(|x| x.as_str()) {
+                        self.state.thinking_level = Some(level.to_string());
+                    }
+                }
+            }
+            AsyncKind::ThinkingApplied => {
+                if let Some(level) = data.as_str() {
+                    self.state.thinking_level = Some(level.to_string());
+                }
+            }
+            AsyncKind::CycleThinking => {
+                if let Some(level) = data.pointer("/level").and_then(|x| x.as_str()) {
+                    self.state.thinking_level = Some(level.to_string());
+                } else if data.is_null() {
+                    self.notice = Some(("无可用 thinking 级别".to_string(), Color::Yellow));
+                }
+            }
+        }
+    }
+
+    fn draw(&self, terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
+        let ui = view::ViewUi {
+            input: &self.input,
+            notice: self.notice.as_ref().map(|(t, c)| (t.as_str(), *c)),
+            status_text: self.status_text.as_deref(),
+            widget_lines: &self.widget_lines,
+            flags: crate::app::chat::RenderFlags {
+                show_thinking: self.show_thinking,
+                expand_tools: self.expand_tools,
+            },
+            overlay: self.overlay.as_ref(),
+        };
+        terminal.draw(|frame| view::render(frame, &self.state, &ui))?;
         Ok(())
     }
 
@@ -412,6 +941,15 @@ fn pop_last_char(s: &mut String) {
 #[cfg(test)]
 mod input_tests {
     use super::*;
+
+
+    /// 测试辅助：经真实 apply_intent 判定意图是否需要命令通道。
+    fn routed_intent(code: KeyCode, mods: KeyModifiers, streaming: bool) -> Option<KeyIntent> {
+        let key = KeyEvent::new(code, mods);
+        let intent = App::key_intent(key, streaming);
+        let mut probe = App::new();
+        probe.apply_intent(key, intent)
+    }
 
     #[test]
     fn append_and_backspace_are_char_safe() {
@@ -541,5 +1079,431 @@ mod input_tests {
         assert!(app.can_submit());
         app.input = "   ".into();
         assert!(!app.can_submit());
+    }
+
+    /// 造一个只应答不动作的假 pi，供需要 CommandSender 的测试使用。
+    fn test_commander() -> (pi_rust_tui::rpc::RpcClient, std::path::PathBuf) {
+        let script = "#!/bin/sh\nwhile IFS= read -r line; do\n  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p')\n  printf '{\"type\":\"response\",\"id\":\"%s\",\"success\":true}\n' \"$id\"\ndone\n";
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("app-test-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fake.sh");
+        std::fs::write(&path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let client = pi_rust_tui::rpc::RpcClient::spawn(path.to_str().unwrap(), &[]).unwrap();
+        (client, dir)}
+
+    #[test]
+    fn overlay_focus_routing_blocks_main_keys() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (client, dir) = test_commander();
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+
+        let mut app = App::new();
+        app.overlay = Some(crate::app::overlay::Overlay::ExtInput {
+            id: "r1".into(),
+            title: "t".into(),
+            placeholder: String::new(),
+            buffer: String::new(),
+        });
+
+        // 浮层内输入字符 → 进浮层缓冲，绝不进主输入框
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+            &commander,
+            &tx,
+        );
+        assert!(app.input.is_empty(), "浮层键不得泄漏到主输入框");
+        match &app.overlay {
+            Some(crate::app::overlay::Overlay::ExtInput { buffer, .. }) => {
+                assert_eq!(buffer, "z");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // 浮层内 ctrl+c → 直接退出标志（全局分支，先于浮层路由）
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &commander,
+            &tx,
+        );
+        assert!(app.should_quit, "ctrl+c 在浮层下应全局退出");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extension_request_dispatch_and_passive_methods() {
+        let mut app = App::new();
+        // 对话 → 浮层
+        app.handle_extension_request(&serde_json::json!({
+            "type":"extension_ui_request","id":"s1","method":"select",
+            "title":"pick","options":["a","b"]
+        }));
+        match &app.overlay {
+            Some(crate::app::overlay::Overlay::ExtSelect { id, options, .. }) => {
+                assert_eq!(id, "s1");
+                assert_eq!(options, &vec!["a".to_string(), "b".to_string()]);
+            }
+            other => panic!("{other:?}"),
+        }
+        // 第二个对话 → 排队
+        app.handle_extension_request(&serde_json::json!({
+            "type":"extension_ui_request","id":"c1","method":"confirm",
+            "title":"t","message":"m"
+        }));
+        assert_eq!(app.pending_overlays.len(), 1, "第二个对话应排队");
+        // 关闭当前 → 队列顶上
+        app.close_overlay();
+        assert!(matches!(
+            app.overlay,
+            Some(crate::app::overlay::Overlay::ExtConfirm { .. })
+        ));
+
+        // 被动 5 种
+        app.handle_extension_request(&serde_json::json!({
+            "type":"extension_ui_request","id":"n1","method":"notify",
+            "message":"heads up","notifyType":"warning"
+        }));
+        let (text, color) = app.notice.clone().expect("notice");
+        assert_eq!(text, "heads up");
+        assert_eq!(color, Color::Yellow);
+
+        app.handle_extension_request(&serde_json::json!({
+            "type":"extension_ui_request","id":"st","method":"setStatus","statusText":"busy"
+        }));
+        assert_eq!(app.status_text.as_deref(), Some("busy"));
+
+        app.handle_extension_request(&serde_json::json!({
+            "type":"extension_ui_request","id":"st2","method":"setStatus","statusText":null
+        }));
+        assert_eq!(app.status_text, None);
+
+        app.handle_extension_request(&serde_json::json!({
+            "type":"extension_ui_request","id":"w","method":"setWidget",
+            "widgetLines":["line-a","line-b"]
+        }));
+        assert_eq!(app.widget_lines, vec!["line-a".to_string(), "line-b".to_string()]);
+        app.handle_extension_request(&serde_json::json!({
+            "type":"extension_ui_request","id":"w2","method":"setWidget","widgetLines":null
+        }));
+        assert!(app.widget_lines.is_empty(), "null 清除 widget");
+
+        app.handle_extension_request(&serde_json::json!({
+            "type":"extension_ui_request","id":"e","method":"set_editor_text","text":"draft text"
+        }));
+        assert_eq!(app.input, "draft text");
+
+        // setTitle 不 panic（无法断言终端标题，仅验证路径安全）
+        app.handle_extension_request(&serde_json::json!({
+            "type":"extension_ui_request","id":"ti","method":"setTitle","title":"proj"
+        }));
+        // 未知 method 忽略
+        app.handle_extension_request(&serde_json::json!({
+            "type":"extension_ui_request","id":"x","method":"mystery"
+        }));
+        // 被动方法均未产生浮层替换（浮层仍是 confirm）
+        assert!(matches!(
+            app.overlay,
+            Some(crate::app::overlay::Overlay::ExtConfirm { .. })
+        ));
+    }
+
+    #[test]
+    fn async_data_fills_selectors_and_discards_stale() {
+        let mut app = App::new();
+        // 打开 model 选择器（seq=1）
+        app.overlay_seq += 1;
+        let seq = app.overlay_seq;
+        app.overlay = Some(crate::app::overlay::Overlay::ModelSelect {
+            items: vec![],
+            loading: true,
+            cursor: 0,
+            seq,
+        });
+        // 过期 seq → 丢弃
+        app.handle_async_data(AsyncKind::Models, seq + 99, &serde_json::json!({
+            "models":[{"provider":"p","id":"m","name":"Stale"}]
+        }));
+        match &app.overlay {
+            Some(crate::app::overlay::Overlay::ModelSelect { loading, items, .. }) => {
+                assert!(*loading, "过期数据不得填充");
+                assert!(items.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+        // 匹配 seq → 填充
+        app.handle_async_data(AsyncKind::Models, seq, &serde_json::json!({
+            "models":[{"provider":"p","id":"m","name":"Real Model"}]
+        }));
+        match &app.overlay {
+            Some(crate::app::overlay::Overlay::ModelSelect { loading, items, .. }) => {
+                assert!(!*loading);
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].name, "Real Model");
+            }
+            other => panic!("{other:?}"),
+        }
+        // CycleModel null → notice
+        app.handle_async_data(AsyncKind::CycleModel, 0, &serde_json::Value::Null);
+        let (text, color) = app.notice.clone().expect("notice");
+        assert!(text.contains("无可用模型"), "{text}");
+        assert_eq!(color, Color::Yellow);
+        // ModelApplied → state.model
+        app.handle_async_data(
+            AsyncKind::ModelApplied,
+            0,
+            &serde_json::json!({"provider":"p","id":"m","name":"Applied"}),
+        );
+        assert_eq!(app.state.model.as_deref(), Some("Applied"));
+        // ThinkingApplied → state.thinking_level
+        app.handle_async_data(AsyncKind::ThinkingApplied, 0, &serde_json::json!("high"));
+        assert_eq!(app.state.thinking_level.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn model_select_opens_with_seq_and_loading() {
+        let mut app = App::new();
+        app.overlay_seq += 1;
+        let seq = app.overlay_seq;
+        app.overlay = Some(crate::app::overlay::Overlay::ModelSelect {
+            items: vec![],
+            loading: true,
+            cursor: 0,
+            seq,
+        });
+        // apply 一个空列表（不发命令路径）——idx 越界安全
+        if let Some(o) = app.overlay.take() {
+            // apply_overlay 需要 commander，空 items 时不会发命令；这里只验证快照语义
+            if let crate::app::overlay::Overlay::ModelSelect { items, .. } = &o {
+                assert!(items.is_empty());
+            }
+            app.overlay = Some(o);
+        }
+        assert!(app.overlay.is_some());
+    }
+
+    /// 用真实 extension_ui fixture 回放：请求 → 浮层 → 键驱动 → 回复载荷。
+    #[test]
+    fn extension_ui_fixture_replay_builds_dialogs_and_replies() {
+        use crate::app::overlay::{overlay_key, Overlay, OverlayOutcome};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/probe/extension_ui/snapshot/transcript.jsonl");
+        let content = std::fs::read_to_string(&path).expect("fixture");
+
+        let mut app = App::new();
+        let mut requests = Vec::new();
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let wrapper: serde_json::Value = serde_json::from_str(line).unwrap();
+            if wrapper.get("dir").and_then(|d| d.as_str()) != Some("in") {
+                continue;
+            }
+            let raw = wrapper.get("raw").cloned().unwrap();
+            if raw.get("type").and_then(|t| t.as_str()) == Some("extension_ui_request") {
+                requests.push(raw);
+            }
+        }
+        assert!(requests.len() >= 3, "fixture 应含 select/confirm/notify: {}", requests.len());
+
+        // 第 1 个：select → 浮层，导航后提交
+        app.handle_extension_request(&requests[0]);
+        let mut overlay = app.overlay.take().expect("select 浮层");
+        match &mut overlay {
+            Overlay::ExtSelect { id, title, options, .. } => {
+                assert_eq!(id, "a7b2a469-5f7e-4162-a635-eaefc3a28815");
+                assert_eq!(title, "probe select");
+                assert_eq!(options, &vec!["first".to_string(), "second".to_string()]);
+            }
+            other => panic!("{other:?}"),
+        }
+        // 选 second
+        overlay_key(&mut overlay, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let out = overlay_key(&mut overlay, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match out {
+            OverlayOutcome::Close { reply: Some(v) } => {
+                assert_eq!(v["value"], "second");
+                assert_eq!(
+                    v["id"],
+                    "a7b2a469-5f7e-4162-a635-eaefc3a28815"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        app.overlay = None;
+
+        // 第 2 个：confirm → 浮层，直接确认
+        app.handle_extension_request(&requests[1]);
+        let mut overlay = app.overlay.take().expect("confirm 浮层");
+        let out = overlay_key(&mut overlay, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match out {
+            OverlayOutcome::Close { reply: Some(v) } => {
+                assert_eq!(v["confirmed"], true);
+                assert_eq!(v["id"], "bd2e786b-5ffa-4b89-aa19-6c3c35d1d2b0");
+            }
+            other => panic!("{other:?}"),
+        }
+        app.overlay = None;
+
+        // 第 3 个：notify → 状态行通知，无浮层
+        app.handle_extension_request(&requests[2]);
+        assert!(app.overlay.is_none(), "notify 不产生浮层");
+        let (text, _) = app.notice.clone().expect("notify 通知");
+        assert!(text.starts_with("probe notify:"), "{text}");
+    }
+
+    #[test]
+    fn selector_keys_map_per_spec() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let k = |code, mods| KeyEvent::new(code, mods);
+        // ctrl+l → 打开模型选择器
+        assert_eq!(
+            App::key_intent(k(KeyCode::Char('l'), KeyModifiers::CONTROL), false),
+            KeyIntent::OpenModelSelect
+        );
+        // 普通 l → 编辑
+        assert_eq!(
+            App::key_intent(k(KeyCode::Char('l'), KeyModifiers::NONE), false),
+            KeyIntent::Edit
+        );
+        // ctrl+p / ctrl+shift+p → 循环
+        assert_eq!(
+            App::key_intent(k(KeyCode::Char('p'), KeyModifiers::CONTROL), false),
+            KeyIntent::CycleModelNext
+        );
+        assert_eq!(
+            App::key_intent(
+                k(KeyCode::Char('p'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+                false
+            ),
+            KeyIntent::CycleModelPrev
+        );
+        // shift+tab (BackTab) → thinking 循环
+        assert_eq!(
+            App::key_intent(k(KeyCode::BackTab, KeyModifiers::SHIFT), false),
+            KeyIntent::CycleThinking
+        );
+        // alt+t → thinking 选择器（与 ctrl+t 切换显示互不干扰）
+        assert_eq!(
+            App::key_intent(k(KeyCode::Char('t'), KeyModifiers::ALT), false),
+            KeyIntent::OpenThinkingSelect
+        );
+        assert_eq!(
+            App::key_intent(k(KeyCode::Char('t'), KeyModifiers::CONTROL), false),
+            KeyIntent::ToggleThinking
+        );
+        // 这些意图都需要命令通道（Some 返回）
+        assert_eq!(
+            routed_intent(KeyCode::Char('l'), KeyModifiers::CONTROL, false),
+            Some(KeyIntent::OpenModelSelect)
+        );
+    }
+
+    #[test]
+    fn thinking_selector_state_and_apply() {
+        let mut app = App::new();
+        app.overlay_seq += 1;
+        let seq = app.overlay_seq;
+        app.overlay = Some(crate::app::overlay::Overlay::ThinkingSelect {
+            levels: vec![],
+            loading: true,
+            cursor: 0,
+            seq,
+        });
+        // 过期序号丢弃
+        app.handle_async_data(
+            AsyncKind::ThinkingLevels,
+            seq + 1,
+            &serde_json::json!({"levels":["low","high"]}),
+        );
+        match &app.overlay {
+            Some(crate::app::overlay::Overlay::ThinkingSelect { loading, .. }) => {
+                assert!(*loading);
+            }
+            other => panic!("{other:?}"),
+        }
+        // 正确序号填充
+        app.handle_async_data(
+            AsyncKind::ThinkingLevels,
+            seq,
+            &serde_json::json!({"levels":["low","high"]}),
+        );
+        match &app.overlay {
+            Some(crate::app::overlay::Overlay::ThinkingSelect { levels, loading, .. }) => {
+                assert!(!*loading);
+                assert_eq!(levels, &vec!["low".to_string(), "high".to_string()]);
+            }
+            other => panic!("{other:?}"),
+        }
+        // cycle_thinking_level 结果
+        app.handle_async_data(AsyncKind::CycleThinking, 0, &serde_json::json!({"level":"xhigh"}));
+        assert_eq!(app.state.thinking_level.as_deref(), Some("xhigh"));
+        app.handle_async_data(AsyncKind::CycleThinking, 0, &serde_json::Value::Null);
+        let (text, color) = app.notice.clone().expect("notice");
+        assert!(text.contains("无可用"), "{text}");
+        assert_eq!(color, Color::Yellow);
+    }
+
+    #[test]
+    fn ctrl_l_via_handle_key_opens_model_selector() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (client, dir) = test_commander();
+        let commander = client.command_sender();
+        let (tx, rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+            &commander,
+            &tx,
+        );
+        // 浮层应打开且 loading
+        match &app.overlay {
+            Some(crate::app::overlay::Overlay::ModelSelect { loading, seq, .. }) => {
+                assert!(*loading, "打开即 loading");
+                assert!(*seq >= 1);
+            }
+            other => panic!("overlay 未打开: {other:?}"),
+        }
+        // 异步请求已发出：稍候应收到 Models 数据（fake pi 对 get_available_models
+        // 回 {success:true} 无 data → items 空但 loading 结束）
+        let got = std::time::Instant::now();
+        let mut filled = false;
+        while got.elapsed() < std::time::Duration::from_secs(3) {
+            if let Ok(UiEvent::AsyncData { kind, .. }) =
+                rx.recv_timeout(std::time::Duration::from_millis(200))
+                && kind == AsyncKind::Models
+            {
+                filled = true;
+                break;
+            }
+        }
+        assert!(filled, "应收到 Models 异步数据");
+        app.handle_async_data(
+            AsyncKind::Models,
+            match &app.overlay {
+                Some(crate::app::overlay::Overlay::ModelSelect { seq, .. }) => *seq,
+                _ => 0,
+            },
+            &serde_json::json!({"models":[]}),
+        );
+        match &app.overlay {
+            Some(crate::app::overlay::Overlay::ModelSelect { loading, .. }) => {
+                assert!(!*loading, "数据到达后结束 loading");
+            }
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

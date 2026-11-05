@@ -200,6 +200,11 @@ follow_up 队列 / auto-retry 提示。
 model/session/tree/thinking 选择器，extension_ui 9 种 method，write/grep/find/ls
 卡片，新建/重命名/删除会话。图片、主题、mermaid 等按需后置。
 
+拆分进度（方案 A）：
+- **4a add-overlay-dialogs ✅**：overlay 框架 + model/thinking 选择器与模型循环 +
+  extension UI 9 method + write/grep/find/ls 卡片
+- **4b 待立项**：session 选择器 / 会话树 / 新建·重命名·删除 / compact 流程
+
 ## 7. 既定技术决策记录
 
 - 运行时：探针已用 std 三线程（无 tokio）。主 TUI 的并发模型（继续 std +

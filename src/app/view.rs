@@ -11,36 +11,72 @@ use pi_rust_tui::session::{Phase, SessionState, Usage};
 use crate::app::chat::{chat_lines, RenderFlags};
 use crate::app::wrap::wrap_for_viewport;
 
-/// Render one frame from immutable state.
-pub fn render(
-    frame: &mut Frame,
-    state: &SessionState,
-    input: &str,
-    notice: Option<&str>,
-    flags: RenderFlags,
-) {
+/// 一帧所需的全部 UI 附加输入（与会话状态解耦，便于测试构造）。
+#[derive(Default)]
+pub struct ViewUi<'a> {
+    /// 主输入框文本。
+    pub input: &'a str,
+    /// 瞬时提示与颜色。
+    pub notice: Option<(&'a str, Color)>,
+    /// setStatus 的状态行附加文本。
+    pub status_text: Option<&'a str>,
+    /// setWidget 的编辑器上方行（空切片=隐藏）。
+    pub widget_lines: &'a [String],
+    /// thinking/工具展开偏好。
+    pub flags: RenderFlags,
+    /// 当前浮层（最上层绘制）。
+    pub overlay: Option<&'a crate::app::overlay::Overlay>,
+}
+
+
+/// 从不可变状态渲染一帧（含浮层）。
+pub fn render(frame: &mut Frame, state: &SessionState, ui: &ViewUi<'_>) {
     let area = frame.area();
     let queue = queue_lines(state);
     let queue_h = queue.len() as u16;
+    // widget 区含 TOP 边框/标题行，非空时多占 1 行。
+    let widget_h = if ui.widget_lines.is_empty() {
+        0
+    } else {
+        ui.widget_lines.len() as u16 + 1
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),            // header/status
             Constraint::Min(1),               // chat
             Constraint::Length(queue_h),      // queue strip（空队列不占行）
+            Constraint::Length(widget_h),     // extension widget（未设置不占行）
             Constraint::Length(3),            // input
         ])
         .split(area);
 
-    render_header(frame, chunks[0], state, notice);
-    render_chat(frame, chunks[1], state, flags);
+    render_header(frame, chunks[0], state, ui);
+    render_chat(frame, chunks[1], state, ui.flags);
     if queue_h > 0 {
         frame.render_widget(
             Paragraph::new(queue).style(Style::default().fg(Color::DarkGray)),
             chunks[2],
         );
     }
-    render_editor(frame, chunks[3], input, state.phase);
+    if widget_h > 0 {
+        let widget: Vec<Line> = ui
+            .widget_lines
+            .iter()
+            .map(|l| Line::from(l.clone()))
+            .collect();
+        frame.render_widget(
+            Paragraph::new(widget)
+                .style(Style::default().fg(Color::Cyan))
+                .block(Block::default().borders(Borders::TOP).title(" widget ")),
+            chunks[3],
+        );
+    }
+    render_editor(frame, chunks[4], ui.input, state.phase);
+
+    if let Some(overlay) = ui.overlay {
+        crate::app::overlay::render_overlay(frame, overlay);
+    }
 }
 
 /// 构建队列带行：`[steer]`/`[queue]` 前缀，最多 2 行，超出显示 `…N more`。
@@ -129,7 +165,8 @@ fn usage_spans(usage: &Usage) -> Vec<Span<'static>> {
 /// 输入: frame — ratatui 帧；area — 状态行区域；state — 会话状态；
 ///       notice — 瞬时提示（可空）
 /// 输出: 无返回值；副作用为向帧写入状态行
-fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, state: &SessionState, notice: Option<&str>) {
+fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, state: &SessionState, ui: &ViewUi<'_>) {
+    let notice = ui.notice;
     let (phase_label, color) = match state.phase {
         Phase::Streaming => ("● streaming", Color::Yellow),
         Phase::Idle => ("○ idle", Color::Green),
@@ -157,10 +194,16 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, state: &Session
         spans.extend(usage_spans(usage));
         spans.push(Span::raw("  "));
     }
-    if let Some(notice) = notice {
+    if let Some(text) = ui.status_text {
         spans.push(Span::styled(
-            truncate(notice, area.width as usize),
-            Style::default().fg(Color::Red),
+            format!(" {text} "),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+    if let Some((text, color)) = notice {
+        spans.push(Span::styled(
+            truncate(text, area.width as usize),
+            Style::default().fg(color),
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -232,7 +275,13 @@ mod render_tests {
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(frame, state, input, None, RenderFlags::default()))
+            .draw(|frame| {
+                let ui = ViewUi {
+                    input,
+                    ..ViewUi::default()
+                };
+                render(frame, state, &ui);
+            })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let mut out = String::new();
@@ -393,5 +442,92 @@ mod render_tests {
         assert!(buf.contains("[queue] queued message"), "{buf}");
         // 输入框仍在
         assert!(buf.contains("input"), "{buf}");
+    }
+
+    #[test]
+    fn overlay_open_close_restores_frame() {
+        let mut state = SessionState::new();
+        state.handle(&serde_json::json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}));
+        let render_with = |overlay: Option<&crate::app::overlay::Overlay>| -> String {
+            let backend = TestBackend::new(60, 20);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    let ui = ViewUi {
+                        input: "draft",
+                        overlay,
+                        ..ViewUi::default()
+                    };
+                    render(frame, &state, &ui);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let mut out = String::new();
+            for y in 0..buffer.area.height {
+                for x in 0..buffer.area.width {
+                    out.push_str(buffer[(x, y)].symbol());
+                }
+                out.push('\n');
+            }
+            out
+        };
+        let base = render_with(None);
+        let overlay = crate::app::overlay::Overlay::ExtConfirm {
+            id: "x".into(),
+            title: "t".into(),
+            message: "sure?".into(),
+            confirm_selected: true,
+        };
+        let with = render_with(Some(&overlay));
+        assert!(with.contains("sure?"), "浮层内容应出现: {with}");
+        assert!(with.contains("hello"), "底层消息仍可见: {with}");
+        let after = render_with(None);
+        assert_eq!(base, after, "关闭后帧应与打开前一致");
+        assert_ne!(base, with, "打开时帧应不同");
+    }
+
+    #[test]
+    fn widget_and_status_render_when_set() {
+        let state = SessionState::new();
+        let backend = TestBackend::new(70, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let ui = ViewUi {
+                    input: "",
+                    status_text: Some("status-here"),
+                    widget_lines: &["widget line 1".to_string(), "widget line 2".to_string()],
+                    ..ViewUi::default()
+                };
+                render(frame, &state, &ui);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        assert!(out.contains("status-here"), "{out}");
+        assert!(out.contains("widget line 1"), "{out}");
+        assert!(out.contains("input"), "输入框仍在: {out}");
+
+        // widget 清除后不再占行
+        terminal
+            .draw(|frame| {
+                let ui = ViewUi { input: "", status_text: None, widget_lines: &[], ..ViewUi::default() };
+                render(frame, &state, &ui);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut out2 = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                out2.push_str(buffer[(x, y)].symbol());
+            }
+        }
+        assert!(!out2.contains("widget line 1"), "{out2}");
     }
 }

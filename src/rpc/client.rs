@@ -164,6 +164,18 @@ impl RpcClient {
 }
 
 impl CommandSender {
+    /// 发送一条不经 id 路由的原始 JSON 行（如 extension_ui_response）。
+    ///
+    /// 输入: value — 单个 JSON 对象（须自带 id 字段）
+    /// 输出: Ok(()) 表示已入队；泵已退出则 Err
+    pub fn send_raw(&self, value: &Value) -> Result<(), ClientError> {
+        let line = serde_json::to_string(value)
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        self.to_pump
+            .send(PumpMessage::Raw(line))
+            .map_err(|_| ClientError::Transport("client pump gone".into()))
+    }
+
     /// Issue a command and await its response. Mirrors [`RpcClient::send_command`].
     pub fn send_command(
         &self,

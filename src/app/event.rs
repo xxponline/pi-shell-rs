@@ -23,6 +23,25 @@ pub enum UiEvent {
     SendFailed(String),
     /// `clear_queue` 的返回数据（alt+up 取回排队消息，主线程回填输入框）。
     RestoreQueued(serde_json::Value),
+    /// 一次性线程取回的异步数据（选择器加载/模型与级别应用结果）。
+    AsyncData { kind: AsyncKind, seq: u64, data: serde_json::Value },
+}
+
+/// 异步数据类别（决定主线程如何消费）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsyncKind {
+    /// get_available_models 的模型列表（按 seq 匹配当前选择器）。
+    Models,
+    /// get_available_thinking_levels 的级别列表（按 seq 匹配）。
+    ThinkingLevels,
+    /// set_model 成功，data 为 Model。
+    ModelApplied,
+    /// cycle_model 结果，data 可能为 null（无可用模型）。
+    CycleModel,
+    /// set_thinking_level 成功，data 为新级别字符串。
+    ThinkingApplied,
+    /// cycle_thinking_level 结果，data 为 {level} 或 null。
+    CycleThinking,
 }
 
 /// Spawn the keyboard + RPC reader threads. Returns the receiving end and a

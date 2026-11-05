@@ -30,6 +30,8 @@ pub fn tool_lines(
         "read" => read_body(&args, tool),
         "bash" | "powershell" => bash_body(&args, tool),
         "edit" => edit_body(&args, tool),
+        "write" => write_body(&args, tool),
+        "grep" | "find" | "ls" => text_result_body(tool, name),
         _ => generic_body(&args, tool),
     };
     if expanded {
@@ -62,7 +64,7 @@ fn head_line(name: &str, args: &Value, tool: &ToolExecution) -> Line<'static> {
         Style::default().add_modifier(Modifier::BOLD),
     )];
 
-    if let Some(key) = key_arg(name, args) {
+    if let Some(key) = head_arg(name, args) {
         spans.push(Span::raw(format!(" {key}")));
     }
     spans.push(Span::styled(
@@ -75,24 +77,45 @@ fn head_line(name: &str, args: &Value, tool: &ToolExecution) -> Line<'static> {
     Line::from(spans)
 }
 
-/// 按工具类型提取头行的关键参数。
+/// 按工具类型提取头行的关键参数（含 grep/find 的组合展示）。
 ///
 /// 输入: name — 工具名；args — 已解析参数
 /// 输出: 关键参数摘要（截断 60 字符）；无则 None
-fn key_arg(name: &str, args: &Value) -> Option<String> {
-    let key = match name {
-        "read" | "edit" | "write" => "path",
-        "bash" | "powershell" => "command",
-        "grep" | "find" => "pattern",
-        _ => return None,
-    };
-    // 兼容 pi 的几种字段命名。
-    let raw = args
-        .get(key)
-        .or_else(|| args.get("filePath"))
-        .or_else(|| args.get("file_path"))?
-        .as_str()?;
-    Some(truncate(raw, 60))
+fn head_arg(name: &str, args: &Value) -> Option<String> {
+    match name {
+        "grep" => {
+            let pattern = args.get("pattern").and_then(|p| p.as_str())?;
+            let path = args.get("path").and_then(|p| p.as_str());
+            let head = match path {
+                Some(p) if !p.is_empty() => format!("/{pattern}/ in {p}"),
+                _ => format!("/{pattern}/"),
+            };
+            Some(truncate(&head, 60))
+        }
+        "find" => {
+            let pattern = args.get("pattern").and_then(|p| p.as_str())?;
+            let path = args.get("path").and_then(|p| p.as_str());
+            let head = match path {
+                Some(p) if !p.is_empty() => format!("{pattern} in {p}"),
+                _ => pattern.to_string(),
+            };
+            Some(truncate(&head, 60))
+        }
+        _ => {
+            let key = match name {
+                "read" | "edit" | "write" | "ls" => "path",
+                "bash" | "powershell" => "command",
+                _ => return None,
+            };
+            // 兼容 pi 的几种字段命名。
+            let raw = args
+                .get(key)
+                .or_else(|| args.get("filePath"))
+                .or_else(|| args.get("file_path"))?
+                .as_str()?;
+            Some(truncate(raw, 60))
+        }
+    }
 }
 
 /// 字符安全截断（按 char 数）。
@@ -294,6 +317,45 @@ fn line_diff(old: &str, new: &str) -> Vec<Line<'static>> {
     out
 }
 
+/// write：优先 args.content 预览（写入内容），退回结果文本。
+fn write_body(args: &Value, tool: &ToolExecution) -> Vec<Line<'static>> {
+    if let Some(content) = args.get("content").and_then(|c| c.as_str())
+        && !content.is_empty()
+    {
+        return text_lines(content.trim_end());
+    }
+    result_text(tool)
+        .map(|t| text_lines(&t))
+        .unwrap_or_default()
+}
+
+/// grep/find/ls 共用：结果文本行 + details 截断提示。
+///
+/// 输入: tool — 执行结果；name — 工具名（ls 无 pattern 语义，仅取结果）
+/// 输出: 行序列；结果缺失时为空（由上层降级为头行+args）
+fn text_result_body(tool: &ToolExecution, name: &str) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    if let Some(text) = result_text(tool) {
+        out.extend(text_lines(text.trim_end()));
+    }
+    // grep 等可能带 details.linesTruncated 提示。
+    if let Some(n) = tool
+        .result
+        .as_ref()
+        .and_then(|r| r.get("details"))
+        .and_then(|d| d.get("linesTruncated"))
+        .and_then(|x| x.as_u64())
+        && n > 0
+    {
+        out.push(Line::from(Span::styled(
+            format!("… {n} lines truncated"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let _ = name;
+    out
+}
+
 /// 通用卡片结果体：args 摘要 + 结果正文摘要。
 fn generic_body(args: &Value, tool: &ToolExecution) -> Vec<Line<'static>> {
     let mut out = Vec::new();
@@ -478,5 +540,110 @@ mod tests {
         let text = render(&lines);
         assert!(text.contains("bash"));
         assert!(text.contains("running"));
+    }
+
+    #[test]
+    fn write_card_shows_path_and_content_preview() {
+        // tool_edit fixture 里包含真实的 write 调用
+        let (name, args, tool) = fixture_tool_call("tool_edit", "write");
+        let lines = tool_lines(&name, &args, &tool, true);
+        let text = render(&lines);
+        assert!(text.contains("write"), "{text}");
+        assert!(text.contains("probe-tmp-edit.txt"), "路径: {text}");
+        assert!(text.contains("FIXTURE-MARKER"), "内容预览来自 args.content: {text}");
+
+        // content 缺失 → 退回 result 文本
+        let tool_no_content = ToolExecution {
+            status: ToolStatus::Ended,
+            is_error: false,
+            result: Some(serde_json::json!({"content":[{"type":"text","text":"Successfully wrote to /x"}]})),
+            duration_ms: None,
+        };
+        let lines = tool_lines("write", r#"{"path":"/x"}"#, &tool_no_content, true);
+        assert!(render(&lines).contains("Successfully wrote"));
+    }
+
+    #[test]
+    fn grep_card_shows_pattern_path_output_and_truncation() {
+        let tool = ToolExecution {
+            status: ToolStatus::Ended,
+            is_error: false,
+            result: Some(serde_json::json!({
+                "content":[{"type":"text","text":"src/a.rs:12: fn foo()\nsrc/b.rs:40: fn food()"}],
+                "details":{"linesTruncated": 7}
+            })),
+            duration_ms: Some(9),
+        };
+        let args = r#"{"pattern":"foo","path":"src"}"#;
+        let lines = tool_lines("grep", args, &tool, true);
+        let text = render(&lines);
+        assert!(text.contains("/foo/ in src"), "头行: {text}");
+        assert!(text.contains("src/a.rs:12"), "输出行: {text}");
+        assert!(text.contains("7 lines truncated"), "截断提示: {text}");
+        assert!(text.contains("done") && text.contains("9ms"), "状态/耗时: {text}");
+    }
+
+    #[test]
+    fn find_and_ls_cards_render() {
+        let find_tool = ToolExecution {
+            status: ToolStatus::Ended,
+            is_error: false,
+            result: Some(serde_json::json!({"content":[{"type":"text","text":"./src/main.rs\n./src/lib.rs"}]})),
+            duration_ms: None,
+        };
+        let lines = tool_lines("find", r#"{"pattern":"*.rs","path":"."}"#, &find_tool, true);
+        let text = render(&lines);
+        assert!(text.contains("*.rs in ."), "find 头行: {text}");
+        assert!(text.contains("./src/main.rs"), "find 结果: {text}");
+
+        let ls_tool = ToolExecution {
+            status: ToolStatus::Ended,
+            is_error: false,
+            result: Some(serde_json::json!({"content":[{"type":"text","text":"Cargo.toml\nsrc/\ndocs/"}]})),
+            duration_ms: None,
+        };
+        let lines = tool_lines("ls", r#"{"path":"."}"#, &ls_tool, true);
+        let text = render(&lines);
+        assert!(text.contains("ls"), "{text}");
+        assert!(text.contains("Cargo.toml"), "ls 结果: {text}");
+    }
+
+    #[test]
+    fn new_cards_degrade_when_result_missing() {
+        // 结果缺失 + 未知/缺失字段 → 头行 + 通用降级，不 panic
+        let bare = ToolExecution {
+            status: ToolStatus::Ended,
+            is_error: true,
+            result: None,
+            duration_ms: None,
+        };
+        for (name, args) in [
+            ("grep", "{}"),
+            ("find", "{}"),
+            ("ls", "{}"),
+            ("write", "{}"),
+            ("grep", "not-json"),
+        ] {
+            let lines = tool_lines(name, args, &bare, true);
+            let text = render(&lines);
+            assert!(text.contains(name), "{name}: {text}");
+            assert!(text.contains("error"), "{name}: {text}");
+        }
+    }
+
+    #[test]
+    fn ctrl_o_expands_new_cards() {
+        let tool = ToolExecution {
+            status: ToolStatus::Ended,
+            is_error: false,
+            result: Some(serde_json::json!({"content":[{"type":"text","text":"l1\nl2\nl3\nl4\nl5\nl6"}]})),
+            duration_ms: None,
+        };
+        let collapsed = tool_lines("ls", r#"{"path":"."}"#, &tool, false);
+        let expanded = tool_lines("ls", r#"{"path":"."}"#, &tool, true);
+        assert!(collapsed.len() <= 1 + COLLAPSED_BODY_LINES, "{}", collapsed.len());
+        assert!(expanded.len() > collapsed.len());
+        assert!(!render(&collapsed).contains("l6"));
+        assert!(render(&expanded).contains("l6"));
     }
 }
