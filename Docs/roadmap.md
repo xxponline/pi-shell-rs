@@ -187,12 +187,13 @@ tool start/update/end 归一化。不引入 ratatui。
 
 - 验收：程序跑起来能与 pi 聊天，能看到流式回复并中断。
 
-### 阶段 3：体验对齐
+### 阶段 3：体验对齐 ✅（已完成）
 
 markdown 高亮 / thinking 折叠 / 工具卡片（read/bash/edit）/ 状态行 tokens·cost /
 follow_up 队列 / auto-retry 提示。
 
-- 验收：与原生 pi 并排对比，布局与功能"基本无差别"。
+- 验收：与原生 pi 并排对比，布局与功能"基本无差别"。（已按清单逐项 PTY 验证，
+  详见 change `align-chat-experience`）
 
 ### 阶段 4+：选择器与会话管理 / extension UI 弹窗 / compact / 其余工具卡片
 

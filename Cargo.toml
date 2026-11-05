@@ -6,9 +6,11 @@ default-run = "pi-rust-tui"
 
 [dependencies]
 crossterm = "0.29.0"
+pulldown-cmark = "0.13.6"
 ratatui = "0.30.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+syntect = "5.3.0"
 unicode-width = "0.2.3"
 
 [[bin]]

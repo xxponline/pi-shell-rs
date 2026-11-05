@@ -21,6 +21,8 @@ pub enum UiEvent {
     Closed,
     /// A detached command send reported failure.
     SendFailed(String),
+    /// `clear_queue` 的返回数据（alt+up 取回排队消息，主线程回填输入框）。
+    RestoreQueued(serde_json::Value),
 }
 
 /// Spawn the keyboard + RPC reader threads. Returns the receiving end and a

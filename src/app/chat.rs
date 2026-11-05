@@ -1,16 +1,27 @@
-//! Pure mapping from session state to renderable ratatui text lines.
+//! 会话状态 → 可渲染 ratatui 行的纯映射（markdown/工具卡片/thinking/通知）。
 //!
-//! Stage 2 keeps it deliberately simple: assistant text is shown verbatim,
-//! thinking blocks collapse to a one-line placeholder, and tool calls render
-//! as one status line. Markdown highlighting and tool cards come later.
+//! 渲染偏好通过 [`RenderFlags`] 传入（不进 SessionState——它们是 UI 偏好，
+//! 不是会话事实），保证相同状态 + 相同 flags 产出相同内容，可离线单测。
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use pi_rust_tui::session::{Block, Entry, SessionState, ToolStatus};
+use pi_rust_tui::session::{Block, Entry, SessionState};
 
-/// Build all chat lines: finalized transcript followed by in-flight streaming.
-pub fn chat_lines(state: &SessionState) -> Vec<Line<'static>> {
+/// 渲染偏好标志（App 级 UI 状态，经键位切换）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RenderFlags {
+    /// thinking 块是否展开（默认折叠为单行占位，ctrl+t 切换）。
+    pub show_thinking: bool,
+    /// 工具输出是否展开（默认折叠，ctrl+o 切换）。
+    pub expand_tools: bool,
+}
+
+/// 构建全部聊天行：先历史 transcript，再流式 in-flight 内容。
+///
+/// 输入: state — 会话状态；flags — 渲染偏好（thinking/工具展开）
+/// 输出: 带样式的行序列，供 wrap 层按视口处理
+pub fn chat_lines(state: &SessionState, flags: RenderFlags) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for entry in state.entries() {
         match entry {
@@ -18,92 +29,84 @@ pub fn chat_lines(state: &SessionState) -> Vec<Line<'static>> {
                 lines.push(prefixed("You", text, Color::Cyan, true));
             }
             Entry::Assistant { blocks, .. } => {
-                append_blocks(&mut lines, blocks, true);
+                append_blocks(&mut lines, blocks, flags);
             }
             Entry::Notice { kind, text } => {
-                // error 类通知（如模型 400/订阅失效）标红加粗，其余弱化为斜体灰。
-                let style = if kind == "error" {
-                    Style::default()
-                        .fg(Color::Red)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC)
-                };
-                lines.push(Line::from(vec![Span::styled(
-                    format!("[{kind}] {text}"),
-                    style,
-                )]));
+                lines.push(notice_line(kind, text));
             }
         }
     }
-    // Live, not-yet-finalized streaming content.
+    // 流式中尚未落盘的内容。
     if state.is_in_flight() {
-        append_blocks(&mut lines, state.in_flight(), false);
+        append_blocks(&mut lines, state.in_flight(), flags);
     }
     lines
 }
 
-fn append_lines(out: &mut Vec<Line<'static>>, blocks: &[Block], finalized: bool) {
-    let _ = finalized;
-    append_blocks(out, blocks, finalized);
+/// 按通知类型生成样式行：error 红色加粗、retry 黄色、其余弱化斜体灰。
+///
+/// 输入: kind — 通知类别（"error"/"retry"/其它）；text — 通知正文
+/// 输出: 单行样式化通知
+fn notice_line(kind: &str, text: &str) -> Line<'static> {
+    let style = match kind {
+        "error" => Style::default()
+            .fg(Color::Red)
+            .add_modifier(Modifier::BOLD),
+        "retry" => Style::default().fg(Color::Yellow),
+        _ => Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    };
+    Line::from(vec![Span::styled(format!("[{kind}] {text}"), style)])
 }
 
-fn append_blocks(out: &mut Vec<Line<'static>>, blocks: &[Block], _finalized: bool) {
+/// 把一组内容块追加到输出行（markdown 文本/thinking 两态/工具卡片）。
+///
+/// 输入: out — 结果收集器；blocks — 内容块；flags — 渲染偏好
+/// 输出: 无返回值；副作用为向 out 追加行
+fn append_blocks(out: &mut Vec<Line<'static>>, blocks: &[Block], flags: RenderFlags) {
     for block in blocks {
         match block {
             Block::Text { text } => {
                 if !text.is_empty() {
-                    out.push(assistant_text(text));
+                    // assistant 文本按 markdown 渲染（流式未闭合语法安全降级）。
+                    out.extend(crate::app::markdown::render_markdown(text));
                 }
             }
             Block::Thinking { text } => {
-                if !text.is_empty() {
+                if text.is_empty() {
+                    continue;
+                }
+                if flags.show_thinking {
+                    // 展开态：完整思考文本，弱化斜体灰（逐行保留换行）。
+                    let style = Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC);
+                    for part in text.split('\n') {
+                        out.push(Line::from(Span::styled(part.to_string(), style)));
+                    }
+                } else {
+                    // 折叠态：单行占位（含字符数）。
                     let n = text.chars().count();
                     out.push(Line::from(vec![Span::styled(
                         format!("<thinking {n} chars>"),
-                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
                     )]));
                 }
             }
             Block::ToolCall { name, args_json, tool, .. } => {
-                let status = match tool.status {
-                    ToolStatus::Pending => "pending",
-                    ToolStatus::Running => "running",
-                    ToolStatus::Ended if tool.is_error => "error",
-                    ToolStatus::Ended => "done",
-                };
-                let color = match status {
-                    "error" => Color::Red,
-                    "running" | "pending" => Color::Yellow,
-                    _ => Color::Green,
-                };
-                let preview = tool_preview(name, args_json);
-                out.push(Line::from(vec![
-                    Span::styled("● ", Style::default().fg(color)),
-                    Span::styled(name.to_string(), Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw(format!(" {preview} · {status}")),
-                ]));
+                // 工具调用渲染为结构化卡片（展开态由 flags.expand_tools 控制）。
+                out.extend(crate::app::tools::tool_lines(
+                    name,
+                    args_json,
+                    tool,
+                    flags.expand_tools,
+                ));
             }
         }
     }
-}
-
-fn tool_preview(name: &str, args_json: &str) -> String {
-    // Best-effort short preview from common arguments; avoid pulling a pretty
-    // printer in stage 2.
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(args_json) {
-        for key in ["command", "path", "file_path", "pattern", "query"] {
-            if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
-                let truncated: String = s.chars().take(48).collect();
-                let ellipsis = if s.chars().count() > 48 { "…" } else { "" };
-                let _ = name;
-                return format!("{truncated}{ellipsis}");
-            }
-        }
-    }
-    String::new()
 }
 
 fn prefixed(label: &str, text: &str, color: Color, bold_label: bool) -> Line<'static> {
@@ -117,17 +120,6 @@ fn prefixed(label: &str, text: &str, color: Color, bold_label: bool) -> Line<'st
     ])
 }
 
-fn assistant_text(text: &str) -> Line<'static> {
-    // Embedded newlines are preserved in the span; Paragraph wrap handles
-    // width while explicit newlines still force line breaks.
-    Line::from(Span::raw(text.to_string()))
-}
-
-// Allow the helper to be used even if future callers need the wrapper name.
-#[allow(dead_code)]
-fn _unused(_: &mut Vec<Line<'static>>, blocks: &[Block]) {
-    append_lines(&mut Vec::new(), blocks, true);
-}
 
 #[cfg(test)]
 mod tests {
@@ -141,7 +133,7 @@ mod tests {
         s.handle(&json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}));
         s.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
         s.handle(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"hi there"}]}}));
-        let lines = chat_lines(&s);
+        let lines = chat_lines(&s, RenderFlags::default());
         let joined = render_to_string(&lines);
         assert!(joined.contains("You: hello"));
         assert!(joined.contains("hi there"));
@@ -155,7 +147,7 @@ mod tests {
         s.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","contentIndex":0,"delta":"abcdefgh"}}));
         s.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"text_start","contentIndex":1}}));
         s.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"answer"}}));
-        let lines = chat_lines(&s);
+        let lines = chat_lines(&s, RenderFlags::default());
         let joined = render_to_string(&lines);
         assert!(joined.contains("<thinking 8 chars>"), "{joined}");
         assert!(joined.contains("answer"));
@@ -168,7 +160,7 @@ mod tests {
         s.handle(&serde_json::json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
         let huge = "y".repeat(200_000);
         s.handle(&serde_json::json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":huge}]}}));
-        let lines = chat_lines(&s);
+        let lines = chat_lines(&s, RenderFlags::default());
         assert!(!lines.is_empty()); // no panic, content rendered
     }
 
@@ -192,7 +184,7 @@ mod tests {
             "role":"assistant","content":[],"stopReason":"error",
             "errorMessage":"400: subscription expired"
         }}));
-        let lines = chat_lines(&st);
+        let lines = chat_lines(&st, RenderFlags::default());
         let err_line = lines.iter().find(|l| {
             l.spans.iter().any(|s| s.content.as_ref().contains("[error]"))
         }).expect("error notice line");
@@ -209,7 +201,7 @@ mod tests {
             kind: "info".to_string(),
             text: "something".to_string(),
         });
-        let lines = chat_lines(&st);
+        let lines = chat_lines(&st, RenderFlags::default());
         let info = lines
             .iter()
             .find(|l| l.spans.iter().any(|s| s.content.as_ref().contains("[info]")))
@@ -221,5 +213,98 @@ mod tests {
             .unwrap();
         assert_eq!(span.style.fg, Some(Color::DarkGray));
         assert_ne!(span.style.fg, Some(Color::Red));
+    }
+
+    fn thinking_state() -> SessionState {
+        let mut s = SessionState::new();
+        s.handle(&serde_json::json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+        s.handle(&serde_json::json!({"type":"message_update","assistantMessageEvent":{"type":"thinking_start","contentIndex":0}}));
+        s.handle(&serde_json::json!({"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","contentIndex":0,"delta":"secret thoughts here"}}));
+        s.handle(&serde_json::json!({"type":"message_update","assistantMessageEvent":{"type":"text_start","contentIndex":1}}));
+        s.handle(&serde_json::json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"answer"}}));
+        s
+    }
+
+    #[test]
+    fn thinking_collapsed_by_default() {
+        let s = thinking_state();
+        let lines = chat_lines(&s, RenderFlags::default());
+        let text = render_to_string(&lines);
+        assert!(text.contains("<thinking 20 chars>"), "{text}");
+        assert!(!text.contains("secret thoughts"), "折叠态不得展开全文: {text}");
+    }
+
+    #[test]
+    fn thinking_expanded_shows_full_text() {
+        let s = thinking_state();
+        let flags = RenderFlags { show_thinking: true, expand_tools: false };
+        let lines = chat_lines(&s, flags);
+        let text = render_to_string(&lines);
+        assert!(text.contains("secret thoughts here"), "{text}");
+        assert!(!text.contains("<thinking"), "展开态不应再有占位符: {text}");
+        // 展开样式为弱化斜体灰
+        let thinking_span = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|sp| sp.content.as_ref().contains("secret thoughts"))
+            .expect("thinking span");
+        assert_eq!(thinking_span.style.fg, Some(Color::DarkGray));
+        assert!(thinking_span.style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn thinking_toggle_roundtrip_restores_placeholder() {
+        let s = thinking_state();
+        let on = RenderFlags { show_thinking: true, expand_tools: false };
+        let off = RenderFlags::default();
+        let expanded = render_to_string(&chat_lines(&s, on));
+        let collapsed = render_to_string(&chat_lines(&s, off));
+        assert!(expanded.contains("secret thoughts"));
+        assert!(collapsed.contains("<thinking"));
+    }
+
+    #[test]
+    fn expand_tools_flag_propagates_to_tool_cards() {
+        use pi_rust_tui::session::{Block, ToolExecution, ToolStatus};
+        let mut s = SessionState::new();
+        s.handle(&serde_json::json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+        // 构造一个多行结果的工具块
+        let result = serde_json::json!({"content":[{"type":"text","text":"l1\nl2\nl3\nl4\nl5\nl6"}]});
+        s.transcript.push(pi_rust_tui::session::Entry::Assistant {
+            turn: 1,
+            blocks: vec![Block::ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                args_json: r#"{"path":"/a/b.txt"}"#.into(),
+                tool: ToolExecution {
+                    status: ToolStatus::Ended,
+                    is_error: false,
+                    result: Some(result),
+                    duration_ms: Some(3),
+                },
+            }],
+            usage: None,
+        });
+        let collapsed = render_to_string(&chat_lines(&s, RenderFlags::default()));
+        let expanded = render_to_string(&chat_lines(
+            &s,
+            RenderFlags { show_thinking: false, expand_tools: true },
+        ));
+        assert!(collapsed.contains("l1"), "{collapsed}");
+        assert!(!collapsed.contains("l6"), "折叠态不应到 l6: {collapsed}");
+        assert!(expanded.contains("l6"), "展开态应含 l6: {expanded}");
+    }
+
+    #[test]
+    fn retry_notice_is_yellow_and_error_stays_red() {
+        let retry = notice_line("retry", "重试 1/3: boom");
+        let err = notice_line("error", "400 bad");
+        let info = notice_line("info", "note");
+        let fg = |l: &Line| l.spans[0].style.fg;
+        assert_eq!(fg(&retry), Some(Color::Yellow), "retry 应为黄色");
+        assert_eq!(fg(&err), Some(Color::Red), "error 保持红色");
+        assert_eq!(fg(&info), Some(Color::DarkGray));
+        let retry_text: String = retry.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(retry_text.contains("[retry] 重试 1/3: boom"));
     }
 }

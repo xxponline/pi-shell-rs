@@ -14,23 +14,46 @@ pub enum Phase {
 
 /// Token usage/cost snapshot carried on message_update / message_end.
 #[derive(Debug, Clone, Default, PartialEq)]
+/// 一次请求的 token 用量与费用快照（来自 wire 的 usage 对象）。
 pub struct Usage {
     pub input: u64,
     pub output: u64,
     pub cache_read: u64,
     pub cache_write: u64,
     pub total_tokens: u64,
+    /// 各项费用（美元），来自 `cost.*`；缺失时为 0。
+    pub cost_input: f64,
+    pub cost_output: f64,
+    pub cost_cache_read: f64,
+    pub cost_cache_write: f64,
+    /// 总费用（美元），来自 `cost.total`；缺失时为 0。
+    pub cost_total: f64,
 }
 
 impl Usage {
+    /// 从 wire 的 usage JSON 解析用量与费用。
+    ///
+    /// 输入: v — usage 对象（可能缺 cost.*）；非对象返回 None
+    /// 输出: Some(Usage)，token 计数缺失为 0，费用缺失为 0（不报错）
     pub fn from_json(v: &Value) -> Option<Self> {
         let obj = v.as_object()?;
+        let cost = obj.get("cost");
+        let cost_f64 = |key: &str| -> f64 {
+            cost.and_then(|c| c.get(key))
+                .and_then(|x| x.as_f64())
+                .unwrap_or(0.0)
+        };
         Some(Usage {
             input: obj.get("input").and_then(|x| x.as_u64()).unwrap_or(0),
             output: obj.get("output").and_then(|x| x.as_u64()).unwrap_or(0),
             cache_read: obj.get("cacheRead").and_then(|x| x.as_u64()).unwrap_or(0),
             cache_write: obj.get("cacheWrite").and_then(|x| x.as_u64()).unwrap_or(0),
             total_tokens: obj.get("totalTokens").and_then(|x| x.as_u64()).unwrap_or(0),
+            cost_input: cost_f64("input"),
+            cost_output: cost_f64("output"),
+            cost_cache_read: cost_f64("cacheRead"),
+            cost_cache_write: cost_f64("cacheWrite"),
+            cost_total: cost_f64("total"),
         })
     }
 }
@@ -58,12 +81,14 @@ impl Entry {
     }
 }
 
-/// The authoritative, headless session state reduced from the RPC event stream.
+/// 会话权威状态：由 RPC 事件流归约得到，与终端无关。
 #[derive(Debug, Clone, Default)]
 pub struct SessionState {
     pub phase: Phase,
     pub thinking_level: Option<String>,
     pub session_name: Option<String>,
+    /// 当前模型标识（来自 get_state 响应的 model.name/id）。
+    pub model: Option<String>,
     pub steering_queue: Vec<String>,
     pub follow_up_queue: Vec<String>,
     pub usage: Option<Usage>,
@@ -80,8 +105,37 @@ pub struct SessionState {
 }
 
 impl SessionState {
+    /// 创建空闲态会话状态。
+    ///
+    /// 输入: 无
+    /// 输出: 全字段默认值的 SessionState
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 把 `get_state` 响应（RpcSessionState）应用到状态。
+    ///
+    /// 输入: v — get_state 的 data 对象（model/thinkingLevel/sessionName 等）
+    /// 输出: 无返回值；设置 model/thinking_level/session_name，
+    ///       字段缺失时保留既有值
+    pub fn apply_get_state(&mut self, v: &Value) {
+        if let Some(model) = v.get("model") {
+            // Model 形状: { id, name, ... }；优先 name，退回 id。
+            let name = model
+                .get("name")
+                .or_else(|| model.get("id"))
+                .and_then(|x| x.as_str())
+                .map(String::from);
+            if name.is_some() {
+                self.model = name;
+            }
+        }
+        if let Some(level) = v.get("thinkingLevel").and_then(|x| x.as_str()) {
+            self.thinking_level = Some(level.to_string());
+        }
+        if let Some(name) = v.get("sessionName").and_then(|x| x.as_str()) {
+            self.session_name = Some(name.to_string());
+        }
     }
 
     /// Ordered transcript entries.
@@ -159,9 +213,38 @@ impl SessionState {
                     .and_then(|v| v.as_str())
                     .map(String::from);
             }
+            // 自动重试：归约为对话流通知（不影响 phase/消息归约）。
+            "auto_retry_start" => {
+                let attempt = event.get("attempt").and_then(|x| x.as_u64()).unwrap_or(0);
+                let max = event.get("maxAttempts").and_then(|x| x.as_u64()).unwrap_or(0);
+                let err = event
+                    .get("errorMessage")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("?");
+                self.transcript.push(Entry::Notice {
+                    kind: "retry".to_string(),
+                    text: format!("重试 {attempt}/{max}: {}", summarize(err)),
+                });
+            }
+            "auto_retry_end" => {
+                let success = event.get("success").and_then(|x| x.as_bool()).unwrap_or(false);
+                let text = if success {
+                    "重试成功".to_string()
+                } else {
+                    let final_err = event
+                        .get("finalError")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("未知错误");
+                    format!("重试失败: {}", summarize(final_err))
+                };
+                self.transcript.push(Entry::Notice {
+                    kind: "retry".to_string(),
+                    text,
+                });
+            }
             // Captured but not modeled in depth this phase:
-            "compaction_start" | "compaction_end" | "auto_retry_start"
-            | "auto_retry_end" | "summarization_retry_scheduled"
+            "compaction_start" | "compaction_end"
+            | "summarization_retry_scheduled"
             | "summarization_retry_attempt_start" | "summarization_retry_finished"
             | "entry_appended" | "bash_execution_update" | "agent_end" => {}
             _ => {}
@@ -594,9 +677,14 @@ impl SessionState {
             status: crate::session::blocks::ToolStatus::Ended,
             is_error: tr.get("isError").and_then(|b| b.as_bool()).unwrap_or(false),
             result: Some({
-                // Keep a compact object mirroring the wire result.
+                // 透传卡片需要的字段：content（必须）+ structuredContent/details（可选）。
                 let mut obj = serde_json::Map::new();
                 obj.insert("content".into(), tr.get("content").cloned().unwrap_or(Value::Null));
+                for key in ["structuredContent", "details"] {
+                    if let Some(v) = tr.get(key) {
+                        obj.insert(key.to_string(), v.clone());
+                    }
+                }
                 Value::Object(obj)
             }),
             duration_ms: tr.get("durationMs").and_then(|d| d.as_u64()),
@@ -659,12 +747,50 @@ fn merge_tool(
             base.status.clone()
         },
         is_error: new.is_error || base.is_error,
-        result: new.result.or_else(|| base.result.clone()),
+        result: merge_result(base.result.as_ref(), new.result.as_ref()),
         duration_ms: new.duration_ms.or(base.duration_ms),
     }
 }
 
-/// Extract display text from a user message (string or text content blocks).
+/// 合并两次来源的工具结果：都是对象时按键合并（new 覆盖 base 的同名键，
+/// 保留 base 独有键如 structuredContent/details），否则取 new 再退回 base。
+///
+/// 输入: base — 较早的结果（如 tool_execution_end 的完整 result）；
+///       new — 较晚的结果（如 turn_end toolResults 的 content-only 对象）
+/// 输出: 合并后的结果对象；两者皆 None 则 None
+fn merge_result(base: Option<&Value>, new: Option<&Value>) -> Option<Value> {
+    match (base, new) {
+        (Some(Value::Object(b)), Some(Value::Object(n))) => {
+            let mut merged = b.clone();
+            for (k, v) in n {
+                merged.insert(k.clone(), v.clone());
+            }
+            Some(Value::Object(merged))
+        }
+        (_, Some(n)) => Some(n.clone()),
+        (Some(b), None) => Some(b.clone()),
+        (None, None) => None,
+    }
+}
+
+/// 把错误文本压缩为单行摘要（取首行、限长），用于通知行。
+///
+/// 输入: text — 原始错误文本（可能多行/很长）
+/// 输出: 单行摘要，超 80 字符截断加 …
+fn summarize(text: &str) -> String {
+    let first_line = text.lines().next().unwrap_or(text).trim();
+    if first_line.chars().count() <= 80 {
+        first_line.to_string()
+    } else {
+        let taken: String = first_line.chars().take(79).collect();
+        format!("{taken}…")
+    }
+}
+
+/// 从用户消息提取可显示文本（字符串或 text/image 内容块）。
+///
+/// 输入: message — 用户消息对象
+/// 输出: Some(拼接文本)；image 记为 [image]；无可提取内容返回 None
 fn extract_user_text(message: &Value) -> Option<String> {
     if let Some(s) = message.get("content").and_then(|c| c.as_str()) {
         return Some(s.to_string());
@@ -884,5 +1010,94 @@ mod tests {
         s.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
         s.handle(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}));
         assert!(!s.entries().iter().any(|e| matches!(e, Entry::Notice { .. })));
+    }
+
+    #[test]
+    fn usage_parses_cost_and_tokens() {
+        let v = json!({"input":10,"output":5,"cacheRead":3,"cacheWrite":1,
+            "totalTokens":15,
+            "cost":{"input":0.001,"output":0.002,"cacheRead":0.0003,"cacheWrite":0.0001,"total":0.012}});
+        let u = Usage::from_json(&v).expect("parse");
+        assert_eq!((u.input, u.output, u.total_tokens), (10, 5, 15));
+        assert_eq!(u.cost_total, 0.012);
+        assert_eq!(u.cost_input, 0.001);
+    }
+
+    #[test]
+    fn usage_missing_cost_defaults_to_zero() {
+        let v = json!({"input":1,"output":2,"cacheRead":0,"cacheWrite":0,"totalTokens":3});
+        let u = Usage::from_json(&v).expect("parse");
+        assert_eq!(u.total_tokens, 3);
+        assert_eq!(u.cost_total, 0.0);
+        assert_eq!(u.cost_input, 0.0);
+        // 非对象返回 None
+        assert!(Usage::from_json(&json!([1,2])).is_none());
+    }
+
+    #[test]
+    fn auto_retry_events_become_retry_notices() {
+        let mut s = SessionState::new();
+        // 先有正常消息，确保 phase/条目不受影响
+        s.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+        s.handle(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}));
+        let msgs_before = s.entries().iter().filter(|e| matches!(e, Entry::Assistant { .. })).count();
+
+        s.handle(&json!({"type":"auto_retry_start","attempt":1,"maxAttempts":3,"delayMs":500,"errorMessage":"500 boom\nsecond line"}));
+        s.handle(&json!({"type":"auto_retry_end","success":true,"attempt":1}));
+
+        let retries: Vec<&str> = s.entries().iter().filter_map(|e| match e {
+            Entry::Notice { kind, text } if kind == "retry" => Some(text.as_str()),
+            _ => None,
+        }).collect();
+        assert_eq!(retries.len(), 2, "{:?}", s.entries());
+        assert!(retries[0].contains("重试 1/3"), "{}", retries[0]);
+        assert!(retries[0].contains("500 boom"), "{}", retries[0]);
+        assert!(!retries[0].contains("second line"), "摘要应只取首行: {}", retries[0]);
+        assert_eq!(retries[1], "重试成功");
+
+        // phase 与消息条目不受影响
+        let msgs_after = s.entries().iter().filter(|e| matches!(e, Entry::Assistant { .. })).count();
+        assert_eq!(msgs_before, msgs_after);
+    }
+
+    #[test]
+    fn auto_retry_end_failure_reports_final_error() {
+        let mut s = SessionState::new();
+        s.handle(&json!({"type":"auto_retry_end","success":false,"attempt":3,"finalError":"still broken"}));
+        let text = s.entries().iter().find_map(|e| match e {
+            Entry::Notice { kind, text } if kind == "retry" => Some(text.as_str()),
+            _ => None,
+        }).expect("retry notice");
+        assert!(text.contains("重试失败"), "{}", text);
+        assert!(text.contains("still broken"), "{}", text);
+    }
+
+    #[test]
+    fn apply_get_state_sets_fields() {
+        let mut s = SessionState::new();
+        s.apply_get_state(&json!({
+            "model": {"id":"mimo-v2.6-pro","name":"MiMo v2.6 Pro"},
+            "thinkingLevel": "high",
+            "sessionName": "my session",
+            "sessionId": "abc"
+        }));
+        assert_eq!(s.model.as_deref(), Some("MiMo v2.6 Pro"));
+        assert_eq!(s.thinking_level.as_deref(), Some("high"));
+        assert_eq!(s.session_name.as_deref(), Some("my session"));
+    }
+
+    #[test]
+    fn apply_get_state_missing_fields_keep_old_values() {
+        let mut s = SessionState::new();
+        s.apply_get_state(&json!({"model": {"id":"x","name":"X"}, "sessionName": "keep me"}));
+        // 缺 thinkingLevel → 保留 None
+        assert_eq!(s.thinking_level, None);
+        s.apply_get_state(&json!({"thinkingLevel": "low"}));
+        // 缺 sessionName → 保留旧值
+        assert_eq!(s.session_name.as_deref(), Some("keep me"));
+        assert_eq!(s.thinking_level.as_deref(), Some("low"));
+        // model 只有 id 无 name → 退回 id
+        s.apply_get_state(&json!({"model": {"id":"only-id"}}));
+        assert_eq!(s.model.as_deref(), Some("only-id"));
     }
 }

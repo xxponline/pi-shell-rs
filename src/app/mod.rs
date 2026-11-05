@@ -6,7 +6,9 @@
 
 mod chat;
 mod event;
+mod markdown;
 mod terminal;
+mod tools;
 mod view;
 mod wrap;
 
@@ -22,6 +24,29 @@ use pi_rust_tui::session::{Phase, SessionState};
 use crate::app::event::UiEvent;
 use crate::app::terminal::TerminalGuard;
 
+/// 按键意图（`key_intent` 的纯映射产物，便于单测）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyIntent {
+    /// 退出程序（ctrl+c / 空闲 esc/q）
+    Quit,
+    /// 切换 thinking 展开（ctrl+t）
+    ToggleThinking,
+    /// 切换工具输出展开（ctrl+o）
+    ToggleTools,
+    /// 发送 prompt（Enter）
+    Submit,
+    /// 发送 follow_up（alt+enter，流式中排队）
+    SendFollowUp,
+    /// 取回全部排队消息（alt+up → clear_queue）
+    Dequeue,
+    /// 中止生成（流式 esc）
+    Abort,
+    /// 普通编辑（可打印字符 / 退格）
+    Edit,
+    /// 忽略
+    Ignore,
+}
+
 /// 应用顶层状态（输入缓冲、会话状态、瞬时提示、退出标志）。
 pub struct App {
     state: SessionState,
@@ -29,6 +54,10 @@ pub struct App {
     /// 最近的瞬时提示（parse 错误、发送失败等）。
     notice: Option<String>,
     should_quit: bool,
+    /// thinking 是否展开（ctrl+t 切换，默认折叠）。
+    show_thinking: bool,
+    /// 工具输出是否展开（ctrl+o 切换，默认折叠）。
+    expand_tools: bool,
     /// 诊断日志句柄；环境变量 `PI_RUST_TUI_LOG=<path>` 开启时逐条记录
     /// 收到的 UiEvent，用于排查“回复不显示”类问题；None 表示未开启。
     debug_log: Option<std::fs::File>,
@@ -48,6 +77,8 @@ impl App {
             input: String::new(),
             notice: None,
             should_quit: false,
+            show_thinking: false,
+            expand_tools: false,
             debug_log,
         }
     }
@@ -83,16 +114,18 @@ impl App {
             ),
         };
 
-        if let Err(e) = client.send_command(
+        match client.send_command(
             serde_json::json!({"type": "get_state"}),
             Duration::from_secs(15),
             ResponsePolicy::RequireSuccess,
         ) {
-            Self::fail_early(
+            // 探活成功：把 model/sessionName/thinkingLevel 应用到状态（状态行显示）。
+            Ok(data) => self.state.apply_get_state(&data),
+            Err(e) => Self::fail_early(
                 &mut guard,
                 &format!("pi 探活失败 (get_state): {e}"),
                 "请先用原生 pi 完成登录后再启动本 TUI。",
-            );
+            ),
         }
 
         let (ui_rx, report_tx) = event::spawn_event_sources(&mut client);
@@ -142,6 +175,11 @@ impl App {
                     self.notice = Some(err);
                     self.draw(terminal)?;
                 }
+                Ok(UiEvent::RestoreQueued(data)) => {
+                    self.log_event("dequeue", &data.to_string());
+                    self.restore_queued(&data);
+                    self.draw(terminal)?;
+                }
                 // Idle timeout: no state changed, so no repaint.
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => self.should_quit = true,
@@ -150,39 +188,92 @@ impl App {
         Ok(())
     }
 
+    /// 处理一个按键：先做纯意图映射，再应用状态，最后按需走命令通道。
+    ///
+    /// 输入: key — 原始按键；commander/report_tx — 发送 prompt/abort 所需
+    /// 输出: 无返回值；副作用为更新输入/标志/退出或异步发命令
     fn handle_key(
         &mut self,
         key: KeyEvent,
         commander: &CommandSender,
         report_tx: &Sender<UiEvent>,
     ) {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.should_quit = true;
-            return;
-        }
-
-        match key.code {
-            KeyCode::Esc => {
-                if self.state.phase == Phase::Streaming {
-                    self.send_command(
-                        commander,
-                        report_tx,
-                        serde_json::json!({"type": "abort"}),
-                        false,
-                    );
-                } else {
-                    self.should_quit = true;
-                }
-            }
-            KeyCode::Char('q') if self.state.phase != Phase::Streaming => {
-                self.should_quit = true;
-            }
-            KeyCode::Enter => self.submit(commander, report_tx),
-            KeyCode::Backspace => {
-                pop_last_char(&mut self.input);
-            }
-            KeyCode::Char(c) => self.input.push(c),
+        let intent = Self::key_intent(key, self.state.phase == Phase::Streaming);
+        match self.apply_intent(key, intent) {
+            Some(KeyIntent::Submit) => self.submit_as(commander, report_tx, "prompt"),
+            Some(KeyIntent::SendFollowUp) => self.submit_as(commander, report_tx, "follow_up"),
+            Some(KeyIntent::Abort) => self.send_command(
+                commander,
+                report_tx,
+                serde_json::json!({"type": "abort"}),
+                false,
+            ),
+            Some(KeyIntent::Dequeue) => self.request_dequeue(commander, report_tx),
             _ => {}
+        }
+    }
+
+    /// 纯按键 → 意图映射（不触碰状态，便于单测）。
+    ///
+    /// 输入: key — 原始按键；streaming — 当前是否在流式生成中
+    /// 输出: KeyIntent（Quit/Toggle*/Submit/Abort/Edit/Ignore）
+    fn key_intent(key: KeyEvent, streaming: bool) -> KeyIntent {
+        use KeyCode::*;
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == Char('c') {
+            return KeyIntent::Quit;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            Esc if streaming => KeyIntent::Abort,
+            Esc => KeyIntent::Quit,
+            Char('q') if !streaming => KeyIntent::Quit,
+            Char('t') if ctrl => KeyIntent::ToggleThinking,
+            Char('o') if ctrl => KeyIntent::ToggleTools,
+            Enter if alt => KeyIntent::SendFollowUp,
+            Enter => KeyIntent::Submit,
+            Up if alt => KeyIntent::Dequeue,
+            Backspace | Char(_) => KeyIntent::Edit,
+            _ => KeyIntent::Ignore,
+        }
+    }
+
+    /// 应用纯状态意图；需要命令通道的意图（Submit/Abort）原样返回。
+    ///
+    /// 输入: key — 原始按键（Edit 分支需要）；intent — key_intent 产物
+    /// 输出: Some(intent) 表示需调用方走命令通道；否则 None
+    fn apply_intent(&mut self, key: KeyEvent, intent: KeyIntent) -> Option<KeyIntent> {
+        match intent {
+            KeyIntent::Quit => {
+                self.should_quit = true;
+                None
+            }
+            KeyIntent::ToggleThinking => {
+                self.show_thinking = !self.show_thinking;
+                self.log_event(
+                    "key",
+                    &format!("thinking toggled -> {}", self.show_thinking),
+                );
+                None
+            }
+            KeyIntent::ToggleTools => {
+                self.expand_tools = !self.expand_tools;
+                self.log_event("key", &format!("tools toggled -> {}", self.expand_tools));
+                None
+            }
+            KeyIntent::Edit => {
+                match key.code {
+                    KeyCode::Char(c) => self.input.push(c),
+                    KeyCode::Backspace => pop_last_char(&mut self.input),
+                    _ => {}
+                }
+                None
+            }
+            KeyIntent::Ignore => None,
+            KeyIntent::Submit
+            | KeyIntent::Abort
+            | KeyIntent::SendFollowUp
+            | KeyIntent::Dequeue => Some(intent),
         }
     }
 
@@ -198,20 +289,80 @@ impl App {
     ///
     /// 输入: commander — RPC 命令句柄；report_tx — 失败回报通道
     /// 输出: 无返回值；副作用为清空输入、记录日志、异步发送 prompt
-    fn submit(&mut self, commander: &CommandSender, report_tx: &Sender<UiEvent>) {
+    /// 把当前输入作为指定命令（prompt/follow_up）发出；空输入忽略。
+    ///
+    /// 输入: commander — RPC 命令句柄；report_tx — 失败回报通道；
+    ///       command — "prompt" 或 "follow_up"
+    /// 输出: 无返回值；副作用为清空输入、记日志、异步发送
+    fn submit_as(&mut self, commander: &CommandSender, report_tx: &Sender<UiEvent>, command: &str) {
         if !self.can_submit() {
-            self.log_event("submit", "skipped: empty input");
+            self.log_event("submit", &format!("skipped: empty input ({command})"));
             return;
         }
         let message = self.input.trim().to_string();
         self.input.clear();
-        self.log_event("submit", &format!("prompt sent: {message}"));
+        self.log_event("submit", &format!("{command} sent: {message}"));
         self.send_command(
             commander,
             report_tx,
-            serde_json::json!({"type": "prompt", "message": message}),
+            serde_json::json!({ "type": command, "message": message }),
             true,
         );
+    }
+
+    /// 把 clear_queue 返回的排队消息回填输入框（非空则换行追加，避免丢字）。
+    ///
+    /// 输入: data — clear_queue 响应 {steering:[..], followUp:[..]}
+    /// 输出: 无返回值；副作用为更新 input
+    fn restore_queued(&mut self, data: &serde_json::Value) {
+        let mut restored: Vec<String> = Vec::new();
+        for key in ["steering", "followUp"] {
+            if let Some(arr) = data.get(key).and_then(|v| v.as_array()) {
+                for item in arr {
+                    if let Some(text) = item.as_str() {
+                        restored.push(text.to_string());
+                    }
+                }
+            }
+        }
+        if restored.is_empty() {
+            return;
+        }
+        let joined = restored.join("\n");
+        if self.input.is_empty() {
+            self.input = joined;
+        } else {
+            self.input.push('\n');
+            self.input.push_str(&joined);
+        }
+    }
+
+    /// alt+up：发送 clear_queue，返回的排队消息经 RestoreQueued 事件回填输入框。
+    ///
+    /// 输入: commander — RPC 命令句柄；report_tx — 结果/失败回报通道
+    /// 输出: 无返回值；副作用为异步发 clear_queue（队列空时仅记日志跳过）
+    fn request_dequeue(&mut self, commander: &CommandSender, report_tx: &Sender<UiEvent>) {
+        if self.state.steering_queue.is_empty() && self.state.follow_up_queue.is_empty() {
+            self.log_event("dequeue", "skipped: queue empty");
+            return;
+        }
+        self.log_event("dequeue", "clear_queue requested");
+        let report = report_tx.clone();
+        let cmd = commander.clone();
+        thread::spawn(move || {
+            match cmd.send_command(
+                serde_json::json!({"type": "clear_queue"}),
+                Duration::from_secs(10),
+                ResponsePolicy::RequireSuccess,
+            ) {
+                Ok(data) => {
+                    let _ = report.send(UiEvent::RestoreQueued(data));
+                }
+                Err(e) => {
+                    let _ = report.send(UiEvent::SendFailed(e.to_string()));
+                }
+            }
+        });
     }
 
     /// Fire a command on a detached thread so waiting never blocks rendering.
@@ -237,8 +388,12 @@ impl App {
     }
 
     fn draw(&self, terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
+        let flags = crate::app::chat::RenderFlags {
+            show_thinking: self.show_thinking,
+            expand_tools: self.expand_tools,
+        };
         terminal.draw(|frame| {
-            view::render(frame, &self.state, &self.input, self.notice.as_deref());
+            view::render(frame, &self.state, &self.input, self.notice.as_deref(), flags);
         })?;
         Ok(())
     }
@@ -282,5 +437,109 @@ mod input_tests {
         assert!(!app.can_submit());
         app.input = "hello".to_string();
         assert!(app.can_submit());
+    }
+
+    #[test]
+    fn ctrl_t_toggles_thinking_and_ctrl_o_toggles_tools() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new();
+        assert!(!app.show_thinking);
+        assert!(!app.expand_tools);
+
+        // 无 CONTROL 的 t → 意图为 Edit → 进输入框，不影响折叠态
+        let plain = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE);
+        let intent = App::key_intent(plain, false);
+        assert_eq!(intent, KeyIntent::Edit);
+        assert_eq!(app.apply_intent(plain, intent), None);
+        assert!(!app.show_thinking);
+        assert_eq!(app.input, "t");
+        app.input.clear();
+
+        // ctrl+t → ToggleThinking → 取反，不进输入框
+        let ctrl_t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(App::key_intent(ctrl_t, false), KeyIntent::ToggleThinking);
+        app.apply_intent(ctrl_t, KeyIntent::ToggleThinking);
+        assert!(app.show_thinking);
+        app.apply_intent(ctrl_t, KeyIntent::ToggleThinking);
+        assert!(!app.show_thinking);
+
+        // ctrl+o → ToggleTools
+        let ctrl_o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert_eq!(App::key_intent(ctrl_o, false), KeyIntent::ToggleTools);
+        app.apply_intent(ctrl_o, KeyIntent::ToggleTools);
+        assert!(app.expand_tools);
+    }
+
+    #[test]
+    fn key_intent_mapping_matches_spec() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let k = |code, mods| KeyEvent::new(code, mods);
+        // ctrl+c 随时退出
+        assert_eq!(App::key_intent(k(KeyCode::Char('c'), KeyModifiers::CONTROL), true), KeyIntent::Quit);
+        // esc: 流式=中止, 空闲=退出
+        assert_eq!(App::key_intent(k(KeyCode::Esc, KeyModifiers::NONE), true), KeyIntent::Abort);
+        assert_eq!(App::key_intent(k(KeyCode::Esc, KeyModifiers::NONE), false), KeyIntent::Quit);
+        // 空闲 q=退出, 流式 q=编辑
+        assert_eq!(App::key_intent(k(KeyCode::Char('q'), KeyModifiers::NONE), false), KeyIntent::Quit);
+        assert_eq!(App::key_intent(k(KeyCode::Char('q'), KeyModifiers::NONE), true), KeyIntent::Edit);
+        // Enter=提交, 退格/字符=编辑, 其它=忽略
+        assert_eq!(App::key_intent(k(KeyCode::Enter, KeyModifiers::NONE), true), KeyIntent::Submit);
+        assert_eq!(App::key_intent(k(KeyCode::Backspace, KeyModifiers::NONE), false), KeyIntent::Edit);
+        assert_eq!(App::key_intent(k(KeyCode::F(5), KeyModifiers::NONE), false), KeyIntent::Ignore);
+    }
+
+    #[test]
+    fn alt_keys_map_to_follow_up_and_dequeue() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let k = |code, mods| KeyEvent::new(code, mods);
+        // alt+enter → SendFollowUp；普通 enter → Submit（行为不变）
+        assert_eq!(
+            App::key_intent(k(KeyCode::Enter, KeyModifiers::ALT), true),
+            KeyIntent::SendFollowUp
+        );
+        assert_eq!(
+            App::key_intent(k(KeyCode::Enter, KeyModifiers::NONE), true),
+            KeyIntent::Submit
+        );
+        // alt+up → Dequeue；普通 up → Ignore（行为不变）
+        assert_eq!(
+            App::key_intent(k(KeyCode::Up, KeyModifiers::ALT), true),
+            KeyIntent::Dequeue
+        );
+        assert_eq!(
+            App::key_intent(k(KeyCode::Up, KeyModifiers::NONE), false),
+            KeyIntent::Ignore
+        );
+    }
+
+    #[test]
+    fn dequeue_on_empty_queue_is_noop() {
+        let mut app = App::new();
+        // 空队列：不产生任何状态变化（发送层在 request_dequeue 内拦截）
+        assert!(app.state.steering_queue.is_empty());
+        assert!(app.state.follow_up_queue.is_empty());
+        // restore_queued 对空数据/空列表无副作用
+        app.restore_queued(&serde_json::json!({"steering": [], "followUp": []}));
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn restore_queued_appends_to_existing_input() {
+        let mut app = App::new();
+        app.input = "existing".into();
+        app.restore_queued(&serde_json::json!({
+            "steering": ["s1"],
+            "followUp": ["f1", "f2"]
+        }));
+        assert_eq!(app.input, "existing\ns1\nf1\nf2");
+    }
+
+    #[test]
+    fn follow_up_and_prompt_submit_clear_input() {
+        let mut app = App::new();
+        app.input = "  hello  ".into();
+        assert!(app.can_submit());
+        app.input = "   ".into();
+        assert!(!app.can_submit());
     }
 }

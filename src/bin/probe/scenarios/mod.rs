@@ -213,6 +213,48 @@ fn extension_ui() -> Scenario {
     }
 }
 
+/// Scenario: bash 工具结果 fixture（捕获 BashResult 的 content/structuredContent 形状）。
+fn tool_bash() -> Scenario {
+    Scenario {
+        name: "tool_bash",
+        description: "Prompt triggering a bash tool call (echo) to capture its result shape",
+        steps: vec![
+            cmd_get_state(),
+            send(
+                json!({"type": "prompt", "message": "Use the bash tool to run exactly: echo hello-bash-fixture. Then reply with the output."}),
+                t(T),
+            ),
+            Step::WaitEvent {
+                event_type: "tool_execution_end".into(),
+                sub_predicate: Some(|v| v.get("toolName").and_then(|n| n.as_str()) == Some("bash")),
+                timeout: t(T),
+            },
+            Step::WaitSettled { timeout: t(T) },
+        ],
+    }
+}
+
+/// Scenario: edit 工具结果 fixture（先 write 建文件再 edit，捕获 details.diff 形状）。
+fn tool_edit() -> Scenario {
+    Scenario {
+        name: "tool_edit",
+        description: "Prompt triggering write+edit tools to capture the edit result/diff shape",
+        steps: vec![
+            cmd_get_state(),
+            send(
+                json!({"type": "prompt", "message": "First use the write tool to create the file probe-tmp-edit.txt containing exactly one line: FIXTURE-MARKER. Then use the edit tool to replace FIXTURE-MARKER with EDITED-MARKER in that file. Reply done when finished."}),
+                t(T),
+            ),
+            Step::WaitEvent {
+                event_type: "tool_execution_end".into(),
+                sub_predicate: Some(|v| v.get("toolName").and_then(|n| n.as_str()) == Some("edit")),
+                timeout: t(T),
+            },
+            Step::WaitSettled { timeout: t(T) },
+        ],
+    }
+}
+
 /// All built-in scenarios in run order.
 pub fn all() -> Vec<Scenario> {
     vec![
@@ -224,6 +266,8 @@ pub fn all() -> Vec<Scenario> {
         compact(),
         failed_tool(),
         extension_ui(),
+        tool_bash(),
+        tool_edit(),
     ]
 }
 

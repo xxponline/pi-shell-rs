@@ -73,6 +73,8 @@ cargo build --bin probe
 | `compact` | 关闭自动压缩后手动 compact，抓 `compaction_start/end` |
 | `failed_tool` | 读不存在的文件，抓 `tool_execution_end.isError=true` |
 | `extension_ui` | 经 fixture 扩展触发 select/confirm/notify 弹窗 |
+| `tool_bash` | 触发 bash 工具，归档其结果形状（exit_code/output） |
+| `tool_edit` | 触发 write+edit 工具，归档 details.diff 形状 |
 
 ## 产物布局
 
