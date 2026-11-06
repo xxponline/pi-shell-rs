@@ -6,7 +6,7 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use pi_rust_tui::session::{Block, Entry, SessionState};
+use pi_shell_rs::session::{Block, Entry, SessionState};
 
 /// 渲染偏好标志（App 级 UI 状态，经键位切换）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -231,7 +231,7 @@ fn prefixed(label: &str, text: &str, color: Color, bold_label: bool) -> Line<'st
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi_rust_tui::session::SessionState;
+    use pi_shell_rs::session::SessionState;
     use serde_json::json;
 
     #[test]
@@ -304,7 +304,7 @@ mod tests {
     fn non_error_notice_stays_subdued() {
         let mut st = SessionState::new();
         // Notice 可直接入公开 transcript（非 error 类型保持弱化样式）
-        st.transcript.push(pi_rust_tui::session::Entry::Notice {
+        st.transcript.push(pi_shell_rs::session::Entry::Notice {
             kind: "info".to_string(),
             text: "something".to_string(),
         });
@@ -372,12 +372,12 @@ mod tests {
 
     #[test]
     fn expand_tools_flag_propagates_to_tool_cards() {
-        use pi_rust_tui::session::{Block, ToolExecution, ToolStatus};
+        use pi_shell_rs::session::{Block, ToolExecution, ToolStatus};
         let mut s = SessionState::new();
         s.handle(&serde_json::json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
         // 构造一个多行结果的工具块
         let result = serde_json::json!({"content":[{"type":"text","text":"l1\nl2\nl3\nl4\nl5\nl6"}]});
-        s.transcript.push(pi_rust_tui::session::Entry::Assistant {
+        s.transcript.push(pi_shell_rs::session::Entry::Assistant {
             turn: 1,
             blocks: vec![Block::ToolCall {
                 id: "c1".into(),
@@ -417,7 +417,7 @@ mod tests {
 
     #[test]
     fn bash_entry_and_live_rendering() {
-        use pi_rust_tui::session::Entry;
+        use pi_shell_rs::session::Entry;
         let mut st = SessionState::new();
 
         // 完成态：exit 0 + 状态行 + 不进上下文标记
@@ -493,7 +493,7 @@ mod tests {
 
     #[test]
     fn bash_output_line_cap_keeps_tail() {
-        use pi_rust_tui::session::Entry;
+        use pi_shell_rs::session::Entry;
         let mut st = SessionState::new();
         let big: String = (0..600).map(|i| format!("row{i}\n")).collect();
         st.transcript.push(Entry::Bash {

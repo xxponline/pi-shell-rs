@@ -1,4 +1,4 @@
-# pi-rust-tui 路线图
+# pi-shell-rs 路线图
 
 > 本文档固化产品定位、复刻范围、工程结构与落地阶段，作为后续所有变更的基准，防止方向漂移。
 > 相关文档：[`rust-tui-architecture.md`](./rust-tui-architecture.md)（总体架构）、
@@ -117,12 +117,12 @@ bracketed paste 粘贴、发送 / esc 中断 / ctrl+c 清空 / alt+enter follow_
 关键决策：抽出一个 lib crate，让 `probe`、未来的主 TUI、离线测试共享 rpc/session 层。
 
 ```
-pi-rust-tui/
+pi-shell-rs/
 ├── Cargo.toml
 ├── src/
-│   ├── lib.rs                    # pi_rust_tui 库入口
+│   ├── lib.rs                    # pi_shell_rs 库入口
 │   ├── bin/
-│   │   ├── probe/                # 已有探针 → 迁移为 use pi_rust_tui
+│   │   ├── probe/                # 已有探针 → 迁移为 use pi_shell_rs
 │   │   └── tui.rs                # 最终主程序
 │   ├── rpc/                      # 连接层（从 probe 提炼，强类型化）
 │   │   ├── process.rs            #   spawn pi --mode rpc / 三线程

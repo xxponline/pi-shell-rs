@@ -7,7 +7,7 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use pi_rust_tui::session::{ToolExecution, ToolStatus};
+use pi_shell_rs::session::{ToolExecution, ToolStatus};
 
 /// 折叠态下结果体保留的最大行数。
 const COLLAPSED_BODY_LINES: usize = 3;
@@ -375,7 +375,7 @@ fn generic_body(args: &Value, tool: &ToolExecution) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi_rust_tui::session::{replay_file, Entry};
+    use pi_shell_rs::session::{replay_file, Entry};
     use std::path::PathBuf;
 
     /// 从真实 fixture 回放中取出指定工具的 ToolCall 块。
@@ -403,7 +403,7 @@ mod tests {
         panic!("tool {tool_name} not found in {scenario}");
     }
 
-    use pi_rust_tui::session::Block;
+    use pi_shell_rs::session::Block;
 
     fn render(lines: &[Line<'static>]) -> String {
         lines
@@ -461,8 +461,8 @@ mod tests {
         let text = render(&lines);
         assert!(text.contains("read"), "{text}");
         assert!(text.contains("Cargo.toml"), "路径应出现: {text}");
-        // 内容预览包含文件正文片段
-        assert!(text.contains("pi-rust-tui") || text.contains("[package]"), "内容预览: {text}");
+        // 内容预览包含文件正文片段（fixture 为归档数据，正文是当时的 Cargo.toml）
+        assert!(text.contains("[package]"), "内容预览: {text}");
         assert!(text.contains("done"), "{text}");
     }
 

@@ -15,8 +15,8 @@
 
 ```bash
 cargo run                       # 默认运行 TUI（default-run）
-# 或指定：cargo run --bin pi-rust-tui
-# 或先构建：cargo build && ./target/debug/pi-rust-tui
+# 或指定：cargo run --bin pi-shell-rs
+# 或先构建：cargo build && ./target/debug/pi-shell-rs
 ```
 
 - `pi` 不在 PATH 时：`PI_BIN=/path/to/pi cargo run`

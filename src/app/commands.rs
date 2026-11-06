@@ -6,7 +6,7 @@
 
 use std::sync::mpsc::Sender;
 
-use pi_rust_tui::rpc::CommandSender;
+use pi_shell_rs::rpc::CommandSender;
 
 use crate::app::event::UiEvent;
 use crate::app::App;
@@ -239,7 +239,7 @@ done
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let client = pi_rust_tui::rpc::RpcClient::spawn(path.to_str().unwrap(), &[]).unwrap();
+        let client = pi_shell_rs::rpc::RpcClient::spawn(path.to_str().unwrap(), &[]).unwrap();
         let commander = client.command_sender();
         let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
         (App::new(), commander, tx, dir)

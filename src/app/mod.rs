@@ -27,8 +27,8 @@ use std::thread;
 use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use pi_rust_tui::rpc::{CommandSender, ResponsePolicy, RpcClient};
-use pi_rust_tui::session::{Phase, SessionState};
+use pi_shell_rs::rpc::{CommandSender, ResponsePolicy, RpcClient};
+use pi_shell_rs::session::{Phase, SessionState};
 use ratatui::style::Color;
 use std::collections::VecDeque;
 
@@ -181,7 +181,7 @@ impl App {
 
     /// Run the full TUI against a spawned pi RPC client.
     pub fn run(mut self) -> io::Result<()> {
-        let binary = pi_rust_tui::rpc::resolve_binary();
+        let binary = pi_shell_rs::rpc::resolve_binary();
         let mut guard = TerminalGuard::enter().map_err(|e| {
             io::Error::other(format!(
                 "无法进入终端 raw/alt-screen 模式（是否在真实交互终端中运行？）: {e}"
@@ -829,7 +829,7 @@ impl App {
                 return Some(path);
             }
         }
-        let bin = pi_rust_tui::rpc::resolve_binary();
+        let bin = pi_shell_rs::rpc::resolve_binary();
         if let Ok(real) = std::fs::canonicalize(&bin) {
             let mut dir = real.parent().map(std::path::Path::to_path_buf);
             for _ in 0..8 {
@@ -901,7 +901,7 @@ impl App {
             self.notice = Some(("No changelog entries found.".into(), Color::Yellow));
             return;
         }
-        use pi_rust_tui::session::Entry;
+        use pi_shell_rs::session::Entry;
         self.state.transcript.push(Entry::Notice {
             kind: "changelog".into(),
             text: "── What's New ──".into(),
@@ -3148,7 +3148,7 @@ mod input_tests {
     }
 
     /// 造一个只应答不动作的假 pi，供需要 CommandSender 的测试使用。
-    fn test_commander() -> (pi_rust_tui::rpc::RpcClient, std::path::PathBuf) {
+    fn test_commander() -> (pi_shell_rs::rpc::RpcClient, std::path::PathBuf) {
         let script = "#!/bin/sh\nwhile IFS= read -r line; do\n  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p')\n  printf '{\"type\":\"response\",\"id\":\"%s\",\"success\":true}\n' \"$id\"\ndone\n";
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3163,7 +3163,7 @@ mod input_tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let client = pi_rust_tui::rpc::RpcClient::spawn(path.to_str().unwrap(), &[]).unwrap();
+        let client = pi_shell_rs::rpc::RpcClient::spawn(path.to_str().unwrap(), &[]).unwrap();
         (client, dir)}
 
     #[test]
@@ -3216,7 +3216,7 @@ mod input_tests {
 
     /// 录制型假 pi：把收到的每行 stdin 追加到日志文件；clear_queue 返回
     /// steering=["s1"]/followUp=["f1"]，其余命令一律 success。
-    fn recording_commander(tag: &str, clear_queue_data: &str) -> (pi_rust_tui::rpc::RpcClient, std::path::PathBuf, std::path::PathBuf) {
+    fn recording_commander(tag: &str, clear_queue_data: &str) -> (pi_shell_rs::rpc::RpcClient, std::path::PathBuf, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "rec-pi-{}-{}",
             std::process::id(),
@@ -3239,7 +3239,7 @@ mod input_tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let client = pi_rust_tui::rpc::RpcClient::spawn(path.to_str().unwrap(), &[]).unwrap();
+        let client = pi_shell_rs::rpc::RpcClient::spawn(path.to_str().unwrap(), &[]).unwrap();
         (client, dir, log)
     }
 
@@ -3839,7 +3839,7 @@ mod input_tests {
 
     /// 假 pi：switch_session 返回 cancelled=false，随后 get_state / get_messages
     /// 返回可断言的固定数据（4.3 切换链）。
-    fn chain_fake_pi(tag: &str, cancelled: bool) -> (pi_rust_tui::rpc::RpcClient, std::path::PathBuf) {
+    fn chain_fake_pi(tag: &str, cancelled: bool) -> (pi_shell_rs::rpc::RpcClient, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "chain-pi-{tag}-{}-{}",
             std::process::id(),
@@ -3880,7 +3880,7 @@ done
         }
         // 保留一份供外部检查（测试结束后目录被删，这里另存）
         let _ = std::fs::write("/tmp/last-chain-pi.sh", std::fs::read(&path).unwrap_or_default());
-        let client = pi_rust_tui::rpc::RpcClient::spawn(path.to_str().unwrap(), &[]).unwrap();
+        let client = pi_shell_rs::rpc::RpcClient::spawn(path.to_str().unwrap(), &[]).unwrap();
         (client, dir)
     }
 
@@ -3945,14 +3945,14 @@ done
             .entries()
             .iter()
             .filter_map(|e| match e {
-                pi_rust_tui::session::Entry::User { text } => Some(text.as_str()),
+                pi_shell_rs::session::Entry::User { text } => Some(text.as_str()),
                 _ => None,
             })
             .collect();
         assert_eq!(users, vec!["switched question"], "{:?}", app.state.entries());
         assert!(app.state.entries().iter().any(|e| matches!(
             e,
-            pi_rust_tui::session::Entry::Assistant { .. }
+            pi_shell_rs::session::Entry::Assistant { .. }
         )));
         let _ = messages;
         let _ = std::fs::remove_dir_all(&dir);
@@ -4010,7 +4010,7 @@ done
         // 旧状态未动
         assert!(app.state.entries().iter().any(|e| matches!(
             e,
-            pi_rust_tui::session::Entry::User { text } if text == "before"
+            pi_shell_rs::session::Entry::User { text } if text == "before"
         )));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4591,7 +4591,7 @@ done
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let client = pi_rust_tui::rpc::RpcClient::spawn(path.to_str().unwrap(), &[]).unwrap();
+        let client = pi_shell_rs::rpc::RpcClient::spawn(path.to_str().unwrap(), &[]).unwrap();
         let commander = client.command_sender();
         let (tx, rx) = std::sync::mpsc::channel::<UiEvent>();
 
@@ -4905,7 +4905,7 @@ done
     // ── /model /thinking 入口与精确匹配（spec） ──
 
     /// 造一个支持 model/thinking 全分支的假 pi。
-    fn selector_fake_pi(tag: &str) -> (pi_rust_tui::rpc::RpcClient, std::path::PathBuf, std::path::PathBuf) {
+    fn selector_fake_pi(tag: &str) -> (pi_shell_rs::rpc::RpcClient, std::path::PathBuf, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "sel-{}-{}",
             tag,
@@ -4938,7 +4938,7 @@ done
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let client = pi_rust_tui::rpc::RpcClient::spawn(path.to_str().unwrap(), &[]).unwrap();
+        let client = pi_shell_rs::rpc::RpcClient::spawn(path.to_str().unwrap(), &[]).unwrap();
         (client, dir, log)
     }
 
@@ -5375,7 +5375,7 @@ done
         });
 
         // 渲染断言：浮层含 doubleEsc 行与当前值
-        let state = pi_rust_tui::session::SessionState::new();
+        let state = pi_shell_rs::session::SessionState::new();
         let backend = ratatui::backend::TestBackend::new(90, 30);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
@@ -5669,7 +5669,7 @@ done
         );
         assert!(!app.state.bash_running);
         match app.state.transcript.last().unwrap() {
-            pi_rust_tui::session::Entry::Bash { command, output, exit_code, .. } => {
+            pi_shell_rs::session::Entry::Bash { command, output, exit_code, .. } => {
                 assert_eq!(command, "echo hi");
                 assert_eq!(output, "hi\n");
                 assert_eq!(*exit_code, Some(0));
@@ -5800,7 +5800,7 @@ done
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let dead_client = pi_rust_tui::rpc::RpcClient::spawn(script.to_str().unwrap(), &[]).unwrap();
+        let dead_client = pi_shell_rs::rpc::RpcClient::spawn(script.to_str().unwrap(), &[]).unwrap();
         let (dtx, drx) = std::sync::mpsc::channel::<UiEvent>();
         App::fetch_commands_quiet(&dead_client.command_sender(), &dtx, std::path::PathBuf::from("/nonexistent/settings.json"));
         std::thread::sleep(std::time::Duration::from_millis(600));

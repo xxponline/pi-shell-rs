@@ -6,7 +6,7 @@ use std::thread;
 
 use crossterm::event::{KeyEvent};
 use crossterm::event::{self as ct_event};
-use pi_rust_tui::rpc::{ClientEvent, RpcClient};
+use pi_shell_rs::rpc::{ClientEvent, RpcClient};
 use serde_json::Value;
 
 /// Everything the main loop reacts to.

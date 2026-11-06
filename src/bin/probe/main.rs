@@ -8,7 +8,7 @@ mod scenarios;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use pi_rust_tui::rpc::{resolve_binary, Transport};
+use pi_shell_rs::rpc::{resolve_binary, Transport};
 use serde_json::json;
 
 use crate::scenario::RunOutcome;

@@ -1,8 +1,8 @@
 [package]
-name = "pi-rust-tui"
+name = "pi-shell-rs"
 version = "0.1.0"
 edition = "2024"
-default-run = "pi-rust-tui"
+default-run = "pi-shell-rs"
 
 [dependencies]
 crossterm = "0.29.0"

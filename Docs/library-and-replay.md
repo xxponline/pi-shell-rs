@@ -7,7 +7,7 @@
 
 ```
 src/
-├── lib.rs                 # pi_rust_tui
+├── lib.rs                 # pi_shell_rs
 ├── rpc/
 │   ├── process.rs         # Transport: spawn pi --mode rpc, 三线程 stdin/stdout/stderr
 │   ├── jsonl.rs           # WireMessage / OutgoingCommand / Direction
@@ -32,7 +32,7 @@ src/
   - `ClientEvent::{Event, ParseError{raw}, Closed}`：普通事件 / 非 JSON 脏行（保留原文）/ pi 退出。
 
 ```rust
-use pi_rust_tui::rpc::{RpcClient, ResponsePolicy, ClientEvent};
+use pi_shell_rs::rpc::{RpcClient, ResponsePolicy, ClientEvent};
 use std::time::Duration;
 
 let client = RpcClient::spawn("pi", &[])?;
@@ -74,7 +74,7 @@ while let Ok(ev) = client.events().recv_timeout(Duration::from_millis(100)) {
 因此无需启动 pi、无需网络、不耗 token：
 
 ```rust
-use pi_rust_tui::session::{replay_file, Entry, Block};
+use pi_shell_rs::session::{replay_file, Entry, Block};
 
 let state = replay_file(std::path::Path::new(
     "tests/fixtures/probe/tool_call/snapshot/transcript.jsonl",

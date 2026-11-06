@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use pi_rust_tui::session::{Phase, SessionState, Usage};
+use pi_shell_rs::session::{Phase, SessionState, Usage};
 
 use crate::app::chat::{chat_lines, RenderFlags};
 use crate::app::wrap::wrap_for_viewport;
@@ -409,7 +409,7 @@ mod tests {
 #[cfg(test)]
 mod render_tests {
     use super::*;
-    use pi_rust_tui::session::SessionState;
+    use pi_shell_rs::session::SessionState;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use serde_json::json;

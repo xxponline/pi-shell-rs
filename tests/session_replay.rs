@@ -1,6 +1,6 @@
 //! Offline replay tests over committed probe snapshots. No pi process/network.
 
-use pi_rust_tui::session::{replay_file, Block, Entry, Phase};
+use pi_shell_rs::session::{replay_file, Block, Entry, Phase};
 use std::path::Path;
 
 fn fixture(scenario: &str) -> std::path::PathBuf {
@@ -10,7 +10,7 @@ fn fixture(scenario: &str) -> std::path::PathBuf {
         .join("snapshot/transcript.jsonl")
 }
 
-fn assistants(state: &pi_rust_tui::session::SessionState) -> Vec<&Vec<Block>> {
+fn assistants(state: &pi_shell_rs::session::SessionState) -> Vec<&Vec<Block>> {
     state
         .entries()
         .iter()

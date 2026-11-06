@@ -587,8 +587,8 @@ mod tests {
     fn safe_dir_name_matches_pi_formula() {
         // 复刻 pi: --${cwd 去首分隔符、/ \ : 换 -}--
         assert_eq!(
-            safe_dir_name(Path::new("/Users/b.f.peng/LLMLearn/pi-rust-tui")),
-            "--Users-b.f.peng-LLMLearn-pi-rust-tui--"
+            safe_dir_name(Path::new("/Users/b.f.peng/LLMLearn/pi-shell-rs")),
+            "--Users-b.f.peng-LLMLearn-pi-shell-rs--"
         );
         assert_eq!(safe_dir_name(Path::new("/tmp/a:b")), "--tmp-a-b--");
         assert_eq!(safe_dir_name(Path::new("/x/y")), "--x-y--");
@@ -607,7 +607,7 @@ mod tests {
         };
         assert!(!filter);
         assert!(dir.to_string_lossy().ends_with("--"), "{dir:?}");
-        assert!(dir.to_string_lossy().contains("pi-rust-tui"), "当前项目子目录");
+        assert!(dir.to_string_lossy().contains("pi-shell-rs"), "当前项目子目录");
 
         // 自定义根 → 直接用根（不派生 cwd 子目录）
         let custom = resolve_from(None, Some(Path::new("/custom/sessions")), &home);
