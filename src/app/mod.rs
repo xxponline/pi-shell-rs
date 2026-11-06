@@ -6,8 +6,10 @@
 
 mod autocomplete;
 mod chat;
+mod clipboard;
 mod commands;
 mod editor;
+mod external_editor;
 mod event;
 mod markdown;
 mod overlay;
@@ -65,6 +67,12 @@ enum KeyIntent {
     Newline,
     /// 中止生成（流式 esc）
     Abort,
+    /// 外部编辑器（ctrl+g；经事件循环挂起/恢复）
+    ExternalEditor,
+    /// 复制最后回复（ctrl+x，复用 /copy 通路）
+    CopyMessage,
+    /// 粘贴剪贴板（ctrl+v，图片→路径 / 文本→插入）
+    PasteClipboard,
     /// 普通编辑（可打印字符 / 退格）
     Edit,
     /// 忽略
@@ -281,6 +289,35 @@ impl App {
                     } else {
                         self.notice = Some((err, Color::Red));
                     }
+                    self.draw(terminal)?;
+                }
+                Ok(UiEvent::OpenExternalEditor) => {
+                    self.log_event("key", "external editor: suspend");
+                    // 暂停键盘闸门 → 挂起 TUI → 阻塞编辑 → 恢复 → 全量重绘
+                    crate::app::terminal::set_keyboard_paused(true);
+                    crate::app::terminal::suspend_for_child();
+                    let cmd = crate::app::external_editor::resolve_command(&self.settings_path());
+                    let content = self.editor.text();
+                    let result = crate::app::external_editor::edit_in_external(&cmd, &content);
+                    crate::app::terminal::resume_from_child();
+                    crate::app::terminal::set_keyboard_paused(false);
+                    match result {
+                        Ok(new_text) => {
+                            self.editor.replace(&new_text);
+                            self.log_event(
+                                "key",
+                                &format!("external editor: {} bytes in", new_text.len()),
+                            );
+                        }
+                        Err(msg) => {
+                            // 失败：黄条提示，输入保持不变（spec）
+                            self.notice = Some((msg, Color::Yellow));
+                        }
+                    }
+                    // 不调用 terminal.clear()：ratatui 0.30 的 clear 会先发
+                    // ESC[6n 查光标位置（无应答终端超时报错、有应答时又与
+                    // 键盘线程抢 stdin）。编辑器跑在主屏，alt-screen 的 TUI
+                    // 帧未被污染——直接重绘即可覆盖输入框等变更单元格。
                     self.draw(terminal)?;
                 }
                 Ok(UiEvent::CommandsFetched(data)) => {
@@ -671,6 +708,58 @@ impl App {
                 None,
             );
         }
+    }
+
+    /// ctrl+v 粘贴链（spec：剪贴板复制与粘贴）：图片（写临时文件→插路径）
+    /// → 文本（光标处插入）→ 皆空无操作；图片写失败降级试文本；全程无红条。
+    ///
+    /// 输入: self — 应用状态（副作用宿主）
+    /// 输出: 无返回值
+    fn paste_clipboard(&mut self) {
+        self.log_event("key", "paste clipboard");
+        let image = crate::app::clipboard::read_image();
+        let text = if image.is_none() {
+            crate::app::clipboard::read_text()
+        } else {
+            None
+        };
+        self.paste_from(image, text);
+    }
+
+    /// 粘贴链核心（可注入，便于单测）：图片 → 文本 → 无操作。
+    ///
+    /// 输入: image — 剪贴板图片（None=无图片/读取失败）；text — 文本兜底
+    /// 输出: 无返回值；副作用为插入路径/文本
+    fn paste_from(
+        &mut self,
+        image: Option<crate::app::clipboard::ClipboardImage>,
+        text: Option<String>,
+    ) {
+        if let Some(img) = image {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let path =
+                std::env::temp_dir().join(format!("pi-clip-{nanos}.{}", img.ext));
+            match std::fs::write(&path, &img.bytes) {
+                Ok(_) => {
+                    let text = path.to_string_lossy().to_string();
+                    self.editor.insert_text(&text);
+                    self.log_event("key", &format!("paste image → {text}"));
+                    return;
+                }
+                Err(e) => {
+                    // 图片写失败 → 按 spec 降级试文本
+                    self.log_event("key", &format!("paste image write failed: {e}"));
+                }
+            }
+        }
+        if let Some(text) = text {
+            self.editor.insert_text(&text);
+            self.log_event("key", &format!("paste text {} chars", text.chars().count()));
+        }
+        // 皆空 → 无操作（无红条）
     }
 
     /// /copy：取最后一条 assistant 文本（get_last_assistant_text），
@@ -1578,7 +1667,20 @@ impl App {
                     None,
                 );
             }
+            Some(KeyIntent::CopyMessage) => {
+                // 复用 /copy 通路（get_last_assistant_text → OSC52）
+                self.cmd_copy(commander, report_tx);
+            }
             _ => {}
+        }
+        // 外部编辑器：转事件循环（只有它持有 terminal，可挂起/恢复并全量重绘）
+        if key.code == KeyCode::Char('g')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+        {
+            self.log_event("key", "ctrl+g → external editor");
+            let _ = report_tx.send(UiEvent::OpenExternalEditor);
+            return;
         }
         // 每次按键后按光标前文本重算补全（菜单内消费键已在上方 return）
         self.update_completion(commander, report_tx);
@@ -1986,6 +2088,15 @@ impl App {
             Enter if key.modifiers.contains(KeyModifiers::SHIFT)
                 && !key.modifiers.contains(KeyModifiers::ALT) => KeyIntent::Newline,
             Char('j') if ctrl => KeyIntent::Newline,
+            Char('g') if ctrl && !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                KeyIntent::ExternalEditor
+            }
+            Char('x') if ctrl && !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                KeyIntent::CopyMessage
+            }
+            Char('v') if ctrl && !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                KeyIntent::PasteClipboard
+            }
             Char('t') if ctrl => KeyIntent::ToggleThinking,
             Char('o') if ctrl => KeyIntent::ToggleTools,
             Enter if alt => KeyIntent::SendFollowUp,
@@ -2050,6 +2161,12 @@ impl App {
                 None
             }
             KeyIntent::Ignore => None,
+            KeyIntent::ExternalEditor => None, // handle_key 单独发事件
+            KeyIntent::PasteClipboard => {
+                self.paste_clipboard();
+                None
+            }
+            KeyIntent::CopyMessage => Some(intent), // handle_key 调 cmd_copy
             KeyIntent::Submit
             | KeyIntent::Abort
             | KeyIntent::SendFollowUp
@@ -5713,5 +5830,136 @@ done
         assert_eq!(app.dynamic_commands.len(), 1);
         assert_eq!(app.dynamic_commands[0].name, "after-reload");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 外部编辑器（spec：外部编辑器） ──
+
+    #[test]
+    fn ctrl_g_emits_open_external_editor_event() {
+        let (client, dir, _log) = recording_commander("exted", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+        app.editor.replace("draft content");
+
+        // ctrl+g → 事件（实际挂起/回填在事件循环，PTY 5.1 验证）
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            &commander,
+            &tx,
+        );
+        let ev = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("应发事件");
+        assert!(matches!(ev, UiEvent::OpenExternalEditor), "{ev:?}");
+        assert_eq!(app.editor.text(), "draft content", "事件阶段不动输入");
+
+        // shift+ctrl+g 不触发（对齐 pi 仅裸 ctrl+g）
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            &commander,
+            &tx,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(rx.try_recv().is_err(), "shift+ctrl+g 不触发");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 复制与粘贴（spec：剪贴板复制与粘贴） ──
+
+    #[test]
+    fn ctrl_x_copies_last_assistant_via_copy_path() {
+        let (client, dir, log) = recording_commander("ctrlx", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL), &commander, &tx);
+        // 复用 /copy：发出 get_last_assistant_text
+        read_log_until(&log, "get_last_assistant_text", 2000).expect("应发取文本命令");
+        // 无回复 → 红条（CopyText 空数据）
+        app.handle_async_data(AsyncKind::CopyText, 0, &serde_json::json!({"text": ""}));
+        let (text, color) = app.notice.clone().unwrap();
+        assert!(text.contains("暂无可复制"), "{text}");
+        assert_eq!(color, Color::Red);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn paste_chain_image_text_and_empty() {
+        use crate::app::clipboard::ClipboardImage;
+        let mut app = App::new();
+
+        // 1) 图片 → 写临时文件 + 插入路径
+        app.editor.replace("BEFORE ");
+        app.paste_from(
+            Some(ClipboardImage { bytes: b"fake-png-bytes".to_vec(), ext: "png" }),
+            Some("should-not-use".into()),
+        );
+        let text = app.editor.text();
+        assert!(text.starts_with("BEFORE /"), "路径插入光标处: {text}");
+        let path_str = text.trim_start_matches("BEFORE ").to_string();
+        assert!(path_str.contains("pi-clip-") && path_str.ends_with(".png"), "{path_str}");
+        let pasted = std::path::Path::new(&path_str);
+        assert!(pasted.is_file(), "临时图片文件应存在");
+        assert_eq!(std::fs::read(pasted).unwrap(), b"fake-png-bytes");
+        let _ = std::fs::remove_file(pasted);
+
+        // 2) 无图片 → 文本插入（光标处）
+        let mut app2 = App::new();
+        app2.editor.replace("ab");
+        app2.editor.move_left();
+        app2.paste_from(None, Some("XY".into()));
+        assert_eq!(app2.editor.text(), "aXYb", "光标处插入");
+
+        // 3) 皆空 → 无操作且无通知（静默降级）
+        let mut app3 = App::new();
+        app3.editor.replace("keep");
+        app3.paste_from(None, None);
+        assert_eq!(app3.editor.text(), "keep");
+        assert!(app3.notice.is_none(), "空剪贴板无通知: {:?}", app3.notice);
+
+        // 4) 图片写入失败降级文本：不可写目标不可直接注入——以"图片 None + 文本"路径覆盖降级链起点；
+        //    写失败分支由 temp_dir 权限决定，逻辑上直接落入文本段（结构保证）。
+    }
+
+    // ── #9 三键意图（spec：外部编辑器 / 剪贴板） ──
+
+    #[test]
+    fn key_intent_maps_clipboard_and_editor_keys() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let k = |code, mods| KeyEvent::new(code, mods);
+        // 三键裸 ctrl → 对应意图
+        assert_eq!(
+            App::key_intent(k(KeyCode::Char('g'), KeyModifiers::CONTROL), false),
+            KeyIntent::ExternalEditor
+        );
+        assert_eq!(
+            App::key_intent(k(KeyCode::Char('x'), KeyModifiers::CONTROL), false),
+            KeyIntent::CopyMessage
+        );
+        assert_eq!(
+            App::key_intent(k(KeyCode::Char('v'), KeyModifiers::CONTROL), false),
+            KeyIntent::PasteClipboard
+        );
+        // shift+ctrl 不触发（回落 Edit → edit_key 忽略未绑定组合）
+        assert_eq!(
+            App::key_intent(k(KeyCode::Char('g'), KeyModifiers::CONTROL | KeyModifiers::SHIFT), false),
+            KeyIntent::Edit
+        );
+        assert_eq!(
+            App::key_intent(k(KeyCode::Char('x'), KeyModifiers::CONTROL | KeyModifiers::SHIFT), false),
+            KeyIntent::Edit
+        );
+        // 无修饰的普通字符不受影响
+        assert_eq!(App::key_intent(k(KeyCode::Char('g'), KeyModifiers::NONE), false), KeyIntent::Edit);
+    }
+
+    #[test]
+    fn hotkeys_rows_include_new_keys() {
+        let rows = crate::app::overlay::hotkeys_rows();
+        let text: String = rows.iter().map(|(_, k, d)| format!("{k} {d}\n")).collect();
+        for needle in ["ctrl+g", "ctrl+x", "ctrl+v"] {
+            assert!(text.contains(needle), "键位表缺 {needle}");
+        }
+        assert!(text.contains("外部编辑器") && text.contains("粘贴剪贴板"), "{text}");
     }
 }

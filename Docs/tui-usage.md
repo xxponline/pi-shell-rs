@@ -48,6 +48,18 @@ cargo run                       # 默认运行 TUI（default-run）
 - 运行中再提交 `!cmd` → 黄条警告（Esc 可中止）且**输入保留**；Esc 中止当前命令
 - 压缩期间 `!cmd` 也可执行（对齐 pi：bash 先于压缩排队）
 
+### 外部编辑器与剪贴板
+
+- **Ctrl+G** 挂起 TUI（退出 alt-screen/raw、暂停键盘读取）→ 编辑器于
+  `pi-editor-*/prompt.md` 打开当前输入 → 退出码 0 读回去 BOM/末尾换行回填；
+  命令不存在/非零退出 → 黄条提示且输入不变
+- **Ctrl+V** 平台后端（零第三方依赖）：macOS 图片 `osascript` JXA / 文本
+  `pbpaste`；Linux `wl-paste`→`xclip`；Windows PowerShell。后端缺失/超时
+  静默降级到下一环，均失败则无操作（不弹红条）。图片写入 `pi-clip-*.{ext}`
+  临时文件后插入其路径
+- 差异（对齐 pi 时省略）：无"复制选区"分支（本 TUI 无选区）、无剪贴板
+  **文件列表**粘贴（链为 图片→文本）
+
 ### 补全菜单
 
 输入行首 `/` 即弹出候选：模糊过滤（说明列 = `参数提示 — 说明`）、↑↓/PageUp/PageDown
@@ -103,6 +115,9 @@ cargo run                       # 默认运行 TUI（default-run）
 | Esc ×2（空输入，500ms 内） | **打开会话树**（按 `doubleEscapeAction` 设置：tree/fork=开树，none=禁用；`/settings` 可改）——单次 Esc 无动作 |
 | `!command` 回车 | **执行 bash**（不发给模型）；输入以 `!` 起始时边框变黄提示；`!!command` 结果不进模型上下文 |
 | Esc（bash 运行中） | 中止当前 bash 命令（优先于双击开树；输入非空也生效） |
+| Ctrl+G | **外部编辑器**：挂起 TUI 打开编辑器（`settings.json externalEditor` → `$VISUAL`/`$EDITOR` → nano），保存退出回填输入；失败黄条且输入不变 |
+| Ctrl+X | 复制最后一条回复到终端剪贴板（OSC52，同 `/copy`） |
+| Ctrl+V | 粘贴剪贴板：图片→临时文件路径插入，否则文本→光标处插入；空则无操作 |
 | Ctrl+D | **仅输入为空时退出**（非空 = 光标处向后删字符） |
 | Esc（流式中） | 发送 abort **并恢复排队消息到输入框**，回到空闲 |
 | Esc（空闲） | **无操作**（不退出、不清空——对齐 pi） |

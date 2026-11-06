@@ -17,6 +17,63 @@ use ratatui::DefaultTerminal;
 /// kitty 键盘增强是否已推送（restore 时弹出；静态供 panic hook 使用）。
 static KB_PUSHED: AtomicBool = AtomicBool::new(false);
 
+/// 键盘线程暂停闸门（外部编辑器子进程占用 stdin 期间为 true——不进入
+/// crossterm poll、不读字节，design D3）。
+static KB_PAUSED: AtomicBool = AtomicBool::new(false);
+
+/// 启动时探测到的 kitty 键盘增强能力（resume 复用，**不再查询**——恢复期的
+/// 光标位置查询会与键盘线程争 crossterm 全局读锁，曾致死锁）。
+static KB_SUPPORTED: AtomicBool = AtomicBool::new(false);
+
+/// 设置键盘线程暂停闸门。
+///
+/// 输入: paused — true=暂停投递（子进程持有 stdin）
+/// 输出: 无返回值
+pub fn set_keyboard_paused(paused: bool) {
+    KB_PAUSED.store(paused, Ordering::SeqCst);
+}
+
+/// 键盘线程当前是否暂停。
+///
+/// 输入: 无
+/// 输出: true = 暂停中
+pub fn keyboard_paused() -> bool {
+    KB_PAUSED.load(Ordering::SeqCst)
+}
+
+/// 挂起 TUI 交给子进程（外部编辑器）：弹 kitty 增强 flags、退 alt-screen、
+/// 关 raw——子进程拿到的是正常终端。
+///
+/// 输入: 无
+/// 输出: 无返回值；副作用为终端模式切换（KB_PAUSED 由调用方另行置位）
+pub fn suspend_for_child() {
+    if KB_PUSHED.swap(false, Ordering::SeqCst) {
+        let _ = crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags);
+    }
+    let _ = crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+    let _ = disable_raw_mode();
+}
+
+/// 子进程结束后的恢复：进 alt-screen、开 raw、重探测并推送 kitty 增强、
+/// 隐藏游标（下一帧 draw 会按需再定位）。
+///
+/// 输入: 无
+/// 输出: 无返回值；副作用为终端模式恢复
+pub fn resume_from_child() {
+    let _ = crossterm::execute!(io::stdout(), crossterm::terminal::EnterAlternateScreen);
+    let _ = crossterm::terminal::enable_raw_mode();
+    // 复用启动时的能力探测结论，不在此处查询（查询要读光标位置应答，
+    // 会与键盘线程的 crossterm 全局读锁互斥 → 死锁，见 KB_SUPPORTED 注释）
+    if KB_SUPPORTED.load(Ordering::SeqCst) {
+        let _ = crossterm::execute!(
+            io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+        KB_PUSHED.store(true, Ordering::SeqCst);
+    }
+    let _ = crossterm::execute!(io::stdout(), crossterm::cursor::Hide);
+}
+
 pub struct TerminalGuard {
     raw_enabled: bool,
 }
@@ -33,7 +90,9 @@ impl TerminalGuard {
     pub fn enter() -> io::Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
         // 查询需在 raw mode 下、事件线程启动前进行（内部会读 stdin 应答）。
-        if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+        let supported = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+        KB_SUPPORTED.store(supported, Ordering::SeqCst);
+        if supported {
             let _ = crossterm::execute!(
                 io::stdout(),
                 PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
@@ -101,4 +160,24 @@ fn install_panic_hook() {
         TerminalGuard::restore_now();
         default(info);
     }));
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    #[test]
+    fn keyboard_pause_gate_roundtrip() {
+        // 闸门默认关闭（正常键路）
+        set_keyboard_paused(false);
+        assert!(!keyboard_paused());
+        // 子进程期间置位：键盘线程据此跳过 read（字节留给子进程）
+        set_keyboard_paused(true);
+        assert!(keyboard_paused());
+        // 恢复
+        set_keyboard_paused(false);
+        assert!(!keyboard_paused());
+        // suspend/resume 不改闸门语义（由调用方管理）
+        assert!(!keyboard_paused());
+    }
 }

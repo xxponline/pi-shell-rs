@@ -29,6 +29,8 @@ pub enum UiEvent {
     OpenModelSelect,
     /// get_commands 响应（动态命令缓存回填；静默拉取，仅成功时回报）。
     CommandsFetched(serde_json::Value),
+    /// ctrl+g：请求外部编辑器（仅事件循环持有 terminal，挂起/恢复在那里执行）。
+    OpenExternalEditor,
     /// 一次性线程取回的异步数据（选择器加载/模型与级别应用结果）。
     AsyncData { kind: AsyncKind, seq: u64, data: serde_json::Value },
 }
@@ -85,16 +87,34 @@ pub fn spawn_event_sources(
 ) -> (Receiver<UiEvent>, Sender<UiEvent>) {
     let (tx, rx) = mpsc::channel();
 
-    // Keyboard source.
+    // Keyboard source：poll + 暂停闸门（design D3）——外部编辑器子进程
+    // 占用 stdin 期间，poll 到数据也不 read，字节留给子进程。
     let key_tx = tx.clone();
     thread::spawn(move || loop {
-        match ct_event::read() {
-            Ok(ct_event::Event::Key(key)) => {
-                if key_tx.send(UiEvent::Key(key)).is_err() {
-                    break;
+        // 暂停闸门前置（design D3 修订）：暂停期不进入 crossterm poll——
+        // 既不会消费子进程（外部编辑器）的 stdin 字节，也不持有全局事件读锁
+        // （否则与恢复路径的能力查询争锁死锁）。
+        if crate::app::terminal::keyboard_paused() {
+            thread::sleep(std::time::Duration::from_millis(50));
+            continue;
+        }
+        match ct_event::poll(std::time::Duration::from_millis(150)) {
+            Ok(true) => {
+                // 二次确认（poll 等待期间可能被置位）
+                if crate::app::terminal::keyboard_paused() {
+                    continue;
+                }
+                match ct_event::read() {
+                    Ok(ct_event::Event::Key(key)) => {
+                        if key_tx.send(UiEvent::Key(key)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) => {} // mouse/resize ignored in stage 2
+                    Err(_) => break,
                 }
             }
-            Ok(_) => {} // mouse/resize ignored in stage 2
+            Ok(false) => {}
             Err(_) => break,
         }
     });

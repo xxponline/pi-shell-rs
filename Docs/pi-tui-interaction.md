@@ -160,7 +160,7 @@ macOS 实现）。
 | 6 | `!cmd` bash 模式（边框变色、!! 排除上下文） | ✅ 分流/流式输出/运行门控/Esc 中止/`bashExecution` 重建全落地；user_bash 扩展拦截未做（无扩展运行时） | ~~中~~ 已完成 |
 | 7 | 本地 slash 命令（26 个） | ✅ 24 个内置命令全部落地 + **斜杠补全菜单** + **动态命令**（扩展/skill/模板的发现、补全标签与压缩期语义，`add-dynamic-slash-commands`）；详见 `Docs/slash-commands.md` | ~~分批~~ 已完成 |
 | 8 | 编辑器 Emacs 全套（词移动/删除、yank、undo、历史） | ✅ 已对齐（多行+光标+词行删除+kill-ring/yank+undo；历史 pi 默认未绑定→不做） | ~~高~~ 已完成 |
-| 9 | ctrl+g 外部编辑器、ctrl+x 复制、ctrl+v 粘贴图片 | 无 | 中 |
+| 9 | ctrl+g 外部编辑器、ctrl+x 复制、ctrl+v 粘贴图片 | ✅ 三键全落地（外部编辑器挂起/回填、复制=OSC52 同 /copy、粘贴 图片→路径→文本链）；差异：无选区复制、无剪贴板文件列表粘贴 | ~~中~~ 已完成 |
 | 10 | shift+enter 换行（编辑器内多行） | ✅ 已对齐（shift+enter/ctrl+j 换行，输入区动态增高） | ~~高~~ 已完成 |
 | 11 | 扩展快捷键最高优先级 | 未实现 | 低 |
 | 12 | 选择列表分页（pageUp/Down）、历史键可覆盖 | 选择器仅 ↑↓ | 低 |
@@ -182,4 +182,5 @@ macOS 实现）。
 - ~~差异 #5、#7 依赖 4b~~ → **#7 已由 `add-remaining-slash-commands`、
   #5 已由 `add-double-escape-action` 完成**。
 - ~~#6 bash 模式依赖 RPC~~ → **#6 已由 change `add-bash-command-mode` 完成**。
-- 其余低优先项按需后置。
+- ~~其余低优先项~~ → **#9 已由 change `add-clipboard-and-external-editor` 完成**；
+  仍后置：树内搜索/标签编辑、`@文件` 补全、扩展命令参数补全（需上游 RPC）。

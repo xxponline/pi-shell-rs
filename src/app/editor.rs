@@ -148,6 +148,20 @@ impl EditorBuffer {
         self.after_yank = false;
     }
 
+    /// 在光标处插入多字符文本（粘贴/外部编辑回填用）：`\n` 按换行语义拆行，
+    /// 整段只入一次 undo 快照（一次撤销回滚整段）。
+    ///
+    /// 输入: text — 待插入文本（可含换行）
+    /// 输出: 无返回值；副作用为插入文本、光标移到插入段末尾
+    pub fn insert_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.push_undo();
+        self.after_yank = false;
+        self.insert_text_inner(text);
+    }
+
     /// 在光标处换行（拆分当前行）。
     ///
     /// 输入: 无
@@ -426,7 +440,7 @@ impl EditorBuffer {
             return;
         };
         self.push_undo();
-        self.insert_text(&text);
+        self.insert_text_inner(&text);
         self.after_yank = true;
     }
 
@@ -444,7 +458,7 @@ impl EditorBuffer {
         let Some(text) = self.kill_ring.get(self.yank_pos).cloned() else {
             return;
         };
-        self.insert_text(&text);
+        self.insert_text_inner(&text);
         self.after_yank = true;
     }
 
@@ -496,7 +510,7 @@ impl EditorBuffer {
     }
 
     /// 无快照的多行文本插入（yank/内部用），光标停在插入末尾。
-    fn insert_text(&mut self, text: &str) {
+    fn insert_text_inner(&mut self, text: &str) {
         let mut parts = text.split('\n');
         let first = parts.next().unwrap_or("");
         self.insert_str_at_cursor(first);

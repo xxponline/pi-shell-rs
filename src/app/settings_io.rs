@@ -88,6 +88,22 @@ pub fn read_double_escape_action(path: &Path) -> DoubleEscapeAction {
         .unwrap_or(DoubleEscapeAction::Tree)
 }
 
+/// 读取 `externalEditor` 设置键（存在且非空白才返回）。
+///
+/// 输入: path — settings.json 路径
+/// 输出: Some(命令) / None（未配置）
+pub fn read_external_editor(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let Value::Object(map) = serde_json::from_str::<Value>(&text).ok()? else {
+        return None;
+    };
+    map.get("externalEditor")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
 /// 读取 `enableSkillCommands`：缺失/非法/不可解析 → true（pi 默认）。
 ///
 /// 输入: path — settings.json 路径
