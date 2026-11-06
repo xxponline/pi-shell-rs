@@ -1716,6 +1716,8 @@ impl App {
                 let query = match &kind {
                     autocomplete::CompletionKind::Command => prefix.trim_start_matches('/').to_string(),
                     autocomplete::CompletionKind::Argument(_) => prefix.clone(),
+                    // @ 文件：候选已按分数排序，预选恒为首位
+                    autocomplete::CompletionKind::AtFile => String::new(),
                 };
                 let selected = autocomplete::best_match_index(&items, &query);
                 self.completion = autocomplete::CompletionState {
@@ -1726,7 +1728,23 @@ impl App {
                     kind: Some(kind),
                 };
             }
-            None => self.completion.close(),
+            None => {
+                // `@文件` 补全（本地 readdir + 可选 fd；斜杠未命中时才尝试，
+                // 空候选/无 @ 静默关闭——spec：目录不存在不报错）
+                let base = std::env::current_dir().unwrap_or_default();
+                match autocomplete::at_suggestions(text_before, &base) {
+                    Some((prefix, items)) => {
+                        self.completion = autocomplete::CompletionState {
+                            open: true,
+                            prefix,
+                            items,
+                            selected: 0,
+                            kind: Some(autocomplete::CompletionKind::AtFile),
+                        };
+                    }
+                    None => self.completion.close(),
+                }
+            }
         }
     }
 
@@ -4450,6 +4468,65 @@ done
             app.overlay
         );
         assert!(app.editor.is_empty(), "提交后输入清空");
+        assert!(!app.completion.open);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn at_file_menu_trigger_keys_and_enter_two_stage() {
+        let (client, dir, _log) = recording_commander("atfile", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let is_at = |app: &App| {
+            matches!(app.completion.kind, Some(autocomplete::CompletionKind::AtFile))
+        };
+
+        // ① 触发：`@` 即开（repo cwd 至少含 Cargo.toml/Cargo.lock）
+        let mut app = App::new();
+        type_text(&mut app, &commander, &tx, "@Cargo");
+        assert!(app.completion.open && is_at(&app), "@应触发文件菜单: {:?}", app.completion.kind);
+        assert!(app.completion.items.iter().any(|i| i.value == "@Cargo.toml"), "{:?}", app.completion.items);
+        assert_eq!(app.completion.selected, 0, "预选首位");
+
+        // ② 续输重过滤；无命中 → 关闭（静默）
+        type_text(&mut app, &commander, &tx, ".");
+        assert!(app.completion.open && is_at(&app), "Cargo. 应仍开");
+        for ch in ['z', 'z', 'q'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &commander, &tx);
+        }
+        assert!(!app.completion.open, "零命中收起");
+        assert_eq!(app.editor.text(), "@Cargo.zzq", "输入保留");
+
+        // ③ 斜杠优先：`/resu` 是命令菜单而非 @ 文件
+        let mut app = App::new();
+        type_text(&mut app, &commander, &tx, "/resu");
+        assert!(app.completion.open && !is_at(&app), "斜杠命令优先");
+
+        // ④ 键序分流：↓ 移动选中（不入编辑器）；Esc 只关菜单（输入不变）
+        let mut app = App::new();
+        type_text(&mut app, &commander, &tx, "@Cargo");
+        assert!(app.completion.items.len() >= 2, "{:?}", app.completion.items);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &commander, &tx);
+        assert_eq!(app.completion.selected, 1, "↓ 移动选中");
+        assert_eq!(app.editor.text(), "@Cargo", "选中键不入编辑器");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &commander, &tx);
+        assert!(!app.completion.open, "Esc 只关菜单");
+        assert_eq!(app.editor.text(), "@Cargo", "Esc 不清输入");
+
+        // ⑤ Tab 应用：文件补空格、不提交
+        let mut app = App::new();
+        type_text(&mut app, &commander, &tx, "@Cargo");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &commander, &tx);
+        let text = app.editor.text();
+        assert!(text.starts_with("@Cargo.") && text.ends_with(' '), "文件尾空格: {text:?}");
+        assert!(!app.editor.is_empty(), "Tab 不提交");
+        assert!(!app.completion.open, "应用后关菜单");
+
+        // ⑥ Enter 双段：应用补全 → 立即提交（输入清空）
+        let mut app = App::new();
+        type_text(&mut app, &commander, &tx, "@Cargo");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commander, &tx);
+        assert!(app.editor.is_empty(), "Enter 应用并提交后输入清空");
         assert!(!app.completion.open);
         let _ = std::fs::remove_dir_all(&dir);
     }

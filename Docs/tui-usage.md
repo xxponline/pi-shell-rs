@@ -66,6 +66,13 @@ cargo run                       # 默认运行 TUI（default-run）
 导航、Tab 应用、**Enter 补全并立即提交**、Esc 只关菜单；`/model `/`/thinking `
 空格后有参数候选。最多 5 条，超出显示 `(i/n)` 滚动。
 
+**`@文件` 补全**：输入 `@`（或 `@"带空格路径`）即弹文件候选——基础目录前缀
+匹配 + `fd` 递归模糊（打分：文件名精确/前缀/子串、目录优先，取前 20）；
+↑↓ 选中、**Tab 应用：文件补空格、目录不补空格可继续下钻**（含空格/标点路径
+自动包 `@"…"`）、Enter 应用并提交、Esc 只关菜单；支持 `~`、`./`、绝对路径写法；
+零命中或目录不存在静默收起。`fd` 不存在时回落为基础目录候选（差异见
+`pi-tui-interaction.md`）。
+
 ## 界面布局
 
 ```
@@ -149,11 +156,12 @@ cargo run                       # 默认运行 TUI（default-run）
 - 工具卡片覆盖 read/bash/edit/write/grep/find/ls（其余走通用卡片兜底）。
 - **Alt+T 打开 thinking 列表**与 `/thinking` 斜杠命令**都可用**（两者等价，
   pi 原生只有后者）；级别循环 Shift+Tab 与 pi 一致。
-- 扩展 `editor` 弹层为终端内最小多行编辑（Enter 提交 / Alt+Enter 换行），
-  不含 pi 编辑器的 kill-ring/undo/外部 $EDITOR（Ctrl+G）等高级能力。
+- 扩展 `editor` 弹层为终端内最小多行编辑（Enter 提交 / Alt+Enter 换行）；
+  外部 $EDITOR（Ctrl+G）已由差异 #9 落地，不含 pi 编辑器的 kill-ring/undo 高级能力。
 - 选择器暂无输入即筛（fuzzy filter），靠 ↑/↓ 导航。
-- 斜杠命令 24 个全部可执行（实现/简化/桩见 `slash-commands.md`）；树内搜索/
-  标签编辑未实现；`@文件`/路径补全未实现（pi 的 fd 集成）。
+- 斜杠命令 24 个全部可执行（实现/简化/桩见 `slash-commands.md`）；树内搜索已落地
+  （`add-tree-search`），`@文件` 补全已落地（`add-at-file-completion`，fd 缺失时
+  回落基础目录候选、消息内为字面量而非 pi 附件语义）；标签编辑不做（差异 #14）。
 - 会话列表仅当前项目（pi 的 listAll 双列表未实现）。
 - **Shift+Enter / Ctrl+- 依赖 kitty 键盘协议**（启动时探测，最多 2s；不支持的
   终端上换行请用 Ctrl+J，undo 无替代键）。

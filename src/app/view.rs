@@ -906,6 +906,36 @@ mod render_tests {
     }
 
     #[test]
+    fn at_file_completion_renders_dir_suffix_and_path_desc() {
+        use crate::app::autocomplete::{CompletionItem, CompletionKind, CompletionState};
+        let comp = CompletionState {
+            open: true,
+            prefix: "@".to_string(),
+            items: vec![
+                CompletionItem {
+                    value: "@src/".to_string(),
+                    label: "src/".to_string(),
+                    description: Some("src".to_string()),
+                },
+                CompletionItem {
+                    value: "@main.rs".to_string(),
+                    label: "main.rs".to_string(),
+                    description: Some("src/main.rs".to_string()),
+                },
+            ],
+            selected: 0,
+            kind: Some(CompletionKind::AtFile),
+        };
+        let out = render_with_completion(&comp, 160, 30);
+        // 目录项带 `/` 后缀、文件项完整值、描述列显示路径
+        assert!(out.contains("@src/"), "目录后缀: {out}");
+        assert!(out.contains("@main.rs"), "文件值: {out}");
+        assert!(out.contains("src/main.rs"), "路径描述行: {out}");
+        // 菜单高度按条目数
+        assert_eq!(completion_height(&comp), 2, "两条 = 2 行");
+    }
+
+    #[test]
     fn completion_height_matches_visible_plus_count() {
         let mut comp = open_completion(0);
         assert_eq!(completion_height(&comp), 6, "24 条 = 5 可见 + 1 计数");

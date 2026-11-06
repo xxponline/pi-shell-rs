@@ -186,7 +186,9 @@ macOS 实现）。
 - ~~#6 bash 模式依赖 RPC~~ → **#6 已由 change `add-bash-command-mode` 完成**。
 - ~~其余低优先项~~ → **#9 已由 change `add-clipboard-and-external-editor` 完成**。
 - 后续分批：**树内搜索 → ✅ 已由 change `add-tree-search` 完成**（键序/分词 AND/
-  叠加/状态行，假 pi PTY 11 项验收）；**`@文件` 补全** →
-  change `add-at-file-completion`（纯 TUI 侧、零上游依赖）。
+  叠加/状态行，假 pi PTY 11 项验收）；**`@文件` 补全 → ✅ 已由
+  change `add-at-file-completion` 完成**（token 提取/打分排序/菜单接线/
+  fd 递归，假 pi PTY 10 项验收）。两项差异：① `fd` 缺失时回落基础目录候选
+  （pi 为完全无候选）；② 消息内 `@path` 为字面量入上下文（pi 会解析为附件）。
 - **明确不做**：扩展命令参数补全（需上游 RPC，违反“不入侵 pi 源码”约束）、
   树内标签编辑（差异 #14 三重排除）。
