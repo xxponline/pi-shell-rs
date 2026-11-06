@@ -185,7 +185,8 @@ macOS 实现）。
   #5 已由 `add-double-escape-action` 完成**。
 - ~~#6 bash 模式依赖 RPC~~ → **#6 已由 change `add-bash-command-mode` 完成**。
 - ~~其余低优先项~~ → **#9 已由 change `add-clipboard-and-external-editor` 完成**。
-- 后续分批：**树内搜索** → change `add-tree-search`；**`@文件` 补全** →
-  change `add-at-file-completion`（两者均纯 TUI 侧、零上游依赖）。
+- 后续分批：**树内搜索 → ✅ 已由 change `add-tree-search` 完成**（键序/分词 AND/
+  叠加/状态行，假 pi PTY 11 项验收）；**`@文件` 补全** →
+  change `add-at-file-completion`（纯 TUI 侧、零上游依赖）。
 - **明确不做**：扩展命令参数补全（需上游 RPC，违反“不入侵 pi 源码”约束）、
   树内标签编辑（差异 #14 三重排除）。

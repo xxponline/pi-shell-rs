@@ -483,6 +483,7 @@ impl App {
             cursor: 0,
             folded: std::collections::HashSet::new(),
             filter: crate::app::tree::FilterMode::Default,
+            search: String::new(),
             loading: true,
             seq,
         });
@@ -2757,6 +2758,7 @@ impl App {
                     rows,
                     folded,
                     filter,
+                    search,
                     loading,
                     seq: s,
                     ..
@@ -2777,6 +2779,7 @@ impl App {
                             leaf_id.as_deref(),
                             folded,
                             *filter,
+                            search,
                         );
                         *loading = false;
                 }

@@ -28,7 +28,7 @@ cargo run                       # 默认运行 TUI（default-run）
 完整命令表、每个命令的实现/简化/桩状态与差异原因见
 [`slash-commands.md`](./slash-commands.md)。要点：
 
-- 会话类：`/resume`（选择器+两段式删除）· `/tree`（导航/折叠/过滤/分支）·
+- 会话类：`/resume`（选择器+两段式删除）· `/tree`（导航/折叠/过滤/**即时搜索**/分支）·
   `/new` · `/clone` · `/fork` · `/session` · `/name` · `/compact`（压缩中本地排队）·
   `/quit`
 - 选择器入口：`/model [搜索]`（精确匹配直切）· `/thinking [级别]`（未知级别红条）
@@ -124,6 +124,7 @@ cargo run                       # 默认运行 TUI（default-run）
 | Ctrl+T | 切换 thinking 块展开/折叠（默认折叠为单行占位） |
 | /resume·/tree 内 ctrl+d | 会话两段式删除（再按一次确认；拒绝删除活跃会话） |
 | /tree 内 ctrl+o / ←→ | 过滤模式循环 / 折叠展开子树 |
+| /tree 内直接键入 | **即时搜索**：可打印字符入查询（空白分词、全部命中、大小写不敏感子串）；backspace 删字符；Esc 先清查询（面板保持）再按才关；标题区显示 `filter:… · search:"…" (n 命中)`，零命中黄字提示；搜索与过滤/折叠正交叠加 |
 | Ctrl+O | 切换工具卡片输出展开/折叠（默认显示头行+前 3 行） |
 | Ctrl+L | 打开模型选择器（↑/↓ 导航，Enter 应用，Esc 取消） |
 | Ctrl+P / Shift+Ctrl+P | 循环切换模型（下一个 / 上一个） |

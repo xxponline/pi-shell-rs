@@ -58,6 +58,8 @@ pub enum Overlay {
         cursor: usize,
         folded: std::collections::HashSet<String>,
         filter: crate::app::tree::FilterMode,
+        /// 搜索查询（空白分词；空串 = 不过滤）。
+        search: String,
         loading: bool,
         seq: u64,
     },
@@ -186,6 +188,7 @@ pub fn overlay_key(o: &mut Overlay, key: KeyEvent) -> OverlayOutcome {
             cursor,
             folded,
             filter,
+            search,
             loading,
             ..
         } => {
@@ -199,8 +202,10 @@ pub fn overlay_key(o: &mut Overlay, key: KeyEvent) -> OverlayOutcome {
                            leaf: &Option<String>,
                            folded: &std::collections::HashSet<String>,
                            filter: crate::app::tree::FilterMode,
+                           search: &str,
                            rows: &mut Vec<crate::app::tree::TreeRow>| {
-                *rows = crate::app::tree::flatten_tree(tree, leaf.as_deref(), folded, filter);
+                *rows =
+                    crate::app::tree::flatten_tree(tree, leaf.as_deref(), folded, filter, search);
             };
             match key.code {
                 KeyCode::Up => {
@@ -217,7 +222,7 @@ pub fn overlay_key(o: &mut Overlay, key: KeyEvent) -> OverlayOutcome {
                 // ctrl+o：过滤模式循环
                 KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     *filter = filter.next();
-                    rebuild(tree, leaf_id, folded, *filter, rows);
+                    rebuild(tree, leaf_id, folded, *filter, search, rows);
                     OverlayOutcome::Handled
                 }
                 // ← 折叠选中子树；→ 展开
@@ -226,7 +231,7 @@ pub fn overlay_key(o: &mut Overlay, key: KeyEvent) -> OverlayOutcome {
                         && row.has_children
                     {
                         folded.insert(row.id.clone());
-                        rebuild(tree, leaf_id, folded, *filter, rows);
+                        rebuild(tree, leaf_id, folded, *filter, search, rows);
                         if *cursor >= rows.len() {
                             *cursor = rows.len().saturating_sub(1);
                         }
@@ -237,11 +242,40 @@ pub fn overlay_key(o: &mut Overlay, key: KeyEvent) -> OverlayOutcome {
                     if let Some(row) = rows.get(*cursor)
                         && folded.remove(&row.id)
                     {
-                        rebuild(tree, leaf_id, folded, *filter, rows);
+                        rebuild(tree, leaf_id, folded, *filter, search, rows);
                     }
                     OverlayOutcome::Handled
                 }
-                KeyCode::Esc => OverlayOutcome::Close { reply: None },
+                // 搜索：Esc 先清空查询（面板/选择保持），查询已空才关闭
+                KeyCode::Esc => {
+                    if search.is_empty() {
+                        OverlayOutcome::Close { reply: None }
+                    } else {
+                        let prev_id = rows.get(*cursor).map(|r| r.id.clone());
+                        search.clear();
+                        rebuild(tree, leaf_id, folded, *filter, search, rows);
+                        crate::app::tree::keep_cursor(rows, cursor, prev_id.as_deref());
+                        OverlayOutcome::Handled
+                    }
+                }
+                // 搜索：Backspace 删查询末字符
+                KeyCode::Backspace if !search.is_empty() => {
+                    let prev_id = rows.get(*cursor).map(|r| r.id.clone());
+                    search.pop();
+                    rebuild(tree, leaf_id, folded, *filter, search, rows);
+                    crate::app::tree::keep_cursor(rows, cursor, prev_id.as_deref());
+                    OverlayOutcome::Handled
+                }
+                // 搜索：无修饰可打印字符直接进查询（ctrl+o 等已在此前分流）
+                KeyCode::Char(c)
+                    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                {
+                    let prev_id = rows.get(*cursor).map(|r| r.id.clone());
+                    search.push(c);
+                    rebuild(tree, leaf_id, folded, *filter, search, rows);
+                    crate::app::tree::keep_cursor(rows, cursor, prev_id.as_deref());
+                    OverlayOutcome::Handled
+                }
                 _ => OverlayOutcome::Handled,
             }
         }
@@ -676,17 +710,26 @@ pub fn render_overlay(frame: &mut Frame, overlay: &Overlay, current_session: Opt
             rows,
             cursor,
             filter,
+            search,
             loading,
             ..
         } => {
-            let title = format!(
-                " Tree (filter:{}) Enter=分支 ←=折叠 →=展开 ",
-                filter.label()
-            );
+            // search 段紧跟 filter（靠前显示，避免标题过长被尾部截断）
+            let mut title = format!(" Tree (filter:{}) ", filter.label());
+            if !search.is_empty() {
+                title.push_str(&format!("· search:\"{search}\" ({} 命中) ", rows.len()));
+            }
+            title.push_str("Enter=分支 ←=折叠 →=展开 ");
             let lines: Vec<Line> = if *loading {
                 vec![Line::from(Span::styled(
                     "loading…",
                     Style::default().fg(Color::DarkGray),
+                ))]
+            } else if rows.is_empty() && !search.is_empty() {
+                // 零命中：黄字提示（查询保留在标题，backspace 逐字恢复）
+                vec![Line::from(Span::styled(
+                    "无匹配 — backspace 逐字恢复，清空后显示全部",
+                    Style::default().fg(Color::Yellow),
                 ))]
             } else if rows.is_empty() {
                 vec![Line::from(Span::styled(
@@ -732,7 +775,8 @@ pub fn render_overlay(frame: &mut Frame, overlay: &Overlay, current_session: Opt
                     })
                     .collect()
             };
-            draw_list(frame, area, &title, lines, rows.len().min(16) as u16 + 2);
+            let lines_len = lines.len();
+            draw_list(frame, area, &title, lines, lines_len.min(16) as u16 + 2);
         }
         Overlay::ImportConfirm { path, cursor } => {
             let name = std::path::Path::new(path)
@@ -1566,6 +1610,63 @@ mod tests {
     }
 
     #[test]
+    fn tree_search_status_line_renders() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::collections::HashSet;
+        let tree: Vec<serde_json::Value> = vec![serde_json::json!({
+            "entry": {"type":"message","id":"root","parentId":null,
+                "message":{"role":"user","content":[{"type":"text","text":"hello world"}]}},
+            "children": []
+        })];
+        let mk = |search: &str| Overlay::Tree {
+            tree: tree.clone(),
+            leaf_id: Some("root".to_string()),
+            rows: crate::app::tree::flatten_tree(&tree, Some("root"), &HashSet::new(),
+                crate::app::tree::FilterMode::Default, search),
+            cursor: 0,
+            folded: HashSet::new(),
+            filter: crate::app::tree::FilterMode::Default,
+            search: search.to_string(),
+            loading: false,
+            seq: 1,
+        };
+        let draw = |o: &Overlay| -> String {
+            let backend = TestBackend::new(160, 30);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| render_overlay(f, o, None)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let mut out = String::new();
+            for y in 0..buffer.area.height {
+                for x in 0..buffer.area.width {
+                    out.push_str(buffer[(x, y)].symbol());
+                }
+                out.push('\n');
+            }
+            out
+        };
+        // 有命中：标题区展示查询与命中数
+        // 宽字符在 TestBackend 中占两格（后格为空格），断言前去空白归一
+        let flat = |o: &str| -> String { o.chars().filter(|c| !c.is_whitespace()).collect() };
+        let out = draw(&mk("hello"));
+        let f = flat(&out);
+        assert!(f.contains("filter:default"), "过滤模式可见: {out}");
+        assert!(f.contains("search:\"hello\""), "查询可见: {out}");
+        assert!(f.contains("(1命中)"), "命中数可见: {out}");
+        // 零命中：黄字提示 + 查询保留在标题
+        let out = draw(&mk("no-such-thing"));
+        let f = flat(&out);
+        assert!(f.contains("无匹配"), "零命中提示: {out}");
+        assert!(f.contains("search:\"no-such-thing\""), "查询保留: {out}");
+        assert!(!f.contains("(空树)"), "零命中不是空树态");
+        // 空查询：无 search 片段
+        let out = draw(&mk(""));
+        let f = flat(&out);
+        assert!(!f.contains("search:"), "空查询不显示: {out}");
+        assert!(f.contains("helloworld"), "全量行可见: {out}");
+    }
+
+    #[test]
     fn session_select_keys_and_two_stage_delete() {
         use crate::app::sessions::SessionItem;
         use std::path::PathBuf;
@@ -1639,6 +1740,87 @@ mod tests {
     }
 
     #[test]
+    fn tree_search_keys_three_states() {
+        use crate::app::tree::FilterMode;
+        use std::collections::HashSet;
+        let tree: Vec<serde_json::Value> = vec![serde_json::json!({
+            "entry": {"type":"message","id":"root","parentId":null,
+                "message":{"role":"user","content":[{"type":"text","text":"question"}]}},
+            "children": [
+                {"entry":{"type":"message","id":"a1","parentId":"root",
+                    "message":{"role":"assistant","content":[{"type":"text","text":"answer"}]}},
+                 "children":[]},
+                {"entry":{"type":"message","id":"b1","parentId":"root",
+                    "message":{"role":"user","content":[{"type":"text","text":"xyz"}]}},
+                 "children":[]}
+            ]
+        })];
+        let mk = || Overlay::Tree {
+            tree: tree.clone(),
+            leaf_id: Some("b1".to_string()),
+            rows: crate::app::tree::flatten_tree(&tree, Some("b1"), &HashSet::new(), FilterMode::Default, ""),
+            cursor: 0,
+            folded: HashSet::new(),
+            filter: FilterMode::Default,
+            search: String::new(),
+            loading: false,
+            seq: 1,
+        };
+        let ids_of = |o: &Overlay| -> Vec<String> {
+            match o { Overlay::Tree { rows, .. } => rows.iter().map(|r| r.id.clone()).collect(), _ => unreachable!() }
+        };
+        let search_of = |o: &Overlay| -> String {
+            match o { Overlay::Tree { search, .. } => search.clone(), _ => unreachable!() }
+        };
+
+        // ① 输入即搜：'a' → 只剩 a1
+        let mut o = mk();
+        assert_eq!(overlay_key(&mut o, key(KeyCode::Char('a'))), OverlayOutcome::Handled);
+        assert_eq!(search_of(&o), "a");
+        assert_eq!(ids_of(&o), vec!["a1"], "输入即搜");
+
+        // ② 空结果安全 + Backspace 逐字恢复
+        assert_eq!(overlay_key(&mut o, key(KeyCode::Char('z'))), OverlayOutcome::Handled); // "az" 零命中
+        assert!(ids_of(&o).is_empty(), "零命中空列表");
+        match &o { Overlay::Tree { cursor, .. } => assert_eq!(*cursor, 0, "空表光标安全"), _ => unreachable!() }
+        overlay_key(&mut o, key(KeyCode::Backspace));
+        assert_eq!(search_of(&o), "a", "删一字符");
+        overlay_key(&mut o, key(KeyCode::Backspace));
+        assert_eq!(search_of(&o), "", "查询清空");
+        assert_eq!(ids_of(&o).len(), 3, "恢复全量");
+
+        // ③ 修饰键：shift 字符入查询；alt/ctrl 字符不入（ctrl+o 走过滤）
+        let mut o = mk();
+        overlay_key(&mut o, KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT));
+        assert_eq!(search_of(&o), "A", "shift 字符入查询（匹配大小写不敏感）");
+        assert_eq!(ids_of(&o), vec!["a1"]);
+        overlay_key(&mut o, KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT));
+        assert_eq!(search_of(&o), "A", "alt 字符不入查询");
+        overlay_key(&mut o, KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        match &o { Overlay::Tree { filter, search, .. } => {
+            assert_eq!(*filter, FilterMode::NoTools, "ctrl+o 照常循环过滤");
+            assert_eq!(search, "A", "ctrl+o 不污染查询");
+        }, _ => unreachable!() }
+
+        // ④ 搜索态下导航可用：user 查询命中 root/b1，↓ 移动选择
+        let mut o = mk();
+        for ch in ['u','s','e','r'] { overlay_key(&mut o, key(KeyCode::Char(ch))); }
+        assert_eq!(ids_of(&o), vec!["root", "b1"], "user 命中两条");
+        overlay_key(&mut o, key(KeyCode::Down));
+        match &o { Overlay::Tree { cursor, .. } => assert_eq!(*cursor, 1), _ => unreachable!() }
+        assert_eq!(overlay_key(&mut o, key(KeyCode::Enter)), OverlayOutcome::Apply(1), "回车仍可 fork");
+
+        // ⑤ Esc 优先级：查询非空 → 先清（面板保持）；已空 → 关闭
+        let mut o = mk();
+        for ch in ['q','u'] { overlay_key(&mut o, key(KeyCode::Char(ch))); }
+        assert_eq!(search_of(&o), "qu");
+        assert_eq!(overlay_key(&mut o, key(KeyCode::Esc)), OverlayOutcome::Handled, "清查询不关面板");
+        assert_eq!(search_of(&o), "");
+        assert_eq!(ids_of(&o).len(), 3, "清空后全量恢复");
+        assert_eq!(overlay_key(&mut o, key(KeyCode::Esc)), OverlayOutcome::Close { reply: None }, "再按才关闭");
+    }
+
+    #[test]
     fn tree_keys_nav_filter_fold_and_fork() {
         use crate::app::tree::FilterMode;
         use std::collections::HashSet;
@@ -1658,10 +1840,11 @@ mod tests {
         let mk = |filter: FilterMode| Overlay::Tree {
             tree: tree.clone(),
             leaf_id: Some("b1".to_string()),
-            rows: crate::app::tree::flatten_tree(&tree, Some("b1"), &HashSet::new(), filter),
+            rows: crate::app::tree::flatten_tree(&tree, Some("b1"), &HashSet::new(), filter, ""),
             cursor: 0,
             folded: HashSet::new(),
             filter,
+            search: String::new(),
             loading: false,
             seq: 1,
         };
