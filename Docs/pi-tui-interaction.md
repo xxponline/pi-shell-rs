@@ -109,8 +109,9 @@ ctrl+v (paste)    → macOS 粘贴文件 / 图片 / 文本
 | alt+up | 取回队列 | ctrl+v | 粘贴文件/图片 |
 | ctrl+n | 会话命名过滤 | | |
 
-**会话树内**（弹层上下文，同名键复用）：ctrl+p/s/d/r、shift+l/t、
+**会话树内**（弹层上下文，同名键复用）：ctrl+p/s/d/r、
 ctrl+a/t/u/l/o、shift+ctrl+o、alt+left/right（折叠/展开）。
+其中 pi 的 **shift+l（编辑标签）/ shift+t（标签时间戳）不做**，原因见差异表 #14。
 
 **Windows/Linux 差异**：模型循环上一个=alt+p、followUp=ctrl+q、dequeue=alt+q、
 paste=alt+v、undo=ctrl+z、search=ctrl+f 等（`windowsKeybindings` 分支；本项目仅按
@@ -165,6 +166,7 @@ macOS 实现）。
 | 11 | 扩展快捷键最高优先级 | 未实现 | 低 |
 | 12 | 选择列表分页（pageUp/Down）、历史键可覆盖 | 选择器仅 ↑↓ | 低 |
 | 13 | Windows 键位分支 | 仅 macOS | 忽略（个人项目） |
+| 14 | **树内标签编辑**（shift+L 改消息 label） | **不做**：三重排除——① 消息 label 只能经扩展 API 写入，**RPC 无写 label 方法**，不加新 RPC 就无法落地；② pi 自身的 `app.tree.editLabel` 键位是**未接线的死键**（`TreeSelector.onLabelEdit` 回调从未被 interactive-mode 传入），无既有行为可对齐；③ 会话显示名编辑已由 `/name`（现有 `set_session_name` RPC）覆盖 | 忽略（约束排除） |
 
 ## 6. 已实现且对齐的部分
 
@@ -182,5 +184,8 @@ macOS 实现）。
 - ~~差异 #5、#7 依赖 4b~~ → **#7 已由 `add-remaining-slash-commands`、
   #5 已由 `add-double-escape-action` 完成**。
 - ~~#6 bash 模式依赖 RPC~~ → **#6 已由 change `add-bash-command-mode` 完成**。
-- ~~其余低优先项~~ → **#9 已由 change `add-clipboard-and-external-editor` 完成**；
-  仍后置：树内搜索/标签编辑、`@文件` 补全、扩展命令参数补全（需上游 RPC）。
+- ~~其余低优先项~~ → **#9 已由 change `add-clipboard-and-external-editor` 完成**。
+- 后续分批：**树内搜索** → change `add-tree-search`；**`@文件` 补全** →
+  change `add-at-file-completion`（两者均纯 TUI 侧、零上游依赖）。
+- **明确不做**：扩展命令参数补全（需上游 RPC，违反“不入侵 pi 源码”约束）、
+  树内标签编辑（差异 #14 三重排除）。
