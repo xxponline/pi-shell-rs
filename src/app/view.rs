@@ -10,6 +10,7 @@ use pi_shell_rs::session::{Phase, SessionState, Usage};
 
 use crate::app::chat::{chat_lines, RenderFlags};
 use crate::app::wrap::wrap_for_viewport;
+use unicode_width::UnicodeWidthChar;
 
 /// 一帧所需的全部 UI 附加输入（与会话状态解耦，便于测试构造）。
 #[derive(Default)]
@@ -18,7 +19,8 @@ pub struct ViewUi<'a> {
     pub input: &'a str,
     /// 输入框逻辑行数（决定动态高度）。
     pub input_lines: usize,
-    /// 输入框光标（行, 列）；None 表示隐藏（如浮层打开时）。
+    /// 输入框光标（行, 字符序号列；显示格列在渲染层按 unicode-width 换算）；
+    /// None 表示隐藏（如浮层打开时）。
     pub input_cursor: Option<(usize, usize)>,
     /// 瞬时提示与颜色。
     pub notice: Option<(&'a str, Color)>,
@@ -335,6 +337,40 @@ fn render_completion(frame: &mut Frame, area: ratatui::layout::Rect, comp: &crat
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+/// 按显示列跳过并截取一行文本（宽字符不切断）。
+///
+/// 输入: line — 源行（不含换行）；skip_w — 起始显示列偏移（格）；
+///       take_w — 最多保留的显示格数
+/// 输出: (片段, 片段实际起始显示列)。跳过仅丢弃"整字结束列 ≤ skip_w"的
+///       字符，跨偏移点的宽字符整字保留（起始列可能小于 skip_w）；截取按
+///       累计显示宽 ≤ take_w 停止，不会留下半个宽字符；纯 ASCII 下退化为
+///       原来的 skip/take 字符数语义
+fn slice_display(line: &str, skip_w: usize, take_w: usize) -> (String, usize) {
+    let mut out = String::new();
+    let mut start = 0usize; // 片段实际起始显示列（跨偏移宽字符时 < skip_w）
+    let mut pos = 0usize; // 当前字符起始显示列
+    let mut taken = 0usize; // 已保留的显示宽
+    let mut started = false;
+    for ch in line.chars() {
+        let w = ch.width().unwrap_or(0).max(1);
+        if !started {
+            if pos + w <= skip_w {
+                pos += w;
+                continue;
+            }
+            started = true;
+            start = pos;
+        }
+        if taken + w > take_w {
+            break;
+        }
+        taken += w;
+        out.push(ch);
+        pos += w;
+    }
+    (out, start)
+}
+
 /// 渲染输入框：多行文本 + 滚动偏移（保证光标可见）+ 终端光标定位。
 ///
 /// 输入: frame — ratatui 帧；area — 输入框区域；ui — 视图输入（文本/行数/光标）；
@@ -361,19 +397,29 @@ fn render_editor(frame: &mut Frame, area: ratatui::layout::Rect, ui: &ViewUi<'_>
     let inner_h = area.height.saturating_sub(2) as usize;
     let (cur_row, cur_col) = ui.input_cursor.unwrap_or((0, 0));
     let row_off = (cur_row + 1).saturating_sub(inner_h);
-    let col_off = (cur_col + 1).saturating_sub(inner_w);
+    // 光标行前缀的显示宽（字符序号 → 格数：全角/emoji 计 2），
+    // 滚动偏移与光标定位均按显示列，而非字符序号（宽字符行否则光标左偏）
+    let cursor_line = ui.input.split('\n').nth(cur_row).unwrap_or("");
+    let prefix_w: usize = cursor_line
+        .chars()
+        .take(cur_col)
+        .map(|c| c.width().unwrap_or(0).max(1))
+        .sum();
+    let col_off = (prefix_w + 1).saturating_sub(inner_w);
     let visible: Vec<Line> = ui
         .input
         .split('\n')
         .skip(row_off)
         .take(inner_h.max(1))
-        .map(|l| Line::from(l.chars().skip(col_off).take(inner_w).collect::<String>()))
+        .map(|l| Line::from(slice_display(l, col_off, inner_w).0))
         .collect();
     frame.render_widget(Paragraph::new(visible).block(block), area);
 
     // 终端光标定位（浮层打开时 input_cursor=None → 不设置）
     if ui.input_cursor.is_some() && inner_w > 0 && area.height >= 2 {
-        let cx = area.x + 1 + (cur_col.saturating_sub(col_off)) as u16;
+        // 格列 = 前缀显示宽 − 实际滚动起始列（跨偏移宽字符整字保留时起始列前移）
+        let start_w = slice_display(cursor_line, col_off, inner_w).1;
+        let cx = area.x + 1 + (prefix_w.saturating_sub(start_w)) as u16;
         let cy = area.y + 1 + (cur_row.saturating_sub(row_off)) as u16;
         frame.set_cursor_position((cx.min(area.x + area.width - 2), cy));
     }
@@ -739,6 +785,46 @@ mod render_tests {
         assert!(long.contains("HELLO-MARKER"), "消息区仍可见: {long}");
         assert_eq!(input_title_row(&long), 22, "20 行输入 → 高度 8");
         assert!(long.contains("L19"), "末行渲染: {long}");
+    }
+
+    /// 宽字符行：光标按显示列定位（字符序号会左偏 3 格）。
+    #[test]
+    fn wide_char_cursor_uses_display_columns() {
+        let state = SessionState::new();
+        let input = "你好😊hahah"; // 8 字符, 显示宽 11 (2+2+2+1+1+1+1+1)
+        assert_eq!(input.chars().count(), 8);
+        let (_, (cx, _)) = render_with_input(&state, input, 1, Some((0, 8)), 60, 30);
+        assert_eq!(cx, 12, "光标应按显示列 1+11 定位, 而非字符序号 1+8=9");
+    }
+
+    /// 宽字符长行：水平滚动按显示列，行尾光标与行尾文本仍可见。
+    #[test]
+    fn wide_char_line_scrolls_by_display_columns() {
+        let state = SessionState::new();
+        let line = "汉".repeat(40); // 80 格 > inner_w (30-2=28)
+        let input = format!("{line}END");
+        let n = input.chars().count();
+        let (buf, (cx, _)) = render_with_input(&state, &input, 1, Some((0, n)), 30, 10);
+        assert!((1..=28).contains(&cx), "行尾光标应在输入区内: {cx}");
+        assert!(buf.contains("END"), "行尾文本应因水平偏移可见: {buf}");
+    }
+
+    /// slice_display：宽字符不切断、跨偏移整字保留、ASCII 退化为原语义。
+    #[test]
+    fn slice_display_keeps_wide_chars_intact() {
+        // 跨偏移的宽字符整字保留（实际起始列前移）
+        let (s, start) = slice_display("a汉b", 2, 10);
+        assert_eq!(s, "汉b");
+        assert_eq!(start, 1, "跨偏移宽字符整字保留 → 实际起始列 1");
+        // 截取按显示宽停止，不留半个宽字符
+        let (s2, _) = slice_display("汉b", 0, 2);
+        assert_eq!(s2, "汉");
+        let (s3, _) = slice_display("汉b", 0, 1);
+        assert_eq!(s3, "", "1 格放不下 2 格宽字符 → 空，不切半");
+        // 纯 ASCII 退化为原 skip/take 字符数语义
+        let (s4, start4) = slice_display("abcdef", 2, 3);
+        assert_eq!(s4, "cde");
+        assert_eq!(start4, 2);
     }
 
     #[test]
