@@ -137,6 +137,15 @@ pub struct App {
     state_slot: Option<Arc<RwLock<SessionState>>>,
 }
 
+/// 默认构造：等价 [`App::new`]。
+///
+/// 输入: 无；输出: 与 `App::new()` 相同的空闲态 App
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl App {
     /// 创建应用状态。
     ///
@@ -390,7 +399,7 @@ impl App {
                     self.should_quit = true;
                 }
                 Ok(UiEvent::Resize) => {
-                    // 尺寸已由宿主写入共享槽；draw 内 autoresize 生效。
+                    // embed: 宿主已写共享槽；standalone: draw 内 autoresize 经 ioctl 取新尺寸。
                     self.draw(terminal)?;
                 }
                 // Idle timeout: no state changed, so no repaint.
@@ -3000,10 +3009,10 @@ impl App {
         io::Error: From<B::Error>,
     {
         // 嵌入模式：把最新状态发布给宿主只读句柄（仅状态变更帧触发）。
-        if let Some(slot) = &self.state_slot {
-            if let Ok(mut guard) = slot.write() {
-                *guard = self.state.clone();
-            }
+        if let Some(slot) = &self.state_slot
+            && let Ok(mut guard) = slot.write()
+        {
+            *guard = self.state.clone();
         }
         let input_text = self.editor.text();
         let ui = view::ViewUi {

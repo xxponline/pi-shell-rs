@@ -21,7 +21,9 @@ pub enum UiEvent {
     Closed,
     /// 宿主请求关闭（embed shutdown）：退出事件循环，线程侧杀 pi 子进程。
     Shutdown,
-    /// 宿主调整了终端尺寸：重绘以触发 autoresize（尺寸已写入共享槽）。
+    /// 终端尺寸改变：重绘以触发 ratatui autoresize。
+    /// embed：宿主写共享槽后注入；standalone：SIGWINCH → crossterm Resize 转发，
+    /// draw 时经 ioctl 取新尺寸。
     Resize,
     /// A detached command send reported failure.
     SendFailed(String),
@@ -125,12 +127,14 @@ pub fn spawn_event_sources(
                     continue;
                 }
                 match ct_event::read() {
-                    Ok(ct_event::Event::Key(key)) => {
-                        if thread_key_tx.send(UiEvent::Key(key)).is_err() {
+                    Ok(ev) => {
+                        // Resize 必须转发（否则改终端尺寸后不重绘）；鼠标等 stage 2 忽略
+                        if let Some(ui_ev) = ui_event_from_crossterm(ev)
+                            && thread_key_tx.send(ui_ev).is_err()
+                        {
                             break;
                         }
                     }
-                    Ok(_) => {} // mouse/resize ignored in stage 2
                     Err(_) => break,
                 }
             }
@@ -171,5 +175,59 @@ pub fn spawn_event_sources(
         events: rx,
         report: tx.clone(),
         keys: key_tx,
+    }
+}
+
+/// 把 crossterm 原始事件翻译成 [`UiEvent`]；不关心的事件返回 `None`。
+///
+/// 输入: ev — 键盘线程 `poll`/`read` 得到的 crossterm 事件
+/// 输出: Key → `UiEvent::Key`；Resize → `UiEvent::Resize`（触发重绘，
+///       autoresize 在 draw 时取新尺寸）；鼠标等 stage 2 忽略项 → `None`
+fn ui_event_from_crossterm(ev: ct_event::Event) -> Option<UiEvent> {
+    match ev {
+        ct_event::Event::Key(key) => Some(UiEvent::Key(key)),
+        ct_event::Event::Resize(..) => Some(UiEvent::Resize),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// 键盘事件原样透传。
+    /// 输入: crossterm Key 事件；输出: 等价的 UiEvent::Key
+    #[test]
+    fn key_event_passes_through() {
+        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert!(matches!(
+            ui_event_from_crossterm(ct_event::Event::Key(key)),
+            Some(UiEvent::Key(_))
+        ));
+    }
+
+    /// 终端 resize 必须转成 UiEvent::Resize（否则改尺寸后不重绘）。
+    /// 输入: crossterm Resize 事件；输出: UiEvent::Resize
+    #[test]
+    fn resize_event_becomes_ui_resize() {
+        assert!(matches!(
+            ui_event_from_crossterm(ct_event::Event::Resize(120, 40)),
+            Some(UiEvent::Resize)
+        ));
+    }
+
+    /// 鼠标等 stage 2 忽略项返回 None（不进事件通道）。
+    /// 输入: crossterm Mouse 事件；输出: None
+    #[test]
+    fn mouse_event_is_ignored() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(ui_event_from_crossterm(ct_event::Event::Mouse(mouse)).is_none());
     }
 }

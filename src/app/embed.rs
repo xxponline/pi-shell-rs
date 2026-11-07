@@ -176,10 +176,10 @@ impl EmbeddedApp {
     /// 幂等。
     pub fn shutdown(&self) {
         let _ = self.keys.send(UiEvent::Shutdown);
-        if let Ok(mut guard) = self.thread.lock() {
-            if let Some(handle) = guard.take() {
-                let _ = handle.join();
-            }
+        if let Ok(mut guard) = self.thread.lock()
+            && let Some(handle) = guard.take()
+        {
+            let _ = handle.join();
         }
     }
 }
