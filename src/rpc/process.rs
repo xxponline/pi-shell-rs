@@ -46,8 +46,19 @@ pub fn resolve_binary() -> String {
 }
 
 impl Transport {
-    /// Spawn `<bin> --mode rpc` with piped stdio.
+    /// Spawn `<bin> --mode rpc` with piped stdio (child inherits this
+    /// process's working directory).
     pub fn spawn_rpc(binary: &str, extra_args: &[String]) -> std::io::Result<Self> {
+        Self::spawn_rpc_in(binary, extra_args, None)
+    }
+
+    /// Same as [`spawn_rpc`] with an explicit working directory for the
+    /// child (embed mode: the session's workspace path).
+    pub fn spawn_rpc_in(
+        binary: &str,
+        extra_args: &[String],
+        cwd: Option<&std::path::Path>,
+    ) -> std::io::Result<Self> {
         let mut cmd = Command::new(binary);
         cmd.arg("--mode")
             .arg("rpc")
@@ -55,6 +66,9 @@ impl Transport {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(cwd) = cwd {
+            cmd.current_dir(cwd);
+        }
 
         let mut child = cmd.spawn().map_err(|e| {
             std::io::Error::new(

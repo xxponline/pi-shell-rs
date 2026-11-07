@@ -72,6 +72,8 @@ enum PumpMessage {
     Command(Waiter),
     /// Send an already-built JSON line and do not expect id routing.
     Raw(String),
+    /// Kill the child process and stop the pump (session shutdown).
+    Shutdown,
 }
 
 struct Waiter {
@@ -97,8 +99,25 @@ impl RpcClient {
     /// Spawn pi and return a client. `extra_args` is forwarded to the transport
     /// (e.g. `-e <extension>` pairs).
     pub fn spawn(binary: &str, extra_args: &[String]) -> std::io::Result<Self> {
-        let transport = Transport::spawn_rpc(binary, extra_args)?;
+        Self::spawn_in(binary, extra_args, None)
+    }
+
+    /// Spawn with an explicit working directory for the pi child (embed mode:
+    /// the session's workspace path, spec: Sidebar session creation).
+    pub fn spawn_in(
+        binary: &str,
+        extra_args: &[String],
+        cwd: Option<&std::path::Path>,
+    ) -> std::io::Result<Self> {
+        let transport = Transport::spawn_rpc_in(binary, extra_args, cwd)?;
         Ok(Self::from_transport(transport))
+    }
+
+    /// Kill the pi child process and stop the pump thread (session close,
+    /// spec: Manual session close). Subsequent commands fail and the events
+    /// channel closes.
+    pub fn shutdown(&self) {
+        let _ = self.to_pump.send(PumpMessage::Shutdown);
     }
 
     /// Wrap an existing transport (used by tests with fake pi processes).
@@ -200,7 +219,7 @@ impl CommandSender {
 }
 
 fn pump(
-    transport: Transport,
+    mut transport: Transport,
     event_tx: Sender<ClientEvent>,
     from_caller: Receiver<PumpMessage>,
 ) {
@@ -216,6 +235,10 @@ fn pump(
                         // transport writer gone; nothing to target, loop will
                         // observe StdoutClosed soon.
                     }
+                }
+                PumpMessage::Shutdown => {
+                    transport.shutdown();
+                    return;
                 }
                 PumpMessage::Command(w) => {
                     let id = w
