@@ -74,6 +74,17 @@ pub fn resume_from_child() {
     let _ = crossterm::execute!(io::stdout(), crossterm::cursor::Hide);
 }
 
+/// 嵌入模式的终端副作用出口（窗口标题、剪贴板）。回调可选；缺省时
+/// standalone 路径落回真实终端（SetTitle / OSC52）。宿主（GUI）在嵌入
+/// 时注入回调，把副作用接到自己的窗口标题栏/系统剪贴板上。
+#[derive(Default)]
+pub struct TerminalSinks {
+    /// 窗口标题回调（`setTitle` 扩展方法）。
+    pub set_title: Option<Box<dyn Fn(String) + Send>>,
+    /// 剪贴板文本回调（`/copy` 等；替代 OSC52 写 stdout）。
+    pub copy_text: Option<Box<dyn Fn(String) + Send>>,
+}
+
 pub struct TerminalGuard {
     raw_enabled: bool,
 }
@@ -103,6 +114,15 @@ impl TerminalGuard {
         Ok(Self {
             raw_enabled: true,
         })
+    }
+
+    /// 嵌入模式入口：宿主进程不提供 tty（如 GUI 内嵌），跳过 raw-mode /
+    /// kitty 键盘增强推送 / alt-screen，不安装 panic hook（由宿主接管）。
+    ///
+    /// 输入: 无
+    /// 输出: Ok(TerminalGuard)（`raw_enabled=false`，Drop/restore 均为无操作）
+    pub fn enter_embedded() -> io::Result<Self> {
+        Ok(Self { raw_enabled: false })
     }
 
     /// Hand ownership of the screen to ratatui (enters alternate screen).
@@ -179,5 +199,44 @@ mod gate_tests {
         assert!(!keyboard_paused());
         // suspend/resume 不改闸门语义（由调用方管理）
         assert!(!keyboard_paused());
+    }
+}
+
+#[cfg(test)]
+mod sink_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn embedded_guard_skips_tty() {
+        // 嵌入模式不触碰真实终端；drop/restore 均应为无操作
+        let g = TerminalGuard::enter_embedded().unwrap();
+        drop(g);
+    }
+
+    #[test]
+    fn title_sink_replaces_stdout() {
+        let mut app = crate::app::App::new();
+        let got = Arc::new(Mutex::new(String::new()));
+        let g = got.clone();
+        app.set_terminal_sinks(TerminalSinks {
+            set_title: Some(Box::new(move |t| *g.lock().unwrap() = t)),
+            ..Default::default()
+        });
+        app.emit_title("hi".into());
+        assert_eq!(*got.lock().unwrap(), "hi");
+    }
+
+    #[test]
+    fn clipboard_sink_replaces_osc52() {
+        let mut app = crate::app::App::new();
+        let got = Arc::new(Mutex::new(String::new()));
+        let g = got.clone();
+        app.set_terminal_sinks(TerminalSinks {
+            copy_text: Some(Box::new(move |t| *g.lock().unwrap() = t)),
+            ..Default::default()
+        });
+        app.emit_clipboard("abc");
+        assert_eq!(*got.lock().unwrap(), "abc");
     }
 }

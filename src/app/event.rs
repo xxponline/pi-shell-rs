@@ -19,6 +19,10 @@ pub enum UiEvent {
     ParseError(String),
     /// pi closed stdout.
     Closed,
+    /// 宿主请求关闭（embed shutdown）：退出事件循环，线程侧杀 pi 子进程。
+    Shutdown,
+    /// 宿主调整了终端尺寸：重绘以触发 autoresize（尺寸已写入共享槽）。
+    Resize,
     /// A detached command send reported failure.
     SendFailed(String),
     /// `clear_queue` 的返回数据（alt+up 取回排队消息，主线程回填输入框）。
@@ -80,16 +84,32 @@ pub enum AsyncKind {
     ExportDone,
 }
 
-/// Spawn the keyboard + RPC reader threads. Returns the receiving end and a
-/// sender handle used by detached command threads to report failures.
+/// 事件源句柄：主循环消费端 + 上报端 + 键注入端。
+///
+/// - `events`: 主循环 `recv_timeout` 消费的事件流（键盘线程与 RPC 线程共用）
+/// - `report`: detached 命令线程回报失败用
+/// - `keys`: `UiEvent::Key` 注入入口——嵌入模式下宿主（GUI）经此送键，
+///   crossterm poll 线程不启动（design D3）
+pub struct EventSources {
+    pub events: Receiver<UiEvent>,
+    pub report: Sender<UiEvent>,
+    pub keys: Sender<UiEvent>,
+}
+
+/// Spawn the RPC reader thread and (unless `embedded`) the crossterm
+/// keyboard thread. `embedded = true` skips the keyboard thread so the host
+/// injects keys through [`EventSources::keys`] instead of a real tty.
 pub fn spawn_event_sources(
     client: &mut RpcClient,
-) -> (Receiver<UiEvent>, Sender<UiEvent>) {
+    embedded: bool,
+) -> EventSources {
     let (tx, rx) = mpsc::channel();
 
     // Keyboard source：poll + 暂停闸门（design D3）——外部编辑器子进程
     // 占用 stdin 期间，poll 到数据也不 read，字节留给子进程。
     let key_tx = tx.clone();
+    if !embedded {
+    let thread_key_tx = key_tx.clone();
     thread::spawn(move || loop {
         // 暂停闸门前置（design D3 修订）：暂停期不进入 crossterm poll——
         // 既不会消费子进程（外部编辑器）的 stdin 字节，也不持有全局事件读锁
@@ -106,7 +126,7 @@ pub fn spawn_event_sources(
                 }
                 match ct_event::read() {
                     Ok(ct_event::Event::Key(key)) => {
-                        if key_tx.send(UiEvent::Key(key)).is_err() {
+                        if thread_key_tx.send(UiEvent::Key(key)).is_err() {
                             break;
                         }
                     }
@@ -118,6 +138,7 @@ pub fn spawn_event_sources(
             Err(_) => break,
         }
     });
+    }
 
     // RPC event source.
     let rpc_tx = tx.clone();
@@ -145,6 +166,10 @@ pub fn spawn_event_sources(
         }
     });
 
-    // Keep one sender as the public report handle; it is dropped with the app.
-    (rx, tx)
+    // report 供 detached 命令线程回报失败; keys 为宿主(嵌入)键注入入口。
+    EventSources {
+        events: rx,
+        report: tx.clone(),
+        keys: key_tx,
+    }
 }

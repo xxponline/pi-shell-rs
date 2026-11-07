@@ -17,12 +17,15 @@ mod sessions;
 mod settings_io;
 mod tree;
 mod terminal;
+pub mod embed;
+pub mod virtual_terminal;
 mod tools;
 mod view;
 mod wrap;
 
 use std::io;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -35,7 +38,7 @@ use std::collections::VecDeque;
 use crate::app::editor::EditorBuffer;
 use crate::app::event::{AsyncKind, UiEvent};
 use crate::app::overlay::{overlay_key, Overlay, OverlayOutcome};
-use crate::app::terminal::TerminalGuard;
+use crate::app::terminal::{TerminalGuard, TerminalSinks};
 
 /// 按键意图（`key_intent` 的纯映射产物，便于单测）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +130,11 @@ pub struct App {
     /// 诊断日志句柄；环境变量 `PI_RUST_TUI_LOG=<path>` 开启时逐条记录
     /// 收到的 UiEvent，用于排查“回复不显示”类问题；None 表示未开启。
     debug_log: Option<std::fs::File>,
+    /// 终端副作用出口（标题/剪贴板）；None=standalone 走真实终端，
+    /// 嵌入模式由宿主注入回调（design D4）。
+    sinks: TerminalSinks,
+    /// 嵌入模式：状态发布槽（draw 时刷新给宿主只读句柄；standalone 为 None）。
+    state_slot: Option<Arc<RwLock<SessionState>>>,
 }
 
 impl App {
@@ -163,6 +171,8 @@ impl App {
             show_thinking: false,
             expand_tools: false,
             debug_log,
+            sinks: TerminalSinks::default(),
+            state_slot: None,
         }
     }
 
@@ -176,6 +186,37 @@ impl App {
             let detail: String = detail.chars().take(1500).collect();
             let _ = writeln!(f, "{kind} {detail}");
             let _ = f.flush();
+        }
+    }
+
+    /// 注入嵌入模式的终端副作用出口（标题/剪贴板）；standalone 不调用，
+    /// 缺省走真实终端。
+    pub fn set_terminal_sinks(&mut self, sinks: TerminalSinks) {
+        self.sinks = sinks;
+    }
+
+    /// 窗口标题出口：sink 注入优先，standalone 落回真实终端 SetTitle。
+    pub(crate) fn emit_title(&self, title: String) {
+        if let Some(f) = &self.sinks.set_title {
+            f(title);
+        } else {
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::terminal::SetTitle(title)
+            );
+        }
+    }
+
+    /// 剪贴板出口：sink 注入优先，standalone 落回 OSC52 写 stdout。
+    pub(crate) fn emit_clipboard(&self, text: &str) {
+        if let Some(f) = &self.sinks.copy_text {
+            f(text.to_string());
+        } else {
+            use std::io::Write as _;
+            let seq = Self::osc52_sequence(text);
+            let mut stdout = std::io::stdout();
+            let _ = stdout.write_all(seq.as_bytes());
+            let _ = stdout.flush();
         }
     }
 
@@ -217,29 +258,32 @@ impl App {
             ),
         }
 
-        let (ui_rx, report_tx) = event::spawn_event_sources(&mut client);
+        let sources = event::spawn_event_sources(&mut client, false);
         // 启动静默拉取动态斜杠命令（design D1：失败不打扰）
         {
             let settings_path = self.settings_path();
-            Self::fetch_commands_quiet(&client.command_sender(), &report_tx, settings_path);
+            Self::fetch_commands_quiet(&client.command_sender(), &sources.report, settings_path);
         }
         let mut terminal = guard.take_terminal();
 
         let commander = client.command_sender();
-        let result = self.event_loop(&mut terminal, &ui_rx, &commander, &report_tx);
+        let result = self.event_loop(&mut terminal, &sources.events, &commander, &sources.report);
 
         drop(terminal);
         guard.finish();
         result
     }
 
-    fn event_loop(
+    fn event_loop<B: ratatui::backend::Backend>(
         &mut self,
-        terminal: &mut ratatui::DefaultTerminal,
+        terminal: &mut ratatui::Terminal<B>,
         ui_rx: &Receiver<UiEvent>,
         commander: &CommandSender,
         report_tx: &Sender<UiEvent>,
-    ) -> io::Result<()> {
+    ) -> io::Result<()>
+    where
+        io::Error: From<B::Error>,
+    {
         self.draw(terminal)?;
 
         while !self.should_quit {
@@ -339,6 +383,14 @@ impl App {
                 Ok(UiEvent::RestoreQueued(data)) => {
                     self.log_event("dequeue", &data.to_string());
                     self.restore_queued(&data);
+                    self.draw(terminal)?;
+                }
+                Ok(UiEvent::Shutdown) => {
+                    self.log_event("shutdown", "host requested");
+                    self.should_quit = true;
+                }
+                Ok(UiEvent::Resize) => {
+                    // 尺寸已由宿主写入共享槽；draw 内 autoresize 生效。
                     self.draw(terminal)?;
                 }
                 // Idle timeout: no state changed, so no repaint.
@@ -2496,10 +2548,7 @@ impl App {
             }
             "setTitle" => {
                 let title = str_field("title");
-                let _ = crossterm::execute!(
-                    std::io::stdout(),
-                    crossterm::terminal::SetTitle(title)
-                );
+                self.emit_title(title);
             }
             "set_editor_text" => {
                 self.editor.replace(&str_field("text"));
@@ -2836,11 +2885,7 @@ impl App {
                 if text.is_empty() {
                     self.notice = Some(("暂无可复制的 assistant 回复".into(), Color::Red));
                 } else {
-                    use std::io::Write as _;
-                    let seq = Self::osc52_sequence(text);
-                    let mut stdout = std::io::stdout();
-                    let _ = stdout.write_all(seq.as_bytes());
-                    let _ = stdout.flush();
+                    self.emit_clipboard(text);
                     self.notice = Some((
                         format!("✓ 已复制 {} 字符到剪贴板", text.chars().count()),
                         Color::Green,
@@ -2950,7 +2995,16 @@ impl App {
         }
     }
 
-    fn draw(&self, terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
+    fn draw<B: ratatui::backend::Backend>(&self, terminal: &mut ratatui::Terminal<B>) -> io::Result<()>
+    where
+        io::Error: From<B::Error>,
+    {
+        // 嵌入模式：把最新状态发布给宿主只读句柄（仅状态变更帧触发）。
+        if let Some(slot) = &self.state_slot {
+            if let Ok(mut guard) = slot.write() {
+                *guard = self.state.clone();
+            }
+        }
         let input_text = self.editor.text();
         let ui = view::ViewUi {
             input: &input_text,
@@ -3026,6 +3080,35 @@ mod input_tests {
         );
         assert!(app.editor.is_empty());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 嵌入模式注入通路：宿主经 `EventSources::keys` 送键 → 主循环消费 →
+    /// `handle_key` 应用到编辑器（不 spawn crossterm poll 线程）。
+    #[test]
+    fn embedded_key_injection_reaches_editor() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut client, dir) = test_commander();
+        let sources = event::spawn_event_sources(&mut client, true);
+        sources
+            .keys
+            .send(UiEvent::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        let key = loop {
+            match sources.events.recv_timeout(std::time::Duration::from_secs(2)) {
+                Ok(UiEvent::Key(k)) => break k,
+                Ok(_) => continue, // 跳过可能的 RPC 事件
+                Err(_) => panic!("injected key event never arrived"),
+            }
+        };
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+        app.handle_key(key, &commander, &tx);
+        assert_eq!(app.editor.text(), "a");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
