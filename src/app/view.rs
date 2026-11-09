@@ -313,7 +313,8 @@ fn render_completion(frame: &mut Frame, area: ratatui::layout::Rect, comp: &crat
         } else {
             Style::default()
         };
-        let name = format!("{:<name_w$}", item.value, name_w = name_w);
+        let name_raw = if item.label.is_empty() { &item.value } else { &item.label };
+        let name = format!("{:<name_w$}", truncate(name_raw, name_w), name_w = name_w);
         let mut spans = vec![Span::styled(name, base)];
         if let Some(desc) = &item.description {
             let room = width.saturating_sub(name_w + 1);
@@ -961,6 +962,7 @@ mod render_tests {
             items,
             selected,
             kind: Some(crate::app::autocomplete::CompletionKind::Command),
+            force: false,
         }
     }
 
@@ -1011,14 +1013,42 @@ mod render_tests {
             ],
             selected: 0,
             kind: Some(CompletionKind::AtFile),
+            force: false,
         };
         let out = render_with_completion(&comp, 160, 30);
-        // 目录项带 `/` 后缀、文件项完整值、描述列显示路径
-        assert!(out.contains("@src/"), "目录后缀: {out}");
-        assert!(out.contains("@main.rs"), "文件值: {out}");
+        // 主列按 label 展示（条目名，目录带 `/`），非 `@` 完整值；描述列仍为路径
+        assert!(out.contains("src/"), "目录 label: {out}");
+        assert!(out.contains("main.rs"), "文件 label: {out}");
+        assert!(!out.contains("@src/"), "主列不再展示 @ 值: {out}");
         assert!(out.contains("src/main.rs"), "路径描述行: {out}");
         // 菜单高度按条目数
         assert_eq!(completion_height(&comp), 2, "两条 = 2 行");
+    }
+
+    #[test]
+    fn path_completion_renders_label_no_desc_with_count() {
+        use crate::app::autocomplete::{CompletionItem, CompletionKind, CompletionState};
+        // 6 条 Path 候选（超 5 条上限）：无描述列 + `(i/n)` 计数行
+        let items = ["src/", "main.rs", "lib.rs", "Cargo.toml", "README.md", "build.rs"]
+            .into_iter()
+            .map(|n| CompletionItem {
+                value: n.to_string(),
+                label: n.to_string(),
+                description: None, // spec: Path 候选无描述列
+            })
+            .collect();
+        let comp = CompletionState {
+            open: true,
+            prefix: "".to_string(),
+            items,
+            selected: 0,
+            kind: Some(CompletionKind::Path),
+            force: true,
+        };
+        let out = render_with_completion(&comp, 80, 30);
+        assert!(out.contains("src/"), "目录带 / 后缀: {out}");
+        assert!(out.contains("(1/6)"), "超限应有计数行: {out}");
+        assert_eq!(completion_height(&comp), 6, "5 可见 + 1 计数行");
     }
 
     #[test]
@@ -1078,6 +1108,38 @@ mod render_tests {
         assert!(buf.contains("import"), "窗口尾部应含下标 6 的 import:\n{buf}");
         assert!(!buf.contains("settings"), "首项已滚出窗口: {buf}");
         assert!(buf.contains("(11/24)"), "计数应反映选中项: {buf}");
+    }
+
+    #[test]
+    fn force_path_menu_height_and_scroll_window() {
+        use crate::app::autocomplete::{CompletionItem, CompletionKind, CompletionState};
+        // force Path 菜单 8 条候选：高度 = 5 可见 + 1 计数；选中末项时窗口贴底上移
+        let items = (0..8)
+            .map(|i| CompletionItem {
+                value: format!("item{i}.rs"),
+                label: format!("item{i}.rs"),
+                description: None,
+            })
+            .collect();
+        let mut comp = CompletionState {
+            open: true,
+            prefix: "".into(),
+            items,
+            selected: 0,
+            kind: Some(CompletionKind::Path),
+            force: true,
+        };
+        assert_eq!(completion_height(&comp), 6, "8 条 = 5 可见 + 1 计数");
+        comp.open = false;
+        assert_eq!(completion_height(&comp), 0, "关闭不占行");
+        comp.open = true;
+        // 选中末项（下标 7）→ 窗口显示下标 3..7，首 3 项滚出
+        comp.selected = 7;
+        let buf = render_with_completion(&comp, 100, 30);
+        assert!(buf.contains("item7.rs"), "选中末项应可见:\n{buf}");
+        assert!(buf.contains("item3.rs"), "窗口应贴底起于下标 3:\n{buf}");
+        assert!(!buf.contains("item0.rs"), "首项已滚出窗口: {buf}");
+        assert!(buf.contains("(8/8)"), "计数反映选中项: {buf}");
     }
 
     #[test]

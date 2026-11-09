@@ -39,6 +39,9 @@ pub enum CompletionKind {
     Argument(String),
     /// `@文件` 补全（替换含 `@` 的 token；目录不补空格可续写）。
     AtFile,
+    /// 纯路径补全（Tab 触发；替换路径 token，无 `@`、不加尾随空格、
+    /// 目录保 `/` 可续写）。
+    Path,
 }
 
 /// 菜单状态（存于 App）。
@@ -54,6 +57,8 @@ pub struct CompletionState {
     pub selected: usize,
     /// 类别。
     pub kind: Option<CompletionKind>,
+    /// 是否 force 态（Tab 打开；退格到空白不关、零候选才关——design D1）。
+    pub force: bool,
 }
 
 impl CompletionState {
@@ -419,45 +424,9 @@ pub struct AtCandidate {
 /// 输出: 已去重、打分、排序、截断的候选（目录不存在/不可读 → 空，静默）
 pub fn list_at_candidates(query: &str, base_dir: &Path, fd_output: Option<&str>) -> Vec<AtCandidate> {
     let raw = query;
-    let exp = expand_home(query);
-    // 定位搜索目录与文件前缀（root 前缀列目录本身）
     let is_root = raw.is_empty() || raw == ".." || raw == "~" || raw == "/";
-    let (search_dir, file_prefix, display_dir) = if is_root {
-        let d = if raw == "~" {
-            PathBuf::from(exp.clone())
-        } else if raw == "/" {
-            PathBuf::from("/")
-        } else if raw == ".." {
-            base_dir.join("..")
-        } else {
-            base_dir.to_path_buf()
-        };
-        let dd = if raw == "~" { "~/".to_string() } else if raw == "/" { "/".to_string() } else { String::new() };
-        (d, String::new(), dd)
-    } else if exp.ends_with('/') {
-        (join_base(base_dir, &exp), String::new(), raw.to_string())
-    } else if let Some(idx) = exp.rfind('/') {
-        let dir_part = &exp[..idx];
-        let prefix = &exp[idx + 1..];
-        let raw_dir = &raw[..raw.rfind('/').map(|i| i + 1).unwrap_or(0)];
-        (join_base(base_dir, dir_part), prefix.to_string(), raw_dir.to_string())
-    } else {
-        (base_dir.to_path_buf(), exp.clone(), String::new())
-    };
-
-    let mut cands: Vec<AtCandidate> = Vec::new();
     // ① 基础目录候选（大小写不敏感前缀、目录优先在排序阶段体现）
-    if let Ok(rd) = std::fs::read_dir(&search_dir) {
-        let pfx = file_prefix.to_lowercase();
-        for entry in rd.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if !name.to_lowercase().starts_with(&pfx) {
-                continue;
-            }
-            let is_dir = entry_is_dir(&entry);
-            cands.push(AtCandidate { path: format!("{display_dir}{name}"), is_dir, score: 0 });
-        }
-    }
+    let mut cands = list_dir_candidates(query, base_dir);
     // ② fd 递归候选（绝对路径行 → 展示路径；与基础候选去重）
     if let Some(raw_fd) = fd_output {
         for line in parse_fd_lines(raw_fd) {
@@ -488,6 +457,61 @@ pub fn list_at_candidates(query: &str, base_dir: &Path, fd_output: Option<&str>)
             .then_with(|| a.path.cmp(&b.path))
     });
     cands.truncate(20);
+    cands
+}
+
+/// 基础目录候选段（read_dir + 大小写不敏感前缀匹配，无 fd、无打分、
+/// 无截断）——`@` 候选与纯路径补全共用（对照 pi `getFileSuggestions` 的
+/// 单目录列举；pi 纯路径同样 readdir-only）。
+///
+/// 输入: query — token 查询（支持 `~`、`./`、绝对路径、目录部分定位）；
+///       base_dir — 基准目录（cwd）
+/// 输出: 目录项候选（score 恒 0，排序由调用方决定；目录不存在/不可读 → 空，静默）
+pub fn list_dir_candidates(query: &str, base_dir: &Path) -> Vec<AtCandidate> {
+    let raw = query;
+    let exp = expand_home(query);
+    // 定位搜索目录与文件前缀（root 前缀列目录本身）
+    let is_root = raw.is_empty() || raw == ".." || raw == "~" || raw == "/";
+    let (search_dir, file_prefix, display_dir) = if is_root {
+        let d = if raw == "~" {
+            PathBuf::from(exp.clone())
+        } else if raw == "/" {
+            PathBuf::from("/")
+        } else if raw == ".." {
+            base_dir.join("..")
+        } else {
+            base_dir.to_path_buf()
+        };
+        let dd = if raw == "~" { "~/".to_string() } else if raw == "/" { "/".to_string() } else { String::new() };
+        (d, String::new(), dd)
+    } else if exp.ends_with('/') {
+        (join_base(base_dir, &exp), String::new(), raw.to_string())
+    } else if let Some(idx) = exp.rfind('/') {
+        // 目录部分：绝对路径单段（idx==0，如 `/var`）时目录为根 `/`（对照 pi
+        // `dirname("/var")=="/"`；否则截到最后一段之前）
+        let dir_part = if idx == 0 { "/" } else { &exp[..idx] };
+        let prefix = &exp[idx + 1..];
+        let raw_dir = &raw[..raw.rfind('/').map(|i| i + 1).unwrap_or(0)];
+        (join_base(base_dir, dir_part), prefix.to_string(), raw_dir.to_string())
+    } else {
+        (base_dir.to_path_buf(), exp.clone(), String::new())
+    };
+
+    let mut cands: Vec<AtCandidate> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&search_dir) {
+        let pfx = file_prefix.to_lowercase();
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.to_lowercase().starts_with(&pfx) {
+                continue;
+            }
+            let is_dir = entry_is_dir(&entry);
+            cands.push(AtCandidate { path: format!("{display_dir}{name}"), is_dir, score: 0 });
+        }
+    }
+    // 目录优先 → 字母序（pi `getFileSuggestions` 同序；纯路径补全直接消费，
+    // `@` 侧随后按分数全序重排不受影响）
+    cands.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.path.cmp(&b.path)));
     cands
 }
 
@@ -660,8 +684,8 @@ pub fn run_fd(query: &str, base_dir: &Path) -> Option<String> {
 
 /// 是否需要自动加引号（空白或 CJK 标点，对照 pi autocompleteSeparatorRegex；
 /// 已带引号的 token 恒需要）。
-fn needs_quotes(token: &AtToken, path: &str) -> bool {
-    if token.quoted {
+fn needs_quotes(quoted_prefix: bool, path: &str) -> bool {
+    if quoted_prefix {
         return true;
     }
     path.chars().any(|c| {
@@ -678,10 +702,27 @@ pub fn build_at_value(token: &AtToken, cand: &AtCandidate) -> String {
     if cand.is_dir && !path.ends_with('/') {
         path.push('/');
     }
-    if needs_quotes(token, &path) {
+    if needs_quotes(token.quoted, &path) {
         format!("@\"{path}\"")
     } else {
         format!("@{path}")
+    }
+}
+
+/// 构造纯路径应用值（对照 pi `buildCompletionValue` 非 `@` 分支）：
+/// 无 `@` 前缀、目录保尾 `/`、需引号时包 `"…"`、不加尾随空格。
+///
+/// 输入: token — 当前路径 token；cand — 选中候选
+/// 输出: 替换用的完整值（如 `src/main.rs`、`src/`、`"my dir/foo.txt"`）
+pub fn build_path_value(token: &PathToken, cand: &AtCandidate) -> String {
+    let mut path = cand.path.clone();
+    if cand.is_dir && !path.ends_with('/') {
+        path.push('/');
+    }
+    if needs_quotes(token.quoted, &path) {
+        format!("\"{path}\"")
+    } else {
+        path
     }
 }
 
@@ -709,6 +750,149 @@ pub fn at_suggestions(text_before: &str, base_dir: &Path) -> Option<(String, Vec
         })
         .collect();
     Some((token.prefix, items))
+}
+
+/// 纯路径补全入口：提取路径 token → readdir 候选 → 打包菜单数据
+/// （对照 pi `extractPathPrefix(force)` → `getFileSuggestions`）。
+///
+/// 输入: text_before — 光标前文本；base_dir — 基准目录（cwd）；
+///       force — force 语义（空 token = cwd 列表；非 force 空 token 不触发）
+/// 输出: Some((待替换前缀, 候选)) = 应开菜单；None = 无 token/无候选（静默）
+pub fn path_suggestions(
+    text_before: &str,
+    base_dir: &Path,
+    force: bool,
+) -> Option<(String, Vec<CompletionItem>)> {
+    let token = extract_path_token(text_before, force)?;
+    let cands = list_dir_candidates(&token.query, base_dir);
+    if cands.is_empty() {
+        return None; // pi: suggestions.length === 0 → 不弹/关
+    }
+    let items = cands
+        .iter()
+        .map(|c| CompletionItem {
+            value: build_path_value(&token, c),
+            label: if c.is_dir {
+                format!("{}/", file_name_of(&c.path))
+            } else {
+                file_name_of(&c.path).to_string()
+            },
+            description: None, // spec: Path 候选无描述列
+        })
+        .collect();
+    Some((token.prefix, items))
+}
+
+// ── 纯路径补全（Tab 触发，对照 pi `extractPathPrefix`） ──
+
+/// 纯路径补全 token（光标前的路径片段，无 `@` 前缀）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PathToken {
+    /// 待替换前缀（与光标前文本尾部逐字对应；未闭合引号形态含开引号、
+    /// 前导包裹已剥离——包裹符留在替换区之前，应用时自然保留）。
+    pub prefix: String,
+    /// 候选查询（不含开引号，供 readdir 定位目录与前缀匹配）。
+    pub query: String,
+    /// 是否未闭引号形态（应用值恒加引号，对齐 pi `isQuotedPrefix`）。
+    pub quoted: bool,
+}
+
+impl PathToken {
+    /// 造空 token（force 下空输入/空白尾随的 cwd 列表语义）。
+    fn empty() -> Self {
+        PathToken { prefix: String::new(), query: String::new(), quoted: false }
+    }
+}
+
+/// 前导包裹符映射（pi `PATH_WRAPPERS`：开括号 → 闭括号）。
+const PATH_WRAPPERS: [(char, char); 5] =
+    [('(', ')'), ('[', ']'), ('{', '}'), ('<', '>'), ('`', '`')];
+
+/// 剥离 token 前导未闭合包裹符（pi `stripLeadingWrappers`）：仅当闭符
+/// 不在余串中才剥——`(x)` 成对整体保留，`(src/x` 剥为 `src/x`。
+///
+/// 输入: token — 待剥离片段
+/// 输出: 剥离后的子串（多数情形原样返回；不分配）
+fn strip_leading_wrappers(token: &str) -> &str {
+    let mut result = token;
+    while let Some(first) = result.chars().next() {
+        let Some((_, closer)) = PATH_WRAPPERS.iter().find(|(open, _)| *open == first) else {
+            break;
+        };
+        // 余串已含闭符 → 成对包裹不剥（开符皆 ASCII，`first.len_utf8()` 安全）
+        if result[first.len_utf8()..].contains(*closer) {
+            break;
+        }
+        result = &result[first.len_utf8()..];
+    }
+    result
+}
+
+/// 定位未闭合 `"` 的起始字节下标（pi `findUnclosedQuoteStart`）：逐字符
+/// 切换引号态，仅在进入引号时记录位置，末态仍在引号内才返回。
+///
+/// 输入: text — 光标前文本
+/// 输出: Some(开引号字节下标) = 存在未闭合引号；None = 引号全闭合
+fn find_unclosed_quote_start(text: &str) -> Option<usize> {
+    let mut in_quotes = false;
+    let mut quote_start = 0usize;
+    for (i, c) in text.char_indices() {
+        if c == '"' {
+            in_quotes = !in_quotes;
+            if in_quotes {
+                quote_start = i;
+            }
+        }
+    }
+    in_quotes.then_some(quote_start)
+}
+
+/// 判定开引号是否处于 token 起始（pi `isTokenStart`，边界集为本项目
+/// `is_token_boundary`；CJK 标点边界挂账）：向前跳过前导包裹开符后，
+/// 前一字符为分隔符、或位置即行首。
+///
+/// 输入: text — 光标前文本；quote_pos — 开引号字节下标（来自 char_indices）
+/// 输出: true = 引号形态成立，可作路径 token；false = 回落分隔符切片
+fn is_quote_token_start(text: &str, quote_pos: usize) -> bool {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut idx = chars.iter().position(|(i, _)| *i == quote_pos).unwrap_or(0);
+    while idx > 0 && PATH_WRAPPERS.iter().any(|(open, _)| *open == chars[idx - 1].1) {
+        idx -= 1;
+    }
+    idx == 0 || is_token_boundary(chars[idx - 1].1)
+}
+
+/// 从光标前文本提取纯路径 token（对照 pi `extractPathPrefix`）。
+///
+/// 输入: text_before — 光标前的当前行文本；force — Tab 强制触发语义
+/// 输出: Some(token) = 处于路径补全上下文；None = 不触发。空 token 仅
+///       force 下返回 Some("")（列 cwd 顶层），非 force 返回 None；
+///       未闭合引号形态 prefix 含开引号、query 不含。边界为空白/`"`/`'`/`=`
+///       （CJK 标点边界挂账），支持 `([{<\`` 前导包裹剥离。
+pub fn extract_path_token(text_before: &str, force: bool) -> Option<PathToken> {
+    // ① 未闭合引号形态（pi extractQuotedPrefix）：开引号处于 token 起始
+    if let Some(qpos) = find_unclosed_quote_start(text_before)
+        .filter(|qpos| is_quote_token_start(text_before, *qpos))
+    {
+        return Some(PathToken {
+            prefix: text_before[qpos..].to_string(),
+            query: text_before[qpos + 1..].to_string(), // 跳过开引号
+            quoted: true,
+        });
+    }
+    // ② 分隔符切片 + 前导包裹剥离（pi findLastDelimiter → stripLeadingWrappers）
+    let start = text_before
+        .char_indices()
+        .rev()
+        .find(|(_, c)| is_token_boundary(*c))
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    let token = strip_leading_wrappers(&text_before[start..]);
+    if token.is_empty() {
+        // 空 token：force → Some("")（列 cwd 顶层）；非 force → 不触发
+        return force.then(PathToken::empty);
+    }
+    Some(PathToken { prefix: token.to_string(), query: token.to_string(), quoted: false })
 }
 
 /// 应用补全：替换前缀为选中值。
@@ -753,6 +937,18 @@ pub fn apply_completion(
                 cursor_in_value -= 1; // 闭引号前
             }
             let new_cursor = start_char + cursor_in_value + suffix.len();
+            (new_line, new_cursor)
+        }
+        CompletionKind::Path => {
+            // 纯路径 token → value：无 `@`、无尾随空格（spec：光标落插入
+            // 文本之后）；引号内目录光标落闭引号前（可续写，对齐 pi
+            // applyCompletion 与 AtFile 规则）
+            let new_line = format!("{before}{value}{after}");
+            let mut cursor_in_value = value.chars().count();
+            if value.ends_with("/\"") {
+                cursor_in_value -= 1; // 闭引号前
+            }
+            let new_cursor = start_char + cursor_in_value;
             (new_line, new_cursor)
         }
     }
@@ -957,6 +1153,39 @@ mod tests {
     }
 
     #[test]
+    fn extract_path_token_forms_and_force_semantics() {
+        // 空输入：force → Some("")（列 cwd），非 force → None
+        assert_eq!(extract_path_token("", true), Some(PathToken::empty()), "空输入 force 空 token");
+        assert_eq!(extract_path_token("", false), None, "非 force 空 token 不触发");
+        // 尾随空白：token 为空（光标前一字符是空白的主场景）
+        assert_eq!(extract_path_token("look ", true), Some(PathToken::empty()), "空白尾随 → 空 token");
+        assert_eq!(extract_path_token("look ", false), None);
+        // 普通路径 token（含前置文本时从最后分隔符切）
+        assert_eq!(
+            extract_path_token("src/mai", true).map(|t| (t.prefix, t.query, t.quoted)),
+            Some(("src/mai".into(), "src/mai".into(), false))
+        );
+        assert_eq!(extract_path_token("find src/mai", true).map(|t| t.query), Some("src/mai".into()));
+        // `~/` 写法保留
+        assert_eq!(extract_path_token("~/Do", true).map(|t| t.query), Some("~/Do".into()));
+        // `=` 是分隔符（pi PATH_DELIMITERS）：`a=b` → token `b`
+        assert_eq!(extract_path_token("a=b", true).map(|t| t.query), Some("b".into()), "`=` 为边界");
+        // 未闭合引号：prefix 含开引号、query 不含、quoted=true；空格在引号内不切 token
+        let t = extract_path_token(r#""my di"#, true).expect("未闭合引号 token");
+        assert_eq!((t.prefix.as_str(), t.query.as_str(), t.quoted), (r#""my di"#, "my di", true));
+        let t = extract_path_token(r#"he said "my di"#, true).expect("前有文本的未闭合引号");
+        assert_eq!((t.prefix.as_str(), t.query.as_str()), (r#""my di"#, "my di"));
+        // 前导包裹剥离：`(src/x` → `src/x`（包裹符留在替换区之前）
+        assert_eq!(extract_path_token("(src/x", true).map(|t| t.query), Some("src/x".into()), "解包裹");
+        // 成对包裹不剥：`(src/x)` 整体保留
+        assert_eq!(extract_path_token("(src/x)", true).map(|t| t.query), Some("(src/x)".into()), "成对不剥");
+        // 引号已闭合（字面 `"(src/x"`）→ 回落分隔符切片，尾部 `"` 是边界 → 空 token
+        assert_eq!(extract_path_token(r#""(src/x""#, true), Some(PathToken::empty()), "闭合引号 → 尾部边界切为空");
+        // 非 force 非空 token 照常提取（force 只影响空 token 分支）
+        assert_eq!(extract_path_token("src/mai", false).map(|t| t.query), Some("src/mai".into()));
+    }
+
+    #[test]
     fn list_at_candidates_prefix_sort_and_cap() {
         let base = temp_base("list");
         // 裸前缀：大小写不敏感、目录优先、字母序
@@ -993,6 +1222,31 @@ mod tests {
         // 空查询：全体保留（score=1），基础+fd 合并
         let c = list_at_candidates("", &base, Some(deep.as_str()));
         assert!(c.len() >= 6, "空查询列全: {}", c.len());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn list_dir_candidates_sort_without_cap() {
+        let base = temp_base("dircand");
+        // 空查询：全量列出，不截断 20（顶层 24 项：2 目录 + 22 文件）
+        let c = list_dir_candidates("", &base);
+        assert!(c.len() > 20, "无 20 条上限，实得 {}", c.len());
+        // 目录优先且目录间字母序：前两条即全部目录
+        let paths: Vec<&str> = c.iter().map(|x| x.path.as_str()).collect();
+        assert_eq!(&paths[..2], &["login_dir", "src"], "目录优先+字母序: {paths:?}");
+        assert!(c[2..].iter().all(|x| !x.is_dir), "第 3 条起全是文件: {paths:?}");
+        // 文件间字母序
+        let files = &paths[2..];
+        let mut want = files.to_vec();
+        want.sort_unstable();
+        assert_eq!(files, want, "文件间字母序: {files:?}");
+        // 前缀匹配：大小写不敏感
+        assert!(list_dir_candidates("MAIN", &base).iter().any(|x| x.path == "main.rs"));
+        // 目录部分定位 + 展示路径保留 `src/`
+        let c = list_dir_candidates("src/", &base);
+        assert!(c.iter().any(|x| x.path == "src/login.rs"), "{c:?}");
+        // 不存在的目录 → 静默空
+        assert!(list_dir_candidates("nope-dir/", &base).is_empty());
         std::fs::remove_dir_all(&base).ok();
     }
 
@@ -1050,6 +1304,51 @@ mod tests {
         // 需要引号：路径含空白
         let spaced = AtCandidate { path: "my dir/x".into(), is_dir: false, score: 50 };
         assert_eq!(build_at_value(&plain, &spaced), r#"@"my dir/x""#, "空白触发引号");
+    }
+
+    #[test]
+    fn apply_completion_path_rules() {
+        let p = |q: &str, quoted: bool| PathToken {
+            prefix: if quoted { format!("\"{q}") } else { q.to_string() },
+            query: q.to_string(),
+            quoted,
+        };
+        let file = AtCandidate { path: "src/main.rs".into(), is_dir: false, score: 0 };
+        let dir = AtCandidate { path: "src/lib".into(), is_dir: true, score: 0 };
+        // 值构造：无 `@`、无尾随空格、目录保 `/`、空白触发引号
+        assert_eq!(build_path_value(&p("mai", false), &file), "src/main.rs");
+        assert_eq!(build_path_value(&p("li", false), &dir), "src/lib/");
+        let spaced = AtCandidate { path: "my dir/foo.txt".into(), is_dir: false, score: 0 };
+        assert_eq!(build_path_value(&p("fo", false), &spaced), r#""my dir/foo.txt""#, "空白触发引号");
+        // 引号 token 恒加引号（即使值无空白）
+        assert_eq!(build_path_value(&p("mai", true), &file), r#""src/main.rs""#, "quoted token 恒引号");
+        // 文件：替换 token、无尾随空格、光标在插入文本后
+        let (l, c) = apply_completion("src/mai", 7, "src/mai", "src/main.rs", &CompletionKind::Path);
+        assert_eq!(l, "src/main.rs");
+        assert_eq!(c, 11, "光标在插入文本后");
+        // 目录：保 `/`、光标在 `/` 后可续写
+        let (l, c) = apply_completion("src/li", 6, "src/li", "src/lib/", &CompletionKind::Path);
+        assert_eq!(l, "src/lib/");
+        assert_eq!(c, 8, "光标在 / 后");
+        // 保留光标后文本（after 自带原空格，插入未追加新空格）
+        let (l, c) = apply_completion("src/mai tail", 7, "src/mai", "src/main.rs", &CompletionKind::Path);
+        assert_eq!(l, "src/main.rs tail", "后缀保留: {l}");
+        assert_eq!(c, 11);
+        // 带空白引号：prefix 含开引号被整体替换，值带闭引号（prefix 6 字符）
+        let (l, c) = apply_completion(r#""my di"#, 6, r#""my di"#, r#""my dir/foo.txt""#, &CompletionKind::Path);
+        assert_eq!(l, r#""my dir/foo.txt""#);
+        assert_eq!(c, 16, "光标在闭引号后");
+        // 引号目录：光标落闭引号前（可续写，对齐 pi/AtFile）
+        let (l, c) = apply_completion(r#""my di"#, 6, r#""my di"#, r#""my dir/lib/""#, &CompletionKind::Path);
+        assert_eq!(l, r#""my dir/lib/""#);
+        assert_eq!(c, 12, "闭引号前: {c}");
+        // `~` 前缀保留
+        let tilde = AtCandidate { path: "~/Documents".into(), is_dir: false, score: 0 };
+        let v = build_path_value(&p("~/Do", false), &tilde);
+        assert_eq!(v, "~/Documents");
+        let (l, c) = apply_completion("~/Do", 4, "~/Do", &v, &CompletionKind::Path);
+        assert_eq!(l, "~/Documents");
+        assert_eq!(c, 11, "~/Documents = 11 字符");
     }
 
     #[test]

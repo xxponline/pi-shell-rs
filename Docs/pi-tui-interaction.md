@@ -167,6 +167,7 @@ macOS 实现）。
 | 12 | 选择列表分页（pageUp/Down）、历史键可覆盖 | 选择器仅 ↑↓ | 低 |
 | 13 | Windows 键位分支 | 仅 macOS | 忽略（个人项目） |
 | 14 | **树内标签编辑**（shift+L 改消息 label） | **不做**：三重排除——① 消息 label 只能经扩展 API 写入，**RPC 无写 label 方法**，不加新 RPC 就无法落地；② pi 自身的 `app.tree.editLabel` 键位是**未接线的死键**（`TreeSelector.onLabelEdit` 回调从未被 interactive-mode 传入），无既有行为可对齐；③ 会话显示名编辑已由 `/name`（现有 `set_session_name` RPC）覆盖 | 忽略（约束排除） |
+| 15 | **tab 纯路径补全**（force 下钻、单条直插）；`@`/Path 菜单回车只应用不提交 | ✅ 已对齐（`add-path-tab-completion`：Tab 列 cwd/路径候选、force 态持续重过滤退格不关、恰 1 条直接插入；Enter 语义修正为仅斜杠菜单 fall-through 提交） | ~~中~~ 已完成 |
 
 ## 6. 已实现且对齐的部分
 
@@ -176,6 +177,8 @@ macOS 实现）。
 - follow_up 排队（alt+enter）与取回（alt+up，按 pi 语义修正为 clear_queue 全部取回）
 - 扩展 UI 9 种 method、read/bash/edit/write/grep/find/ls 工具卡片
 - 空闲退出（我们为 esc/q，pi 为 ctrl+d 空输入——差异 #2）
+- Tab 纯路径补全（force 态下钻/单条直插）与菜单回车分流（仅斜杠菜单提交）
+  （差异 #15，`add-path-tab-completion`）
 
 ## 7. 后续建议归属
 
@@ -190,5 +193,8 @@ macOS 实现）。
   change `add-at-file-completion` 完成**（token 提取/打分排序/菜单接线/
   fd 递归，假 pi PTY 10 项验收）。两项差异：① `fd` 缺失时回落基础目录候选
   （pi 为完全无候选）；② 消息内 `@path` 为字面量入上下文（pi 会解析为附件）。
+- **纯路径 Tab 补全 → ✅ 已由 change `add-path-tab-completion` 完成**
+  （Tab 触发/force 生命周期/单条自动应用/Path 应用规则，`@`/Path 回车
+  只应用不提交、主列按 label 渲染——差异 #15）。
 - **明确不做**：扩展命令参数补全（需上游 RPC，违反“不入侵 pi 源码”约束）、
   树内标签编辑（差异 #14 三重排除）。

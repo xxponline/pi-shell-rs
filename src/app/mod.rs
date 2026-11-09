@@ -68,6 +68,8 @@ enum KeyIntent {
     ExitIfEmpty,
     /// 换行（shift+enter / ctrl+j）
     Newline,
+    /// 强制路径补全（菜单未开时的 Tab；菜单开启时 Tab 为应用键不入此意图）
+    ForcePath,
     /// 中止生成（流式 esc）
     Abort,
     /// 外部编辑器（ctrl+g；经事件循环挂起/恢复）
@@ -80,6 +82,28 @@ enum KeyIntent {
     Edit,
     /// 忽略
     Ignore,
+}
+
+/// Tab 触发纯路径补全的开启结果（design D5）。
+#[derive(Debug)]
+enum PathOpen {
+    /// 应开菜单（调用方写入 `completion`）。
+    Menu(autocomplete::CompletionState),
+    /// 恰 1 条候选已直接应用到编辑器（跳过开菜单）。
+    Applied,
+    /// 无路径 token / 零候选 → 无操作。
+    None,
+}
+
+/// Tab 触发的斜杠命令上下文判定（对照 pi `isInSlashCommandContext && 无空格`）。
+///
+/// 输入: text_before — 光标前的当前行文本
+/// 输出: true = 行首（trim 后）`/` 起始且其后无空白（正在输入命令名，Tab 交由
+///       斜杠补全）；false = 其余情形（可走纯路径补全）
+fn is_slash_cmd_context(text_before: &str) -> bool {
+    let trimmed = text_before.trim_start();
+    // pi 仅查空格，此处放宽为任意空白（差异仅现于 `/x\ty` 类边缘输入）
+    trimmed.starts_with('/') && !trimmed.contains(char::is_whitespace)
 }
 
 /// 应用顶层状态（输入缓冲、会话状态、瞬时提示、退出标志）。
@@ -1659,14 +1683,39 @@ impl App {
                     return;
                 }
                 KeyCode::Enter if key.modifiers == KeyModifiers::NONE => {
-                    // spec：回车先应用补全再立即提交该行（对齐 pi fall-through）
+                    // P1（design D6）：Command/Argument 应用后继续 fall-through
+                    // 提交（现状）；AtFile/Path 只应用不提交（spec：回车只应用
+                    // 不提交，对齐 pi 非 `/` 前缀分支）
+                    let submit_after = matches!(
+                        self.completion.kind,
+                        Some(
+                            autocomplete::CompletionKind::Command
+                                | autocomplete::CompletionKind::Argument(_)
+                        )
+                    );
                     self.apply_completion_selection();
+                    if !submit_after {
+                        return;
+                    }
                 }
                 _ => {}
             }
         }
 
         let intent = Self::key_intent(key, self.state.phase == Phase::Streaming);
+
+        // Tab 强制路径补全（spec：Tab 触发与 token 提取；design D2/D5）：斜杠
+        // 上下文（trim 后 `/` 起始且无空白）不触发（斜杠菜单由 slash-autocomplete
+        // 负责）；其余一次性开启/单条直插后返回（跳过末尾重算，与菜单消费键同构）
+        if intent == KeyIntent::ForcePath {
+            if !is_slash_cmd_context(&self.cursor_text_before()) {
+                match self.open_path_completion(true, true) {
+                    PathOpen::Menu(state) => self.completion = state,
+                    PathOpen::Applied | PathOpen::None => {}
+                }
+            }
+            return;
+        }
 
         // 空闲 Esc：双击判定（spec：双击 Esc 动作）。浮层/补全的 Esc 已在前序
         // 分支消费（优先且不计入窗口），流式 Esc 走 Abort 不落此分支。
@@ -1748,6 +1797,62 @@ impl App {
         self.update_completion(commander, report_tx);
     }
 
+    /// 取光标前的当前行文本（补全/上下文判定共用）。
+    ///
+    /// 输入: self — 应用状态（读编辑器行数组与光标列）
+    /// 输出: 当前行光标之前的子串（多字节安全；光标越界取整行）
+    fn cursor_text_before(&self) -> String {
+        let row = self.editor.row();
+        let line = &self.editor.lines()[row];
+        let col = self.editor.col();
+        let byte = line
+            .char_indices()
+            .nth(col)
+            .map(|(b, _)| b)
+            .unwrap_or(line.len());
+        line[..byte].to_string()
+    }
+
+    /// 打开（或直接应用）Tab 强制路径补全（design D5）。
+    ///
+    /// 输入: force — force 语义（空 token 列 cwd 顶层）；explicit_tab — 是否
+    ///       显式 Tab（恰 1 条候选的自动插入仅在显式 Tab 下发生，对齐 pi）
+    /// 输出: PathOpen::Menu(菜单状态) = 多候选已展开；PathOpen::Applied =
+    ///       恰 1 条候选已按 Path 规则写入输入框（菜单不开）；PathOpen::None =
+    ///       无路径 token / 零候选（静默，无错误提示）
+    fn open_path_completion(&mut self, force: bool, explicit_tab: bool) -> PathOpen {
+        let text_before = self.cursor_text_before();
+        let base = std::env::current_dir().unwrap_or_default();
+        let Some((prefix, items)) = autocomplete::path_suggestions(&text_before, &base, force)
+        else {
+            return PathOpen::None;
+        };
+        // 单条自动应用（spec：单条自动应用）：直接插入、跳过开菜单
+        if force && explicit_tab && items.len() == 1 {
+            let item = items[0].clone();
+            let row = self.editor.row();
+            let line = self.editor.lines()[row].clone();
+            let (new_line, new_cursor) = autocomplete::apply_completion(
+                &line,
+                self.editor.col(),
+                &prefix,
+                &item.value,
+                &autocomplete::CompletionKind::Path,
+            );
+            self.editor.set_line(row, new_line, new_cursor);
+            self.log_event("key", &format!("path apply {}", item.value));
+            return PathOpen::Applied;
+        }
+        PathOpen::Menu(autocomplete::CompletionState {
+            open: true,
+            prefix,
+            items,
+            selected: 0,
+            kind: Some(autocomplete::CompletionKind::Path),
+            force,
+        })
+    }
+
     /// 按当前光标前文本重算补全菜单（无 RPC）。
     ///
     /// 输入: self — 应用状态（读编辑器与缓存）
@@ -1757,6 +1862,10 @@ impl App {
             self.completion.close();
             return;
         }
+        // 捕获 force 会话标记与开启态：斜杠/@ 接管重建时继承、Path 续算判定用
+        //（design D1/D2，对齐 pi autocompleteState 持续为 "force"）
+        let force = self.completion.force;
+        let was_open = self.completion.open;
         let row = self.editor.row();
         let line = self.editor.lines()[row].clone();
         let col = self.editor.col();
@@ -1779,6 +1888,8 @@ impl App {
                     autocomplete::CompletionKind::Argument(_) => prefix.clone(),
                     // @ 文件：候选已按分数排序，预选恒为首位
                     autocomplete::CompletionKind::AtFile => String::new(),
+                    // 纯路径：候选已按目录优先+字母序排序，预选恒为首位
+                    autocomplete::CompletionKind::Path => String::new(),
                 };
                 let selected = autocomplete::best_match_index(&items, &query);
                 self.completion = autocomplete::CompletionState {
@@ -1787,6 +1898,9 @@ impl App {
                     items,
                     selected,
                     kind: Some(kind),
+                    // 继承 force：Tab 打开的 force 会话被斜杠/@ 接管后不丢
+                    //（对齐 pi autocompleteState 持续为 "force"）
+                    force,
                 };
             }
             None => {
@@ -1801,9 +1915,28 @@ impl App {
                             items,
                             selected: 0,
                             kind: Some(autocomplete::CompletionKind::AtFile),
+                            force, // 同上：force 会话经 @ 接管后保持
                         };
                     }
                     None => self.completion.close(),
+                }
+                // ③ 纯路径续算（design D2）：仅 force 会话持续重过滤下钻；
+                // 零候选静默关（spec：force 态生命周期），退格至空白 token
+                // 退回 cwd 列表不关（extract_path_token force 语义）
+                if was_open
+                    && force
+                    && !self.completion.open
+                    && let Some((prefix, items)) =
+                        autocomplete::path_suggestions(text_before, &base, true)
+                {
+                    self.completion = autocomplete::CompletionState {
+                        open: true,
+                        prefix,
+                        items,
+                        selected: 0,
+                        kind: Some(autocomplete::CompletionKind::Path),
+                        force: true,
+                    };
                 }
             }
         }
@@ -2191,6 +2324,8 @@ impl App {
             Char('p') if ctrl => KeyIntent::CycleModelNext,
             Char('t') if alt => KeyIntent::OpenThinkingSelect,
             BackTab => KeyIntent::CycleThinking,
+            // Tab：菜单未开时强制路径补全（菜单开启的 Tab 已被上方消费块截获）
+            Tab if key.modifiers == KeyModifiers::NONE => KeyIntent::ForcePath,
             // 编辑族：光标移动 / 删除键 / 字符（含未绑定的 ctrl/alt 组合，
             // 由 apply_intent 的 Edit 分派决定是编辑还是忽略）
             Left | Right | Up | Down | Home | End | Delete | PageUp | PageDown => {
@@ -2241,6 +2376,7 @@ impl App {
                 None
             }
             KeyIntent::Ignore => None,
+            KeyIntent::ForcePath => None, // handle_key 在 apply_intent 之前拦截
             KeyIntent::ExternalEditor => None, // handle_key 单独发事件
             KeyIntent::PasteClipboard => {
                 self.paste_clipboard();
@@ -3180,6 +3316,9 @@ mod input_tests {
         assert_eq!(App::key_intent(k(KeyCode::Enter, KeyModifiers::NONE), false), KeyIntent::Submit);
         // Enter=提交, 退格/字符=编辑, 其它=忽略
         assert_eq!(App::key_intent(k(KeyCode::Enter, KeyModifiers::NONE), true), KeyIntent::Submit);
+        // Tab：菜单未开 = 强制路径补全（菜单开启时 Tab 为应用键，被消费块截获）
+        assert_eq!(App::key_intent(k(KeyCode::Tab, KeyModifiers::NONE), false), KeyIntent::ForcePath);
+        assert_eq!(App::key_intent(k(KeyCode::Tab, KeyModifiers::CONTROL), false), KeyIntent::Ignore);
         assert_eq!(App::key_intent(k(KeyCode::Backspace, KeyModifiers::NONE), false), KeyIntent::Edit);
         assert_eq!(App::key_intent(k(KeyCode::F(5), KeyModifiers::NONE), false), KeyIntent::Ignore);
     }
@@ -4564,6 +4703,179 @@ done
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ── Tab 强制路径补全（spec：path-completion） ──
+
+    #[test]
+    fn key_intent_tab_triggers_force_path() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let k = |code, mods| KeyEvent::new(code, mods);
+        // Tab（无修饰）= 强制路径补全；修饰 Tab 不触发（对齐 pi 仅裸 Tab）
+        assert_eq!(App::key_intent(k(KeyCode::Tab, KeyModifiers::NONE), false), KeyIntent::ForcePath);
+        assert_eq!(App::key_intent(k(KeyCode::Tab, KeyModifiers::NONE), true), KeyIntent::ForcePath);
+        assert_eq!(App::key_intent(k(KeyCode::Tab, KeyModifiers::CONTROL), false), KeyIntent::Ignore);
+        // shift+tab（BackTab）仍为 thinking 循环
+        assert_eq!(App::key_intent(k(KeyCode::BackTab, KeyModifiers::NONE), false), KeyIntent::CycleThinking);
+    }
+
+    #[test]
+    fn open_path_completion_single_applies_zero_none_multi_menu() {
+        let (client, dir, _log) = recording_commander("pathopen", r#"{"steering":[],"followUp":[]}"#);
+        let _commander = client.command_sender();
+        let (_tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        // 恰 1 条（repo cwd：src/mai 仅命中 main.rs）→ Applied 且值已按 Path 规则拼好
+        app.editor.replace("src/mai");
+        match app.open_path_completion(true, true) {
+            PathOpen::Applied => {}
+            other => panic!("恰 1 条应 Applied: {other:?}"),
+        }
+        assert_eq!(app.editor.text(), "src/main.rs", "无 @、无尾随空格");
+        assert_eq!(app.editor.col(), "src/main.rs".chars().count(), "光标在插入文本后");
+        assert!(!app.completion.open, "自动应用不开菜单");
+
+        // 0 条 → None（静默）
+        app.editor.replace("src/zzz");
+        assert!(matches!(app.open_path_completion(true, true), PathOpen::None));
+        assert!(!app.completion.open);
+
+        // 多条 → Menu（force 态、kind Path、目录优先）
+        app.editor.replace("src/");
+        match app.open_path_completion(true, true) {
+            PathOpen::Menu(st) => {
+                assert!(st.open && st.force, "{st:?}");
+                assert!(matches!(st.kind, Some(autocomplete::CompletionKind::Path)));
+                assert!(st.items.len() > 1, "多候选: {:?}", st.items);
+                assert!(st.items[0].label.ends_with('/'), "目录优先: {:?}", st.items[0]);
+            }
+            other => panic!("多条应 Menu: {other:?}"),
+        }
+
+        // 空输入 + force → Menu（cwd 多候选）；非 force 空 token → None
+        app.editor.replace("");
+        assert!(matches!(app.open_path_completion(true, true), PathOpen::Menu(_)));
+        assert!(matches!(app.open_path_completion(false, true), PathOpen::None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tab_force_path_end_to_end() {
+        let (client, dir, log) = recording_commander("tabpath", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+
+        // ① 空输入 + Tab → 开 cwd 列表（force、kind Path）
+        let mut app = App::new();
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &commander, &tx);
+        assert!(app.completion.open, "空白+Tab 开菜单");
+        assert!(matches!(app.completion.kind, Some(autocomplete::CompletionKind::Path)));
+        assert!(app.completion.force, "Tab 打开的菜单为 force 态");
+        assert!(app.completion.items.len() > 1, "cwd 多候选");
+        assert!(app.editor.is_empty(), "输入不变");
+
+        // ② 斜杠上下文（/mo）不触发路径菜单
+        let mut app = App::new();
+        type_text(&mut app, &commander, &tx, "/mo");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &commander, &tx);
+        assert!(!app.completion.open, "前置：Esc 关斜杠菜单");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &commander, &tx);
+        assert!(!app.completion.open, "/mo+Tab 不开路径菜单");
+        assert_eq!(app.editor.text(), "/mo", "输入不变");
+
+        // ③ src/mai 恰 1 条 → 单条直接插入且无 prompt 发出
+        let mut app = App::new();
+        type_text(&mut app, &commander, &tx, "src/mai");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &commander, &tx);
+        assert_eq!(app.editor.text(), "src/main.rs", "单条直接插入");
+        assert!(!app.completion.open);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let sent = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(!sent.contains("prompt"), "Tab 不应发送 prompt: {sent}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn force_menu_lifecycle_refilters_and_closes() {
+        let (client, dir, _log) = recording_commander("forcelife", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        // 空白 + Tab → cwd 列表（force）
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &commander, &tx);
+        assert!(app.completion.open && app.completion.force);
+
+        // 继续输入 `src/` → 刷新为 src/ 内容（下钻）
+        type_text(&mut app, &commander, &tx, "src/");
+        assert!(app.completion.open && app.completion.force, "下钻保持打开");
+        assert!(
+            app.completion.items.iter().any(|i| i.value == "src/main.rs"),
+            "应刷新为 src/ 内容: {:?}",
+            app.completion.items
+        );
+
+        // 退格至光标前为空白 → 退回 cwd 顶层列表（不关）
+        for _ in 0..4 {
+            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), &commander, &tx);
+        }
+        assert!(app.editor.is_empty(), "退格至空白");
+        assert!(app.completion.open, "退格回空白不关菜单");
+        assert!(app.completion.force, "force 态保持");
+        assert!(
+            app.completion.items.iter().any(|i| i.value == "src/"),
+            "退回 cwd 顶层列表: {:?}",
+            app.completion.items
+        );
+
+        // 指向不存在的目录 → 静默关闭（无错误提示）
+        type_text(&mut app, &commander, &tx, "src/nope/");
+        assert!(!app.completion.open, "零候选关闭");
+        assert!(app.notice.is_none(), "无错误提示");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enter_semantics_split_by_kind() {
+        let (client, dir, log) = recording_commander("enterkind", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+
+        // ① 斜杠菜单回车：应用后 fall-through 提交（/resume → 会话选择器）
+        let mut app = App::new();
+        type_text(&mut app, &commander, &tx, "/resu");
+        assert!(app.completion.open);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commander, &tx);
+        assert!(app.editor.is_empty(), "斜杠回车提交（输入清空）");
+        assert!(
+            matches!(app.overlay, Some(Overlay::SessionSelect { .. })),
+            "提交 /resume: {:?}",
+            app.overlay
+        );
+
+        // ② @ 菜单回车：只应用不提交（输入保留、无 prompt）
+        let mut app = App::new();
+        type_text(&mut app, &commander, &tx, "@Cargo");
+        assert!(app.completion.open);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commander, &tx);
+        let text = app.editor.text();
+        assert!(text.starts_with("@Cargo"), "Enter 应用补全: {text:?}");
+        assert!(!app.editor.is_empty(), "Enter 不提交，输入保留");
+        assert!(!app.completion.open);
+
+        // ③ Path 菜单回车：只应用不提交
+        let mut app = App::new();
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &commander, &tx);
+        assert!(app.completion.open && app.completion.force);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commander, &tx);
+        assert!(!app.editor.is_empty(), "Path 回车不提交，输入保留");
+        assert!(!app.completion.open);
+
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let sent = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(!sent.contains("prompt"), "@/Path 回车不应发送 prompt: {sent}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn at_file_menu_trigger_keys_and_enter_two_stage() {
         let (client, dir, _log) = recording_commander("atfile", r#"{"steering":[],"followUp":[]}"#);
@@ -4614,11 +4926,12 @@ done
         assert!(!app.editor.is_empty(), "Tab 不提交");
         assert!(!app.completion.open, "应用后关菜单");
 
-        // ⑥ Enter 双段：应用补全 → 立即提交（输入清空）
+        // ⑥ Enter 只应用不提交（spec：回车只应用不提交，对齐 pi）
         let mut app = App::new();
         type_text(&mut app, &commander, &tx, "@Cargo");
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commander, &tx);
-        assert!(app.editor.is_empty(), "Enter 应用并提交后输入清空");
+        assert!(!app.editor.is_empty(), "Enter 不提交，输入保留应用结果");
+        assert!(app.editor.text().starts_with("@Cargo."), "应用后含 @ 值: {:?}", app.editor.text());
         assert!(!app.completion.open);
         let _ = std::fs::remove_dir_all(&dir);
     }
