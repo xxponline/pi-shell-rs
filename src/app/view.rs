@@ -43,20 +43,23 @@ pub struct ViewUi<'a> {
     pub scroll: ChatScroll,
     /// 单卡工具展开覆盖表（None=无覆盖，全部跟随全局，design D1/D5）。
     pub tool_expanded: Option<&'a std::collections::HashMap<String, bool>>,
+    /// thinking 单块展开覆盖表（None=无覆盖，全部跟随全局，design D3/D5）。
+    pub thinking_overrides: Option<&'a std::collections::HashMap<usize, bool>>,
 }
 
 
 /// 从不可变状态渲染一帧（含浮层）。
 ///
 /// 输入: frame — ratatui 帧；state — 会话状态；ui — 一帧的 UI 附加输入
-/// 输出: `(吸收后的 ChatScroll, Vec<CardHit>)`——前者为渲染端回写
-///       （视口首行/贴底跟随/视口高，design D2），后者为工具卡片绝对
-///       屏行命中区间（design D2，供点击分发）；副作用为绘制整帧
+/// 输出: `(吸收后的 ChatScroll, Vec<Hit>)`——前者为渲染端回写
+///       （视口首行/贴底跟随/视口高，design D2），后者为可点击内容
+///       （工具卡/thinking）绝对屏行命中区间（design D1/D2）；
+///       副作用为绘制整帧
 pub fn render(
     frame: &mut Frame,
     state: &SessionState,
     ui: &ViewUi<'_>,
-) -> (ChatScroll, Vec<crate::app::wrap::CardHit>) {
+) -> (ChatScroll, Vec<crate::app::wrap::Hit>) {
     let area = frame.area();
     let queue = queue_lines(state, ui.local_queue);
     let queue_h = queue.len() as u16;
@@ -81,7 +84,15 @@ pub fn render(
         .split(area);
 
     render_header(frame, chunks[0], state, ui);
-    let (scroll, hits) = render_chat(frame, chunks[1], state, ui.flags, ui.scroll, ui.tool_expanded);
+    let (scroll, hits) = render_chat(
+        frame,
+        chunks[1],
+        state,
+        ui.flags,
+        ui.scroll,
+        ui.tool_expanded,
+        ui.thinking_overrides,
+    );
     if queue_h > 0 {
         frame.render_widget(
             Paragraph::new(queue).style(Style::default().fg(Color::DarkGray)),
@@ -122,6 +133,7 @@ pub fn render(
             completion: ui.completion,
             scroll: ui.scroll,
             tool_expanded: ui.tool_expanded,
+            thinking_overrides: ui.thinking_overrides,
         }
     };
     render_editor(frame, chunks[4], &editor_ui, state.phase);
@@ -277,8 +289,9 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, state: &Session
 ///   flags  — thinking/工具展开偏好
 ///   scroll — 当前滚动状态（following 贴底 / 钉住开窗）
 ///   tool_expanded — 单卡展开覆盖表（None=无覆盖，design D1）
-/// 输出: `(吸收后的 ChatScroll, Vec<CardHit>)`——前者为窗口首行/贴底判定/
-///       视口高回写，后者为卡片绝对屏行命中区间（design D2）；
+///   thinking_overrides — thinking 单块覆盖（None=无覆盖，design D3）
+/// 输出: `(吸收后的 ChatScroll, Vec<Hit>)`——前者为窗口首行/贴底判定/
+///       视口高回写，后者为可点击内容绝对屏行命中区间（design D1/D2）；
 ///       副作用为在 area 上绘制消息区
 fn render_chat(
     frame: &mut Frame,
@@ -287,10 +300,13 @@ fn render_chat(
     flags: RenderFlags,
     scroll: ChatScroll,
     tool_expanded: Option<&std::collections::HashMap<String, bool>>,
-) -> (ChatScroll, Vec<crate::app::wrap::CardHit>) {
+    thinking_overrides: Option<&std::collections::HashMap<usize, bool>>,
+) -> (ChatScroll, Vec<crate::app::wrap::Hit>) {
     let empty = std::collections::HashMap::new();
     let overrides = tool_expanded.unwrap_or(&empty);
-    let (lines, meta) = chat_lines(state, flags, overrides);
+    let empty_t = std::collections::HashMap::new();
+    let thinking = thinking_overrides.unwrap_or(&empty_t);
+    let (lines, meta) = chat_lines(state, flags, overrides, thinking);
     // 自行换行后按滚动状态开窗口：ratatui 的 Wrap+scroll 偏移按换行后行数
     // 计，我们无法精确预知，会导致最新内容被挤出视口（见 wrap 模块说明）。
     let (wrapped, next, hits) =
@@ -545,7 +561,7 @@ mod render_tests {
         let state = long_reply_state();
         let fb = std::cell::Cell::new((
             ChatScroll::default(),
-            Vec::<crate::app::wrap::CardHit>::new(),
+            Vec::<crate::app::wrap::Hit>::new(),
         ));
         let draw_with = |scroll: ChatScroll| {
             let backend = TestBackend::new(40, 12);
@@ -588,10 +604,10 @@ mod render_tests {
         assert_eq!(stale.top, following.top, "clamp 到底与贴底首行一致");
     }
 
-    /// 任务 2.3：render 返回的命中区间含已知卡片 id 与其行区间
-    /// （用户行占行 0，卡片从行 1 起；design D2 渲染反馈）。
+    /// 任务 2.3：render 返回的命中区间含已知卡片 kind 与其行区间
+    /// （用户行占行 0，卡片从行 1 起；design D1/D2 渲染反馈）。
     #[test]
-    fn render_returns_card_hits_with_id_and_range() {
+    fn render_returns_hits_with_kind_and_range() {
         use pi_shell_rs::session::{Block, Entry, ToolExecution, ToolStatus};
         let mut state = SessionState::new();
         state.transcript.push(Entry::User { text: "hi".into() });
@@ -617,7 +633,7 @@ mod render_tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let fb = std::cell::Cell::new((
             ChatScroll::default(),
-            Vec::<crate::app::wrap::CardHit>::new(),
+            Vec::<crate::app::wrap::Hit>::new(),
         ));
         terminal
             .draw(|frame| {
@@ -631,7 +647,11 @@ mod render_tests {
         let (_scroll, hits) = fb.take();
 
         assert_eq!(hits.len(), 1, "应恰一个卡片命中: {hits:?}");
-        assert_eq!(hits[0].id, "c1", "命中含已知卡片 id");
+        assert_eq!(
+            hits[0].kind,
+            crate::app::wrap::HitKind::Tool("c1".into()),
+            "命中含已知卡片 kind"
+        );
         assert_eq!(hits[0].start, 1, "用户行占行 0，卡片从行 1 起");
         assert!(hits[0].end > hits[0].start, "区间跨多行: {:?}", hits[0]);
     }
@@ -688,6 +708,60 @@ mod render_tests {
         // None（无覆盖）→ 跟随全局折叠，无 l11
         let plain_buf = render_to_buffer(&state, "", 40, 20);
         assert!(!plain_buf.contains("l11"), "无覆盖时折叠: {plain_buf}");
+    }
+
+    /// 任务 2.3：`ViewUi.thinking_overrides` 覆盖表进入渲染——全局折叠 +
+    /// 覆盖 true → thinking 全文可见（design D3/D5 生产接线，点击 →
+    /// 覆盖表 → 单块展开的后半段）。
+    #[test]
+    fn render_uses_thinking_override() {
+        use pi_shell_rs::session::{Block, Entry};
+        let mut state = SessionState::new();
+        state.transcript.push(Entry::Assistant {
+            turn: 1,
+            blocks: vec![Block::Thinking {
+                text: "secret thoughts here".into(),
+            }],
+            usage: None,
+        });
+        let mut map = std::collections::HashMap::new();
+        map.insert(0usize, true);
+
+        // 覆盖 true + 全局默认折叠 → 全文可见
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let ui = ViewUi {
+                    input: "",
+                    thinking_overrides: Some(&map),
+                    ..ViewUi::default()
+                };
+                let _ = render(frame, &state, &ui);
+            })
+            .unwrap();
+        let mut overridden = String::new();
+        for y in 0..12 {
+            for x in 0..40 {
+                overridden.push_str(terminal.backend().buffer()[(x, y)].symbol());
+            }
+            overridden.push('\n');
+        }
+        assert!(
+            overridden.contains("secret thoughts"),
+            "覆盖展开应含全文: {overridden}"
+        );
+
+        // None（无覆盖）→ 跟随全局折叠，仅占位
+        let plain_buf = render_to_buffer(&state, "", 40, 12);
+        assert!(
+            plain_buf.contains("<thinking"),
+            "无覆盖时占位可见: {plain_buf}"
+        );
+        assert!(
+            !plain_buf.contains("secret thoughts"),
+            "无覆盖时折叠: {plain_buf}"
+        );
     }
 
     #[test]

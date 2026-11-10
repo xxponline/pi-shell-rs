@@ -123,8 +123,9 @@ pub struct App {
     /// thinking 单块展开覆盖表（全局渲染序号 → 是否展开；Ctrl+T 全局切换时
     /// 清空，design D3——≡ pi setHideThinkingBlock 的 overrides.clear()）。
     thinking_overrides: HashMap<usize, bool>,
-    /// 工具卡片绝对屏行命中表（上一帧渲染反馈，design D2；点击分发用）。
-    card_hits: Vec<wrap::CardHit>,
+    /// 可点击内容（工具卡/thinking）绝对屏行命中表（上一帧渲染反馈，
+    /// design D1/D2；点击分发用）。
+    card_hits: Vec<wrap::Hit>,
     /// 多行编辑器缓冲（行数组+光标+kill-ring+undo）。
     editor: EditorBuffer,
     /// 瞬时提示与颜色（error 红 / warning 黄 / info 默认色）。
@@ -519,34 +520,50 @@ impl App {
         true
     }
 
-    /// 左键点击分发：行号 → 卡片 → 翻转单卡展开（design D3/D4）。
+    /// 左键点击分发：行号 → 命中对象 → 按域翻转覆盖（design D4）。
     ///
-    /// 输入: y — 0-based 屏幕行（x 不参与——只判行不判列，卡片行满宽语义，
-    ///       design D3；坐标日志在事件臂）
+    /// 输入: y — 0-based 屏幕行（x 不参与——只判行不判列，命中行满宽语义，
+    ///       design D4；坐标日志在事件臂）
     /// 输出: true = 命中并翻转（需重绘）；false = 浮层打开/非聊天区/
-    ///       未命中（不改状态）；副作用为写覆盖表（相对当前生效值取反）
+    ///       未命中（不改状态）；副作用为写对应覆盖表（相对当前生效值取反）
     fn handle_click(&mut self, y: u16) -> bool {
-        // 浮层遮挡时忽略（design D3，与滚轮同规则）。
+        // 浮层遮挡时忽略（既有规则，与滚轮/工具卡同一分发；design D4）。
         if self.overlay.is_some() {
             return false;
         }
-        let Some(id) = self.card_at(y) else {
+        let Some(kind) = self.hit_at(y) else {
             return false;
         };
-        // 翻转相对当前生效值（覆盖优先、否则全局，design D1）。
-        let effective = *self.user_tool_expanded.get(&id).unwrap_or(&self.expand_tools);
-        self.user_tool_expanded.insert(id.clone(), !effective);
-        self.log_event("key", &format!("tool card {id} expanded -> {}", !effective));
+        match kind {
+            wrap::HitKind::Tool(id) => {
+                // 翻转相对当前生效值（覆盖优先、否则全局，design D1/D3）。
+                let effective = *self.user_tool_expanded.get(&id).unwrap_or(&self.expand_tools);
+                self.user_tool_expanded.insert(id.clone(), !effective);
+                self.log_event("key", &format!("tool card {id} expanded -> {}", !effective));
+            }
+            wrap::HitKind::Thinking(seq) => {
+                // 单块相对生效值翻转（覆盖优先、否则全局，design D3）。
+                let effective = *self
+                    .thinking_overrides
+                    .get(&seq)
+                    .unwrap_or(&self.show_thinking);
+                self.thinking_overrides.insert(seq, !effective);
+                self.log_event(
+                    "key",
+                    &format!("thinking block {seq} expanded -> {}", !effective),
+                );
+            }
+        }
         true
     }
 
-    /// 坐标 → 卡片 id（design D3）：`y=0` 是 header，聊天区行 = `y-1`；
+    /// 坐标 → 命中对象（design D4/D2）：`y=0` 是 header，聊天区行 = `y-1`；
     /// 越过上帧视口高无动作；绝对屏行 = 上帧 `scroll.top` + 行号，线性扫
-    /// 上帧命中表（同帧一致；append-only 增长不移位既有绝对号，design D2）。
+    /// 上帧命中表（同帧一致；append-only 增长不移位既有绝对号）。
     ///
     /// 输入: y — 0-based 屏幕行
-    /// 输出: Some(toolCallId) 命中卡片；None = 非卡片行/越界
-    fn card_at(&self, y: u16) -> Option<String> {
+    /// 输出: Some(命中对象)；None = 非命中行/越界
+    fn hit_at(&self, y: u16) -> Option<wrap::HitKind> {
         let row = y.checked_sub(1)? as usize;
         if row >= self.scroll.viewport as usize {
             return None;
@@ -555,7 +572,7 @@ impl App {
         self.card_hits
             .iter()
             .find(|h| abs >= h.start && abs < h.end)
-            .map(|h| h.id.clone())
+            .map(|h| h.kind.clone())
     }
 
     /// 编辑键统一分派：字符/光标移动/删除/kill-ring/yank/undo。
@@ -3344,10 +3361,11 @@ impl App {
             },
             scroll: self.scroll,
             tool_expanded: Some(&self.user_tool_expanded),
+            thinking_overrides: Some(&self.thinking_overrides),
         };
         // 渲染回写（design D2）：ratatui 闭包返回 ()，经 Cell 带出
         // (滚动状态, 卡片命中区间)，闭包结束后存回。
-        let fb = std::cell::Cell::new((self.scroll, Vec::<wrap::CardHit>::new()));
+        let fb = std::cell::Cell::new((self.scroll, Vec::<wrap::Hit>::new()));
         terminal.draw(|frame| fb.set(view::render(frame, &self.state, &ui)))?;
         let (scroll, hits) = fb.take();
         self.scroll = scroll;
@@ -3647,6 +3665,60 @@ mod input_tests {
         assert_eq!(app.scroll.top, 47, "菜单打开时滚动生效");
     }
 
+    /// 任务 3.1：thinking 单块点击独立翻转——seq1 点开仅键 1 置位、
+    /// seq0/工具覆盖不动；再点恢复；跨域点击互不干扰；浮层忽略
+    /// （design D4，spec「点击展开单块」「点击收起单块」）。
+    #[test]
+    fn click_toggles_thinking_block_independently() {
+        let mut app = App::new();
+        app.scroll.viewport = 50;
+        app.scroll.top = 0;
+        app.card_hits = vec![
+            wrap::Hit { start: 0, end: 3, kind: wrap::HitKind::Thinking(0) },
+            wrap::Hit { start: 5, end: 9, kind: wrap::HitKind::Thinking(1) },
+            wrap::Hit {
+                start: 12,
+                end: 20,
+                kind: wrap::HitKind::Tool("t1".into()),
+            },
+        ];
+        assert!(!app.show_thinking, "全局默认折叠");
+
+        // 点 seq1（行 6 → y=7）：展开，仅键 1 置位
+        assert!(app.handle_click(7), "命中应翻转并需重绘");
+        assert_eq!(app.thinking_overrides.get(&1), Some(&true), "seq1 展开");
+        assert!(!app.thinking_overrides.contains_key(&0), "seq0 不动");
+        assert!(app.user_tool_expanded.is_empty(), "工具覆盖不动");
+
+        // 再点 seq1：恢复折叠（相对生效值取反）
+        assert!(app.handle_click(7));
+        assert_eq!(app.thinking_overrides.get(&1), Some(&false), "再点恢复折叠");
+
+        // 点工具卡行（行 12 → y=13）：只动工具覆盖（跨域隔离）
+        assert!(app.handle_click(13));
+        assert_eq!(
+            app.user_tool_expanded.get("t1"),
+            Some(&true),
+            "工具卡正常切换"
+        );
+        assert_eq!(app.thinking_overrides.len(), 1, "thinking 覆盖不受影响");
+
+        // 浮层打开时点击被忽略
+        app.overlay = Some(Overlay::Tree {
+            tree: Vec::new(),
+            leaf_id: None,
+            rows: Vec::new(),
+            cursor: 0,
+            folded: std::collections::HashSet::new(),
+            filter: crate::app::tree::FilterMode::Default,
+            search: String::new(),
+            loading: true,
+            seq: 0,
+        });
+        assert!(!app.handle_click(1), "浮层下点击忽略");
+        assert_eq!(app.thinking_overrides.len(), 1, "浮层下覆盖表不变");
+    }
+
     /// 任务 4.1：点击分发——命中翻转单卡且不影响他卡、非命中行/越界/
     /// 浮层均无效、已展开卡再点恢复折叠（design D3/D4）。
     #[test]
@@ -3655,8 +3727,8 @@ mod input_tests {
         app.scroll.viewport = 50;
         app.scroll.top = 0;
         app.card_hits = vec![
-            wrap::CardHit { start: 10, end: 20, id: "c1".into() },
-            wrap::CardHit { start: 30, end: 40, id: "c2".into() },
+            wrap::Hit { start: 10, end: 20, kind: wrap::HitKind::Tool("c1".into()) },
+            wrap::Hit { start: 30, end: 40, kind: wrap::HitKind::Tool("c2".into()) },
         ];
         assert!(!app.expand_tools, "全局默认折叠");
 

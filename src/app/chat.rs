@@ -8,6 +8,8 @@ use ratatui::text::{Line, Span};
 
 use pi_shell_rs::session::{Block, Entry, SessionState, ToolExecution, ToolStatus};
 
+use crate::app::wrap::HitKind;
+
 /// 渲染偏好标志（App 级 UI 状态，经键位切换）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RenderFlags {
@@ -23,22 +25,35 @@ pub struct RenderFlags {
 ///       overrides — 单卡工具展开覆盖表（toolCallId → 是否展开，
 ///       无覆盖的卡跟随 flags.expand_tools，design D1）
 /// 输出: `(行序列, 逐行命中 meta)`——meta 与 lines 等长，仅**已有最终结果**
-///       的工具卡行记 Some(toolCallId)（门控前移到建表，运行中卡不入表，
-///       design D2）；其余（用户行/markdown/思考/notice/`!` bash）为 None
+///       的工具卡行记 Some(Tool(id))、非空 thinking 块整段记
+///       Some(Thinking(seq))（design D1/D2）；其余（用户行/markdown/
+///       notice/`!` bash）为 None；thinking_overrides — 单块展开覆盖
+///       （seq → 是否展开，无覆盖跟随 flags.show_thinking，design D3）
 pub fn chat_lines(
     state: &SessionState,
     flags: RenderFlags,
     overrides: &std::collections::HashMap<String, bool>,
-) -> (Vec<Line<'static>>, Vec<Option<String>>) {
+    thinking_overrides: &std::collections::HashMap<usize, bool>,
+) -> (Vec<Line<'static>>, Vec<Option<HitKind>>) {
     let mut lines = Vec::new();
-    let mut meta: Vec<Option<String>> = Vec::new();
+    let mut meta: Vec<Option<HitKind>> = Vec::new();
+    // thinking 全局渲染序号（design D2：无条件计数，跨流式/落盘稳定）。
+    let mut thinking_seq = 0usize;
     for entry in state.entries() {
         match entry {
             Entry::User { text } => {
                 lines.push(prefixed("You", text, Color::Cyan, true));
             }
             Entry::Assistant { blocks, .. } => {
-                append_blocks(&mut lines, &mut meta, blocks, flags, overrides);
+                append_blocks(
+                    &mut lines,
+                    &mut meta,
+                    blocks,
+                    flags,
+                    overrides,
+                    thinking_overrides,
+                    &mut thinking_seq,
+                );
             }
             Entry::Notice { kind, text } => {
                 lines.push(notice_line(kind, text));
@@ -68,7 +83,15 @@ pub fn chat_lines(
     }
     // 流式中尚未落盘的内容。
     if state.is_in_flight() {
-        append_blocks(&mut lines, &mut meta, state.in_flight(), flags, overrides);
+        append_blocks(
+            &mut lines,
+            &mut meta,
+            state.in_flight(),
+            flags,
+            overrides,
+            thinking_overrides,
+            &mut thinking_seq,
+        );
     }
     // 运行中的用户 bash（分片实时增长）。
     if state.bash_running {
@@ -182,17 +205,24 @@ fn notice_line(kind: &str, text: &str) -> Line<'static> {
 
 /// 把一组内容块追加到输出行（markdown 文本/thinking 两态/工具卡片）。
 ///
-/// 输入: out — 结果收集器；blocks — 内容块；flags — 渲染偏好
-/// 输出: 无返回值；副作用为向 out 追加行
+/// 输入: out/meta — 行与逐行命中标识收集器（design D1）；blocks — 内容块；
+///       flags — 渲染偏好；overrides — 单卡工具覆盖；thinking_overrides —
+///       thinking 单块覆盖；thinking_seq — 全局 thinking 序号游标
+///       （无条件递增、跨调用穿透，design D2）
+/// 输出: 无返回值；副作用为向 out/meta 追加
 fn append_blocks(
     out: &mut Vec<Line<'static>>,
-    meta: &mut Vec<Option<String>>,
+    meta: &mut Vec<Option<HitKind>>,
     blocks: &[Block],
     flags: RenderFlags,
     overrides: &std::collections::HashMap<String, bool>,
+    thinking_overrides: &std::collections::HashMap<usize, bool>,
+    thinking_seq: &mut usize,
 ) {
     for block in blocks {
         let start = out.len();
+        // 本块命中标识（None = 不入命中表，design D1）。
+        let mut mark: Option<HitKind> = None;
         match block {
             Block::Text { text } => {
                 if !text.is_empty() {
@@ -201,10 +231,18 @@ fn append_blocks(
                 }
             }
             Block::Thinking { text } => {
+                // 每个 thinking 块无条件消耗一个全局序号（含空块——空块后
+                // 接 delta 变非空时既有序号不重排，design D2）。
+                let seq = *thinking_seq;
+                *thinking_seq += 1;
                 if text.is_empty() {
                     continue;
                 }
-                if flags.show_thinking {
+                mark = Some(HitKind::Thinking(seq));
+                // 生效值：单块覆盖优先、否则全局（design D3，与工具 D1 同构）。
+                let expanded = flags.show_thinking
+                    || thinking_overrides.get(&seq).copied().unwrap_or(false);
+                if expanded {
                     // 展开态：完整思考文本，弱化斜体灰（逐行保留换行）。
                     let style = Style::default()
                         .fg(Color::DarkGray)
@@ -233,16 +271,18 @@ fn append_blocks(
                     line.style = Style::default().bg(bg);
                     out.push(line);
                 }
+                // 门控前移到建表：仅已有最终结果的卡入表（运行中不入，D1）。
+                if tool.result.is_some() {
+                    mark = Some(HitKind::Tool(id.clone()));
+                }
             }
         }
-        // 逐块同步 meta（design D2）：仅**已有最终结果**的工具卡整段打标
-        // （门控前移到建表——运行中卡不入表，分发无需回查 state）。
+        // 逐块同步 meta（design D1/D2）：命中块的全部行整段打标（门控前移
+        // 到建表，分发无需回查 state）。
         meta.resize(out.len(), None);
-        if let Block::ToolCall { id, tool, .. } = block
-            && tool.result.is_some()
-        {
+        if let Some(kind) = mark {
             for m in &mut meta[start..] {
-                *m = Some(id.clone());
+                *m = Some(kind.clone());
             }
         }
     }
@@ -287,7 +327,7 @@ mod tests {
         s.handle(&json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}));
         s.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
         s.handle(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"hi there"}]}}));
-        let (lines, _) = chat_lines(&s, RenderFlags::default(), &std::collections::HashMap::new());
+        let (lines, _) = chat_lines(&s, RenderFlags::default(), &std::collections::HashMap::new(), &std::collections::HashMap::new());
         let joined = render_to_string(&lines);
         assert!(joined.contains("You: hello"));
         assert!(joined.contains("hi there"));
@@ -301,7 +341,7 @@ mod tests {
         s.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","contentIndex":0,"delta":"abcdefgh"}}));
         s.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"text_start","contentIndex":1}}));
         s.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"answer"}}));
-        let (lines, _) = chat_lines(&s, RenderFlags::default(), &std::collections::HashMap::new());
+        let (lines, _) = chat_lines(&s, RenderFlags::default(), &std::collections::HashMap::new(), &std::collections::HashMap::new());
         let joined = render_to_string(&lines);
         assert!(joined.contains("<thinking 8 chars>"), "{joined}");
         assert!(joined.contains("answer"));
@@ -314,7 +354,7 @@ mod tests {
         s.handle(&serde_json::json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
         let huge = "y".repeat(200_000);
         s.handle(&serde_json::json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":huge}]}}));
-        let (lines, _) = chat_lines(&s, RenderFlags::default(), &std::collections::HashMap::new());
+        let (lines, _) = chat_lines(&s, RenderFlags::default(), &std::collections::HashMap::new(), &std::collections::HashMap::new());
         assert!(!lines.is_empty()); // no panic, content rendered
     }
 
@@ -338,7 +378,7 @@ mod tests {
             "role":"assistant","content":[],"stopReason":"error",
             "errorMessage":"400: subscription expired"
         }}));
-        let (lines, _) = chat_lines(&st, RenderFlags::default(), &std::collections::HashMap::new());
+        let (lines, _) = chat_lines(&st, RenderFlags::default(), &std::collections::HashMap::new(), &std::collections::HashMap::new());
         let err_line = lines.iter().find(|l| {
             l.spans.iter().any(|s| s.content.as_ref().contains("[error]"))
         }).expect("error notice line");
@@ -355,7 +395,7 @@ mod tests {
             kind: "info".to_string(),
             text: "something".to_string(),
         });
-        let (lines, _) = chat_lines(&st, RenderFlags::default(), &std::collections::HashMap::new());
+        let (lines, _) = chat_lines(&st, RenderFlags::default(), &std::collections::HashMap::new(), &std::collections::HashMap::new());
         let info = lines
             .iter()
             .find(|l| l.spans.iter().any(|s| s.content.as_ref().contains("[info]")))
@@ -382,7 +422,7 @@ mod tests {
     #[test]
     fn thinking_collapsed_by_default() {
         let s = thinking_state();
-        let (lines, _) = chat_lines(&s, RenderFlags::default(), &std::collections::HashMap::new());
+        let (lines, _) = chat_lines(&s, RenderFlags::default(), &std::collections::HashMap::new(), &std::collections::HashMap::new());
         let text = render_to_string(&lines);
         assert!(text.contains("<thinking 20 chars>"), "{text}");
         assert!(!text.contains("secret thoughts"), "折叠态不得展开全文: {text}");
@@ -392,7 +432,7 @@ mod tests {
     fn thinking_expanded_shows_full_text() {
         let s = thinking_state();
         let flags = RenderFlags { show_thinking: true, expand_tools: false };
-        let (lines, _) = chat_lines(&s, flags, &std::collections::HashMap::new());
+        let (lines, _) = chat_lines(&s, flags, &std::collections::HashMap::new(), &std::collections::HashMap::new());
         let text = render_to_string(&lines);
         assert!(text.contains("secret thoughts here"), "{text}");
         assert!(!text.contains("<thinking"), "展开态不应再有占位符: {text}");
@@ -411,8 +451,8 @@ mod tests {
         let s = thinking_state();
         let on = RenderFlags { show_thinking: true, expand_tools: false };
         let off = RenderFlags::default();
-        let expanded = render_to_string(&chat_lines(&s, on, &std::collections::HashMap::new()).0);
-        let collapsed = render_to_string(&chat_lines(&s, off, &std::collections::HashMap::new()).0);
+        let expanded = render_to_string(&chat_lines(&s, on, &std::collections::HashMap::new(), &std::collections::HashMap::new()).0);
+        let collapsed = render_to_string(&chat_lines(&s, off, &std::collections::HashMap::new(), &std::collections::HashMap::new()).0);
         assert!(expanded.contains("secret thoughts"));
         assert!(collapsed.contains("<thinking"));
     }
@@ -441,10 +481,11 @@ mod tests {
             }],
             usage: None,
         });
-        let collapsed = render_to_string(&chat_lines(&s, RenderFlags::default(), &std::collections::HashMap::new()).0);
+        let collapsed = render_to_string(&chat_lines(&s, RenderFlags::default(), &std::collections::HashMap::new(), &std::collections::HashMap::new()).0);
         let expanded = render_to_string(&chat_lines(
             &s,
             RenderFlags { show_thinking: false, expand_tools: true },
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         ).0);
         assert!(collapsed.contains("l1"), "{collapsed}");
@@ -484,26 +525,61 @@ mod tests {
         let on = RenderFlags { show_thinking: false, expand_tools: true };
 
         // ① 无覆盖：跟随全局（折叠无 l11 / 展开有 l15）
-        let off_text = render_to_string(&chat_lines(&s, RenderFlags::default(), &no).0);
+        let off_text = render_to_string(&chat_lines(&s, RenderFlags::default(), &no, &std::collections::HashMap::new()).0);
         assert!(!off_text.contains("l11"), "全局折叠: {off_text}");
-        let on_text = render_to_string(&chat_lines(&s, on, &no).0);
+        let on_text = render_to_string(&chat_lines(&s, on, &no, &std::collections::HashMap::new()).0);
         assert!(on_text.contains("l15"), "全局展开: {on_text}");
 
         // ② 覆盖优先：全局折叠 + 覆盖 true → 展开
         ov.insert("c1".to_string(), true);
-        let override_on = render_to_string(&chat_lines(&s, RenderFlags::default(), &ov).0);
+        let override_on = render_to_string(&chat_lines(&s, RenderFlags::default(), &ov, &std::collections::HashMap::new()).0);
         assert!(override_on.contains("l15"), "覆盖 true 压过全局折叠: {override_on}");
 
         // ②' 覆盖 false + 全局展开 → 折叠
         ov.insert("c1".to_string(), false);
-        let override_off = render_to_string(&chat_lines(&s, on, &ov).0);
+        let override_off = render_to_string(&chat_lines(&s, on, &ov, &std::collections::HashMap::new()).0);
         assert!(!override_off.contains("l11"), "覆盖 false 压过全局展开: {override_off}");
 
         // 覆盖表对未知 id 无效
         let mut ov_unknown = std::collections::HashMap::new();
         ov_unknown.insert("nope".to_string(), true);
-        let unknown = render_to_string(&chat_lines(&s, RenderFlags::default(), &ov_unknown).0);
+        let unknown = render_to_string(&chat_lines(&s, RenderFlags::default(), &ov_unknown, &std::collections::HashMap::new()).0);
         assert!(!unknown.contains("l11"), "未知 id 覆盖不生效: {unknown}");
+    }
+
+    /// 任务 2.2：thinking meta——非空块整段标 Thinking(seq)；空块消耗
+    /// 序号但不打标（空→delta 变非空时既有序号不重排，design D2）；
+    /// 两次渲染产出完全一致（稳定键前提）。
+    #[test]
+    fn thinking_meta_marks_nonempty_and_seq_skips_nothing() {
+        let mut s = SessionState::new();
+        s.transcript.push(Entry::User { text: "hi".into() });
+        s.transcript.push(Entry::Assistant {
+            turn: 1,
+            blocks: vec![
+                Block::Thinking { text: String::new() }, // 序号 0：空块，不打标
+                Block::Thinking { text: "secret thoughts".into() }, // 序号 1
+                Block::Text { text: "after".into() },    // 不占序号
+                Block::Thinking { text: "second".into() }, // 序号 2
+            ],
+            usage: None,
+        });
+
+        let empty: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+        let empty_t: std::collections::HashMap<usize, bool> = std::collections::HashMap::new();
+        let (lines, meta) = chat_lines(&s, RenderFlags::default(), &empty, &empty_t);
+        assert_eq!(lines.len(), meta.len(), "meta 必须与行等长");
+        let marks: Vec<HitKind> = meta.iter().flatten().cloned().collect();
+        assert_eq!(
+            marks,
+            vec![HitKind::Thinking(1), HitKind::Thinking(2)],
+            "空块（序号 0）不打标、非空块整段打标"
+        );
+
+        // 两次渲染产出完全一致（序号稳定，design D2）
+        let (lines2, meta2) = chat_lines(&s, RenderFlags::default(), &empty, &empty_t);
+        assert_eq!(lines, lines2, "行产出确定性");
+        assert_eq!(meta, meta2, "meta 产出确定性");
     }
 
     /// 任务 2.1：命中 meta 门控——仅已有最终结果的工具卡入表，
@@ -555,13 +631,13 @@ mod tests {
         });
 
         let no = std::collections::HashMap::new();
-        let (lines, meta) = chat_lines(&s, RenderFlags::default(), &no);
+        let (lines, meta) = chat_lines(&s, RenderFlags::default(), &no, &std::collections::HashMap::new());
         assert_eq!(lines.len(), meta.len(), "meta 必须与行等长");
 
-        let marked: Vec<&str> = meta.iter().flatten().map(String::as_str).collect();
+        let marked: Vec<HitKind> = meta.iter().flatten().cloned().collect();
         assert!(!marked.is_empty(), "结果卡 c1 应入表");
         assert!(
-            marked.iter().all(|m| *m == "c1"),
+            marked.iter().all(|m| *m == HitKind::Tool("c1".into())),
             "只标 c1——运行中 c2 与普通行不入表: {marked:?}"
         );
 
@@ -623,7 +699,7 @@ mod tests {
             full_output_path: None,
             excluded: false,
         });
-        let (lines, _) = chat_lines(&st, RenderFlags::default(), &std::collections::HashMap::new());
+        let (lines, _) = chat_lines(&st, RenderFlags::default(), &std::collections::HashMap::new(), &std::collections::HashMap::new());
         let text: String = lines
             .iter()
             .map(|l| {
@@ -646,7 +722,7 @@ mod tests {
         let mut st2 = SessionState::new();
         st2.start_bash("ping", false);
         st2.bash_output.push_str("64 bytes from x\n");
-        let (lines, _) = chat_lines(&st2, RenderFlags::default(), &std::collections::HashMap::new());
+        let (lines, _) = chat_lines(&st2, RenderFlags::default(), &std::collections::HashMap::new(), &std::collections::HashMap::new());
         let text: String = lines
             .iter()
             .map(|l| {
@@ -678,7 +754,7 @@ mod tests {
             full_output_path: None,
             excluded: false,
         });
-        let (lines, _) = chat_lines(&st, RenderFlags::default(), &std::collections::HashMap::new());
+        let (lines, _) = chat_lines(&st, RenderFlags::default(), &std::collections::HashMap::new(), &std::collections::HashMap::new());
         let text: String = lines
             .iter()
             .map(|l| {
@@ -720,7 +796,7 @@ mod tests {
             ],
             usage: None,
         });
-        let (lines, _) = chat_lines(&s, RenderFlags::default(), &std::collections::HashMap::new());
+        let (lines, _) = chat_lines(&s, RenderFlags::default(), &std::collections::HashMap::new(), &std::collections::HashMap::new());
 
         // 每张卡片的所有行带对应 bg，且状态文字保留（spec #16）
         let expect = [
@@ -761,7 +837,7 @@ mod tests {
         let mut s2 = SessionState::new();
         s2.handle(&serde_json::json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}));
         s2.handle(&serde_json::json!({"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}));
-        let (lines2, _) = chat_lines(&s2, RenderFlags::default(), &std::collections::HashMap::new());
+        let (lines2, _) = chat_lines(&s2, RenderFlags::default(), &std::collections::HashMap::new(), &std::collections::HashMap::new());
         assert!(
             lines2.iter().all(|l| l.style.bg.is_none()),
             "非卡片行不应有背景"

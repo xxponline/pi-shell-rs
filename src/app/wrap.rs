@@ -11,19 +11,28 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::scroll::ChatScroll;
 
-/// 工具卡片在**绝对屏行**空间的命中区间（design D2）。
+/// 点击命中的对象类型（design D1：一表强类型分发，拒字符串键约定）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HitKind {
+    /// 工具调用卡片（toolCallId）。
+    Tool(String),
+    /// thinking 块（全局渲染序号，空块也计数，design D2）。
+    Thinking(usize),
+}
+
+/// 可点击内容在**绝对屏行**空间的命中区间（design D1/D2）。
 ///
-/// 字段：`start` 含 / `end` 不含（半开区间）；`id` 为 toolCallId。
+/// 字段：`start` 含 / `end` 不含（半开区间）；`kind` 区分工具卡/thinking。
 /// 绝对号 = 窗口化（drain）之前的全量屏行序号——流式只在底部追加，
 /// 既有屏行不移位，上一帧 hits + 上一帧 top 在两次绘制间点击仍精确。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CardHit {
+pub struct Hit {
     /// 区间起始屏行（含）。
     pub start: usize,
     /// 区间结束屏行（不含）。
     pub end: usize,
-    /// 工具调用 id（toolCallId）。
-    pub id: String,
+    /// 命中对象（工具卡 id / thinking 序号）。
+    pub kind: HitKind,
 }
 
 /// 将逻辑行按视口宽度换行，并按滚动状态截取视口窗口。
@@ -34,10 +43,11 @@ pub struct CardHit {
 ///   height — 视口高度（窗口行数上限，至少 1）
 ///   scroll — 滚动状态：following 取末尾（贴底跟随，即原底部锚定行为）；
 ///            钉住取 `[top, top+height)`，top 越界时 clamp 到底
-///   meta   — 逐逻辑行命中标识（与 lines 等长；chat_lines 产出，
-///            仅已有结果的工具卡为 Some(id)，design D2）
+///   meta   — 逐逻辑行命中标识（与 lines 等长；chat_lines 产出：已有结果
+///            的工具卡 Some(Tool(id))、非空 thinking 块 Some(Thinking(seq))，
+///            design D1/D2）
 /// 输出:
-///   `(窗口行序列, 吸收后的 ChatScroll, Vec<CardHit>)`——窗口总行数
+///   `(窗口行序列, 吸收后的 ChatScroll, Vec<Hit>)`——窗口总行数
 ///   ≤ height；返回状态已回写 `viewport=height` 并 `absorb(...)`；
 ///   hits 为**窗口化之前**的全量绝对屏行区间（供点击命中）。
 ///   空逻辑行保留为一个空行，保证段落间距不塌缩。
@@ -46,14 +56,14 @@ pub fn wrap_for_viewport(
     width: u16,
     height: u16,
     scroll: &ChatScroll,
-    meta: &[Option<String>],
-) -> (Vec<Line<'static>>, ChatScroll, Vec<CardHit>) {
+    meta: &[Option<HitKind>],
+) -> (Vec<Line<'static>>, ChatScroll, Vec<Hit>) {
     let width = width.max(1) as usize;
     let height = height.max(1) as usize;
 
     let mut wrapped: Vec<Line<'static>> = Vec::new();
     // 逐屏行的命中标识：一条逻辑行的全部子行同 meta（logical→screen 传播）。
-    let mut screen_meta: Vec<Option<String>> = Vec::new();
+    let mut screen_meta: Vec<Option<HitKind>> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         // 父行 style（如工具卡片 bg 面板）传播到拆分出的子行（design D5）：
         // Paragraph 只给有文本的单元格上色，行尾还得补 pad。
@@ -70,8 +80,8 @@ pub fn wrap_for_viewport(
         screen_meta.resize(wrapped.len(), mark.clone());
     }
 
-    // 全量屏行空间扫出卡片命中区间（drain 窗口之前，绝对号，design D2）。
-    let hits = collect_card_hits(&screen_meta);
+    // 全量屏行空间扫出点击命中区间（drain 窗口之前，绝对号，design D2）。
+    let hits = collect_hits(&screen_meta);
 
     // 带 bg 的行补齐到视口宽（整行面板着色，否则行尾露底色）。
     for l in &mut wrapped {
@@ -109,24 +119,25 @@ pub fn wrap_for_viewport(
     (wrapped, next, hits)
 }
 
-/// 把逐屏行标识扫描为连续卡片命中区间（纯函数）。
+/// 把逐屏行标识扫描为连续命中区间（纯函数，design D1）。
 ///
-/// 输入: meta — 逐屏行命中标识（Some(id) = 该行属于某工具卡）
-/// 输出: 半开区间 `[start, end)` 序列（绝对屏行号，按出现顺序）；
-///       同 id 若因内容重建出现多段则各成一段（分发取首段，无害）
-fn collect_card_hits(meta: &[Option<String>]) -> Vec<CardHit> {
+/// 输入: meta — 逐屏行命中标识（Some(kind) = 该行属于该命中对象）
+/// 输出: 半开区间 `[start, end)` 序列（绝对屏行号，按出现顺序）；相邻
+///       不同 kind 各成一段；同对象因内容重建出现多段也各成一段
+///       （分发取首段，无害）
+fn collect_hits(meta: &[Option<HitKind>]) -> Vec<Hit> {
     let mut hits = Vec::new();
     let mut i = 0;
     while i < meta.len() {
-        let Some(id) = meta[i].clone() else {
+        let Some(kind) = meta[i].clone() else {
             i += 1;
             continue;
         };
         let start = i;
-        while i < meta.len() && meta[i].as_deref() == Some(id.as_str()) {
+        while i < meta.len() && meta[i].as_ref() == Some(&kind) {
             i += 1;
         }
-        hits.push(CardHit { start, end: i, id });
+        hits.push(Hit { start, end: i, kind });
     }
     hits
 }
@@ -463,22 +474,22 @@ mod tests {
         assert_eq!(next.top, 0);
     }
 
-    /// 任务 2.2：meta 逻辑→屏行传播 + 连续命中区间（跨多屏行、
+    /// 任务 2.1：meta 逻辑→屏行传播 + 连续命中区间（跨多屏行、
     /// 窗口化之前产出、与窗口化输出对齐）。
     #[test]
-    fn card_hits_span_wrapped_lines_and_align_with_window() {
-        // 3 逻辑行：None / Some(c1，超宽换行成多屏行) / None
+    fn hits_span_wrapped_lines_and_align_with_window() {
+        // 3 逻辑行：None / Some(Tool(c1)，超宽换行成多屏行) / None
         let lines = vec![
             plain("header"),
             plain(&"word ".repeat(30)),
             plain("tail"),
         ];
-        let meta = vec![None, Some("c1".to_string()), None];
+        let meta = vec![None, Some(HitKind::Tool("c1".into())), None];
         let (out, _next, hits) =
             wrap_for_viewport(&lines, 20, 100, &ChatScroll::default(), &meta);
         assert_eq!(hits.len(), 1, "应恰一个命中区间: {hits:?}");
         let h = &hits[0];
-        assert_eq!(h.id, "c1");
+        assert_eq!(h.kind, HitKind::Tool("c1".into()), "强类型 kind 断言");
         assert_eq!(h.start, 1, "区间起点在 header 之后");
         assert!(h.end - h.start > 1, "展开卡跨多屏行连续: {h:?}");
         // 未滚动（following、内容不足一屏）时窗口 = 全量，绝对号即窗口内号
@@ -492,12 +503,14 @@ mod tests {
             "区间末行之后是 None 行");
     }
 
-    /// 任务 2.2：pinned 态下 hits 仍为绝对屏行号（不含窗口偏移）。
+    /// 任务 2.1：pinned 态下 hits 仍为绝对屏行号（不含窗口偏移）；
+    /// 相邻不同 kind 各成一段（强类型分组，design D1）。
     #[test]
-    fn card_hits_are_absolute_when_pinned() {
+    fn hits_are_absolute_when_pinned_and_kind_typed() {
         let lines: Vec<Line> = (0..200).map(|i| plain(&format!("L{i:03}"))).collect();
         let mut meta = vec![None; 200];
-        meta[80] = Some("c1".to_string());
+        meta[80] = Some(HitKind::Tool("c1".into()));
+        meta[81] = Some(HitKind::Thinking(7));
         let scroll = ChatScroll {
             top: 50,
             following: false,
@@ -506,11 +519,15 @@ mod tests {
         let (out, _next, hits) = wrap_for_viewport(&lines, 20, 10, &scroll, &meta);
         assert_eq!(out.len(), 10);
         assert_eq!(out[0].spans[0].content.as_ref(), "L050", "窗口从 top 起");
-        assert_eq!(hits.len(), 1);
+        assert_eq!(hits.len(), 2, "不同 kind 各成一段: {hits:?}");
         assert_eq!(
-            (hits[0].start, hits[0].end),
-            (80, 81),
+            (hits[0].start, hits[0].end, hits[0].kind.clone()),
+            (80, 81, HitKind::Tool("c1".into())),
             "绝对屏行号，不含窗口偏移（窗口在 [50,60)）"
+        );
+        assert_eq!(
+            (hits[1].start, hits[1].end, hits[1].kind.clone()),
+            (81, 82, HitKind::Thinking(7)),
         );
     }
 }
