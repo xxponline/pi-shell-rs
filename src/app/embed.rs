@@ -140,6 +140,17 @@ impl EmbeddedApp {
         let _ = self.keys.send(UiEvent::Key(key));
     }
 
+    /// 注入滚轮行数（宿主换算：负=上滚看更早、正=下滚看更新；
+    /// Alt 倍率与像素累积都在宿主侧完成 — terminal-pointer-and-scroll-input D1/D3）。
+    pub fn inject_wheel(&self, lines: i16) {
+        let _ = self.keys.send(UiEvent::Wheel(lines));
+    }
+
+    /// 注入左键点击（0-based 会话帧单元坐标；命中表在 pi-shell 内部）。
+    pub fn inject_click(&self, x: u16, y: u16) {
+        let _ = self.keys.send(UiEvent::Click { x, y });
+    }
+
     /// 注入已提交的文本（IME commit）：逐字符转为字符键事件。
     pub fn inject_text(&self, text: &str) {
         for c in text.chars() {
@@ -328,5 +339,41 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.contains("无法启动 pi"), "err: {err}");
+    }
+
+    /// 门面透传断言（terminal-pointer-and-scroll-input task 1.1）：
+    /// inject_wheel / inject_click 必须把载荷原样送进 keys 通道（宿主 GUI
+    /// 换算好行数/坐标后经此进事件循环）。
+    #[test]
+    fn inject_wheel_and_click_forward_payloads_to_keys_channel() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let size = Arc::new(Mutex::new(Size::new(10, 4)));
+        let backend = VirtualBackend::with_shared_size(size.clone());
+        let app = EmbeddedApp {
+            keys: tx,
+            ansi: backend.buffer(),
+            state: Arc::new(RwLock::new(Default::default())),
+            size,
+            running: Arc::new(AtomicBool::new(true)),
+            thread: Mutex::new(None),
+        };
+
+        app.inject_wheel(-3);
+        match rx.try_recv().expect("wheel 应送达 keys 通道") {
+            UiEvent::Wheel(lines) => assert_eq!(lines, -3, "上滚负行数原样透传"),
+            other => panic!("期望 Wheel, 得到 {other:?}"),
+        }
+
+        app.inject_wheel(7);
+        match rx.try_recv().expect("wheel 应送达 keys 通道") {
+            UiEvent::Wheel(lines) => assert_eq!(lines, 7, "下滚正行数原样透传"),
+            other => panic!("期望 Wheel, 得到 {other:?}"),
+        }
+
+        app.inject_click(12, 7);
+        match rx.try_recv().expect("click 应送达 keys 通道") {
+            UiEvent::Click { x, y } => assert_eq!((x, y), (12, 7), "坐标原样透传"),
+            other => panic!("期望 Click, 得到 {other:?}"),
+        }
     }
 }

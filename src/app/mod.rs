@@ -13,7 +13,7 @@ mod external_editor;
 mod event;
 mod markdown;
 mod overlay;
-mod scroll;
+pub mod scroll; // 宿主（GUI）引 ALT_WHEEL_MULTIPLIER — terminal-pointer-and-scroll-input D1
 mod sessions;
 mod settings_io;
 mod tree;
@@ -120,6 +120,9 @@ pub struct App {
     /// 单卡工具展开覆盖表（toolCallId → 是否展开；Ctrl+O 全局切换时清空，
     /// design D1——≡ pi setToolsExpanded 遍历广播）。
     user_tool_expanded: HashMap<String, bool>,
+    /// thinking 单块展开覆盖表（全局渲染序号 → 是否展开；Ctrl+T 全局切换时
+    /// 清空，design D3——≡ pi setHideThinkingBlock 的 overrides.clear()）。
+    thinking_overrides: HashMap<usize, bool>,
     /// 工具卡片绝对屏行命中表（上一帧渲染反馈，design D2；点击分发用）。
     card_hits: Vec<wrap::CardHit>,
     /// 多行编辑器缓冲（行数组+光标+kill-ring+undo）。
@@ -196,6 +199,7 @@ impl App {
             state: SessionState::new(),
             scroll: ChatScroll::default(),
             user_tool_expanded: HashMap::new(),
+            thinking_overrides: HashMap::new(),
             card_hits: Vec::new(),
             editor: EditorBuffer::new(),
             notice: None,
@@ -2495,6 +2499,9 @@ impl App {
             }
             KeyIntent::ToggleThinking => {
                 self.show_thinking = !self.show_thinking;
+                // 全局切换清单块独立状态（design D3，pi setHideThinkingBlock
+                // 的 overrides.clear() parity；spec「全局切换覆盖单块状态」）。
+                self.thinking_overrides.clear();
                 self.log_event(
                     "key",
                     &format!("thinking toggled -> {}", self.show_thinking),
@@ -3111,6 +3118,10 @@ impl App {
                 // 被替换，滚动恢复贴底跟随——钉住态切到更长会话时 clamp
                 // 救不了（top 不越界、不恢复跟随），必须显式重置。
                 self.scroll = ChatScroll::default();
+                // thinking 单块键是全局渲染序号，跨会话必撞（不同于 uuid
+                // 工具 id）；load_messages 又是 transcript 唯一整体重写点，
+                // 在此单点清表防旧覆盖错块（design D6）。
+                self.thinking_overrides.clear();
             }
             AsyncKind::SessionSwitched => {
                 let cmd = data
@@ -3433,6 +3444,33 @@ mod input_tests {
         assert!(!app.can_submit());
         app.editor.replace("hello");
         assert!(app.can_submit());
+    }
+
+    /// 任务 1.1：Ctrl+T 翻转全局并清空单块覆盖（design D3，pi
+    /// setHideThinkingBlock 的 overrides.clear() parity；spec「全局切换
+    /// 覆盖单块状态」）。
+    #[test]
+    fn ctrl_t_flips_global_and_clears_thinking_overrides() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new();
+        app.thinking_overrides.insert(0, true);
+        app.thinking_overrides.insert(3, false);
+        assert!(!app.show_thinking);
+
+        let ctrl_t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        let intent = App::key_intent(ctrl_t, false);
+        assert_eq!(intent, KeyIntent::ToggleThinking);
+        app.apply_intent(ctrl_t, intent);
+        assert!(app.show_thinking, "全局翻转为展开");
+        assert!(
+            app.thinking_overrides.is_empty(),
+            "单块独立状态被清空，全部跟随新全局"
+        );
+
+        // 再按：回到折叠，表仍空
+        app.apply_intent(ctrl_t, intent);
+        assert!(!app.show_thinking);
+        assert!(app.thinking_overrides.is_empty());
     }
 
     #[test]
@@ -4187,6 +4225,30 @@ mod input_tests {
             app.scroll,
             ChatScroll::default(),
             "重建后恢复贴底跟随（top 归零、following=true）"
+        );
+        assert!(app.state.entries().len() >= 2, "transcript 已被替换");
+    }
+
+    /// 任务 1.2：会话重建（Messages 应答）清空 thinking 单块覆盖——序号键
+    /// 跨会话会撞，旧覆盖不得带入新会话（design D6）。
+    #[test]
+    fn session_reload_clears_thinking_overrides() {
+        let mut app = App::new();
+        app.thinking_overrides.insert(0, true);
+        app.thinking_overrides.insert(2, false);
+
+        app.handle_async_data(
+            AsyncKind::Messages,
+            0,
+            &serde_json::json!({"messages": [
+                {"role": "user", "content": [{"type": "text", "text": "new session"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "answer"}]}
+            ]}),
+        );
+
+        assert!(
+            app.thinking_overrides.is_empty(),
+            "重建后单块覆盖全部失效"
         );
         assert!(app.state.entries().len() >= 2, "transcript 已被替换");
     }
