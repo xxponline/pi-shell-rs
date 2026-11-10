@@ -13,6 +13,7 @@ mod external_editor;
 mod event;
 mod markdown;
 mod overlay;
+mod scroll;
 mod sessions;
 mod settings_io;
 mod tree;
@@ -39,6 +40,9 @@ use crate::app::editor::EditorBuffer;
 use crate::app::event::{AsyncKind, UiEvent};
 use crate::app::overlay::{overlay_key, Overlay, OverlayOutcome};
 use crate::app::terminal::{TerminalGuard, TerminalSinks};
+
+/// 消息区滚动状态（design D1；view/wrap/App 共用）。
+pub use crate::app::scroll::ChatScroll;
 
 /// 按键意图（`key_intent` 的纯映射产物，便于单测）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +74,8 @@ enum KeyIntent {
     Newline,
     /// 强制路径补全（菜单未开时的 Tab；菜单开启时 Tab 为应用键不入此意图）
     ForcePath,
+    /// 消息区整页滚动（PageUp=-1 上翻 / PageDown=+1 下翻；design D4）
+    ScrollPage(i8),
     /// 中止生成（流式 esc）
     Abort,
     /// 外部编辑器（ctrl+g；经事件循环挂起/恢复）
@@ -109,6 +115,8 @@ fn is_slash_cmd_context(text_before: &str) -> bool {
 /// 应用顶层状态（输入缓冲、会话状态、瞬时提示、退出标志）。
 pub struct App {
     state: SessionState,
+    /// 消息区滚动状态（design D1；渲染端经 draw 回写，D2）。
+    scroll: ChatScroll,
     /// 多行编辑器缓冲（行数组+光标+kill-ring+undo）。
     editor: EditorBuffer,
     /// 瞬时提示与颜色（error 红 / warning 黄 / info 默认色）。
@@ -181,6 +189,7 @@ impl App {
             .and_then(|path| std::fs::File::create(path).ok());
         Self {
             state: SessionState::new(),
+            scroll: ChatScroll::default(),
             editor: EditorBuffer::new(),
             notice: None,
             should_quit: false,
@@ -1750,6 +1759,18 @@ impl App {
             return;
         }
 
+        // 消息区整页回看（spec：消息区滚动回看；design D4）：菜单位置已在
+        // 上方消费块处理、浮层在 overlay_key 吞键，此处仅菜单/浮层关闭时
+        // 到达；滚动不影响输入，跳过末尾重算直接返回。
+        if let KeyIntent::ScrollPage(dir) = intent {
+            if dir < 0 {
+                self.scroll.page_up();
+            } else {
+                self.scroll.page_down();
+            }
+            return;
+        }
+
         // 空闲 Esc：双击判定（spec：双击 Esc 动作）。浮层/补全的 Esc 已在前序
         // 分支消费（优先且不计入窗口），流式 Esc 走 Abort 不落此分支。
         if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE && intent == KeyIntent::Ignore
@@ -2369,9 +2390,14 @@ impl App {
             BackTab => KeyIntent::CycleThinking,
             // Tab：菜单未开时强制路径补全（菜单开启的 Tab 已被上方消费块截获）
             Tab if key.modifiers == KeyModifiers::NONE => KeyIntent::ForcePath,
+            // 消息区整页回看（spec：消息区滚动回看；design D4）。菜单位置的
+            // PageUp/Down 已在 handle_key 前序消费块拦截、浮层在 overlay_key
+            // 吞键，均不入此意图。
+            PageUp => KeyIntent::ScrollPage(-1),
+            PageDown => KeyIntent::ScrollPage(1),
             // 编辑族：光标移动 / 删除键 / 字符（含未绑定的 ctrl/alt 组合，
             // 由 apply_intent 的 Edit 分派决定是编辑还是忽略）
-            Left | Right | Up | Down | Home | End | Delete | PageUp | PageDown => {
+            Left | Right | Up | Down | Home | End | Delete => {
                 KeyIntent::Edit
             }
             Backspace | Char(_) => KeyIntent::Edit,
@@ -2420,6 +2446,7 @@ impl App {
             }
             KeyIntent::Ignore => None,
             KeyIntent::ForcePath => None, // handle_key 在 apply_intent 之前拦截
+            KeyIntent::ScrollPage(_) => None, // handle_key 在 apply_intent 之前拦截
             KeyIntent::ExternalEditor => None, // handle_key 单独发事件
             KeyIntent::PasteClipboard => {
                 self.paste_clipboard();
@@ -2998,6 +3025,10 @@ impl App {
             }
             AsyncKind::Messages => {
                 self.state.load_messages(data);
+                // 会话重建/切换链应答（design D5 主路径）：整段 transcript
+                // 被替换，滚动恢复贴底跟随——钉住态切到更长会话时 clamp
+                // 救不了（top 不越界、不恢复跟随），必须显式重置。
+                self.scroll = ChatScroll::default();
             }
             AsyncKind::SessionSwitched => {
                 let cmd = data
@@ -3183,7 +3214,12 @@ impl App {
         }
     }
 
-    fn draw<B: ratatui::backend::Backend>(&self, terminal: &mut ratatui::Terminal<B>) -> io::Result<()>
+    /// 渲染一帧并回写滚动状态（design D2）。
+    ///
+    /// 输入: terminal — ratatui 终端；self — 需 &mut 以回写 self.scroll
+    /// 输出: io::Result（draw 失败时不回写）；副作用为发布 embed 状态、
+    ///       绘制整帧并把渲染端吸收后的 ChatScroll 存回 self.scroll
+    fn draw<B: ratatui::backend::Backend>(&mut self, terminal: &mut ratatui::Terminal<B>) -> io::Result<()>
     where
         io::Error: From<B::Error>,
     {
@@ -3213,8 +3249,13 @@ impl App {
             } else {
                 None
             },
+            scroll: self.scroll,
         };
-        terminal.draw(|frame| view::render(frame, &self.state, &ui))?;
+        // 渲染回写（design D2）：ratatui 闭包返回 ()，经 Cell 带出吸收后的
+        // 滚动状态（视口首行/贴底跟随/视口高），闭包结束后存回。
+        let fb = std::cell::Cell::new(self.scroll);
+        terminal.draw(|frame| fb.set(view::render(frame, &self.state, &ui)))?;
+        self.scroll = fb.get();
         Ok(())
     }
 
@@ -3364,6 +3405,57 @@ mod input_tests {
         assert_eq!(App::key_intent(k(KeyCode::Tab, KeyModifiers::CONTROL), false), KeyIntent::Ignore);
         assert_eq!(App::key_intent(k(KeyCode::Backspace, KeyModifiers::NONE), false), KeyIntent::Edit);
         assert_eq!(App::key_intent(k(KeyCode::F(5), KeyModifiers::NONE), false), KeyIntent::Ignore);
+        // PageUp/PageDown：消息区整页回看（菜单/浮层优先级在 handle_key 前序块）
+        assert_eq!(App::key_intent(k(KeyCode::PageUp, KeyModifiers::NONE), false), KeyIntent::ScrollPage(-1));
+        assert_eq!(App::key_intent(k(KeyCode::PageDown, KeyModifiers::NONE), true), KeyIntent::ScrollPage(1));
+    }
+
+    /// 任务 3.2：菜单关闭时 PageUp/PageDown 整页滚动消息区（跟随打断/下移语义）。
+    #[test]
+    fn page_keys_scroll_chat_when_menu_closed() {
+        let (client, _dir, _log) = recording_commander("pkey", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+        // 视口 20 → 页长 16（20−4 重叠）；中段 top=50 起步
+        app.scroll.viewport = 20;
+        app.scroll.top = 50;
+        app.scroll.following = true;
+
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), &commander, &tx);
+        assert!(!app.scroll.following, "上滚应打断贴底跟随");
+        assert_eq!(app.scroll.top, 50 - 16, "整页上移（20−4 重叠）");
+
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE), &commander, &tx);
+        assert_eq!(app.scroll.top, 50, "下移回原位");
+        assert!(!app.scroll.following, "page_down 不直接改跟随（回底恢复由渲染端 absorb 判定）");
+    }
+
+    /// 任务 3.2：浮层打开时 PageUp 被 overlay_key 吞掉，不动消息区滚动。
+    #[test]
+    fn page_up_consumed_by_overlay_without_touching_scroll() {
+        let (client, _dir, _log) = recording_commander("pkeyov", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+        app.scroll.viewport = 20;
+        app.scroll.top = 50;
+        // loading 态浮层：overlay_key 对非 Esc 键一律 Handled（吞键）
+        app.overlay = Some(Overlay::Tree {
+            tree: Vec::new(),
+            leaf_id: None,
+            rows: Vec::new(),
+            cursor: 0,
+            folded: std::collections::HashSet::new(),
+            filter: crate::app::tree::FilterMode::Default,
+            search: String::new(),
+            loading: true,
+            seq: 0,
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), &commander, &tx);
+        assert_eq!(app.scroll.top, 50, "浮层吞键，不动消息区滚动");
+        assert!(app.scroll.following, "跟随标志不受影响");
     }
 
     #[test]
@@ -3871,6 +3963,34 @@ mod input_tests {
         // ThinkingApplied → state.thinking_level
         app.handle_async_data(AsyncKind::ThinkingApplied, 0, &serde_json::json!("high"));
         assert_eq!(app.state.thinking_level.as_deref(), Some("high"));
+    }
+
+    /// 任务 4.1：会话重建（Messages 应答）重置滚动为贴底跟随（design D5 主路径）。
+    #[test]
+    fn messages_reload_resets_scroll_to_follow() {
+        let mut app = App::new();
+        // 钉住态（用户上滚到中段）
+        app.scroll = ChatScroll {
+            top: 120,
+            following: false,
+            viewport: 20,
+        };
+
+        app.handle_async_data(
+            AsyncKind::Messages,
+            0,
+            &serde_json::json!({"messages": [
+                {"role": "user", "content": [{"type": "text", "text": "old session"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "answer"}]}
+            ]}),
+        );
+
+        assert_eq!(
+            app.scroll,
+            ChatScroll::default(),
+            "重建后恢复贴底跟随（top 归零、following=true）"
+        );
+        assert!(app.state.entries().len() >= 2, "transcript 已被替换");
     }
 
     #[test]

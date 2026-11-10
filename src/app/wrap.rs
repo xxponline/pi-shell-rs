@@ -1,27 +1,35 @@
-//! 视口换行与底部锚定（纯函数，无终端依赖）。
+//! 视口换行与滚动窗口（纯函数，无终端依赖）。
 //!
 //! 背景：ratatui 的 `Paragraph` 在开启 `Wrap` 时，`scroll.y` 按**换行后的
 //! 屏幕行**计数，而我们无法从公开 API 拿到精确的换行行数，导致偏移不足、
-//! 最新内容被挤出视口。这里改为：自己贪心换行到视口宽度，再只保留末尾
-//! `height` 行（底部锚定），渲染时不再使用 `Wrap`/`scroll`。
+//! 最新内容被挤出视口。这里改为：自己贪心换行到视口宽度，再按滚动状态
+//! 截取视口窗口（following=贴底跟随，即原底部锚定行为；钉住=按换行后
+//! 绝对行号开窗），渲染时不再使用 `Wrap`/`scroll`。
 
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-/// 将逻辑行按视口宽度换行，并截取末尾 `height` 行（底部锚定）。
+use crate::app::scroll::ChatScroll;
+
+/// 将逻辑行按视口宽度换行，并按滚动状态截取视口窗口。
 ///
 /// 输入:
 ///   lines  — 逻辑行（span 内可含 `\n`，样式随 span 保留）
 ///   width  — 视口宽度（单元格数，CJK 按 2 计）
-///   height — 视口高度（保留的换行后行数上限）
+///   height — 视口高度（窗口行数上限，至少 1）
+///   scroll — 滚动状态：following 取末尾（贴底跟随，即原底部锚定行为）；
+///            钉住取 `[top, top+height)`，top 越界时 clamp 到底
 /// 输出:
-///   换行后的行序列；总行数 ≤ height，且**尾部**（最新内容）一定保留。
+///   `(窗口行序列, 吸收后的 ChatScroll)`——窗口总行数 ≤ height；返回状态
+///   已回写 `viewport=height` 并 `absorb(effective_top, at_bottom)`：
+///   贴底（含 clamp 到底、内容不足一屏）时 following 恢复为 true。
 ///   空逻辑行保留为一个空行，保证段落间距不塌缩。
 pub fn wrap_for_viewport(
     lines: &[Line<'static>],
     width: u16,
     height: u16,
-) -> Vec<Line<'static>> {
+    scroll: &ChatScroll,
+) -> (Vec<Line<'static>>, ChatScroll) {
     let width = width.max(1) as usize;
     let height = height.max(1) as usize;
 
@@ -50,11 +58,29 @@ pub fn wrap_for_viewport(
         }
     }
 
-    if wrapped.len() > height {
-        let cut = wrapped.len() - height;
-        wrapped.drain(..cut);
+    // 窗口化（design D3）：following 取末尾（现底部锚定行为），钉住取
+    // [top, top+height)；top 越界（内容骤减）时 clamp 到底。
+    let len = wrapped.len();
+    let max_top = len.saturating_sub(height);
+    let effective_top = if scroll.following {
+        max_top
+    } else {
+        scroll.top.min(max_top)
+    };
+    // 贴底判定：窗口已覆盖到最后一行（含内容不足一屏、空内容）。
+    let at_bottom = effective_top + height >= len;
+
+    if effective_top > 0 {
+        wrapped.drain(..effective_top);
     }
-    wrapped
+    wrapped.truncate(height);
+
+    // 回写（design D2）：viewport 供页长计算；absorb 同步 top 并按
+    // at_bottom 恢复/维持跟随。
+    let mut next = *scroll;
+    next.viewport = height as u16;
+    next.absorb(effective_top, at_bottom);
+    (wrapped, next)
 }
 
 /// 把一个逻辑行按 span 内的 `\n` 拆成多个子行（保留每个 span 的样式）。
@@ -223,14 +249,14 @@ mod tests {
     #[test]
     fn content_fitting_viewport_is_unchanged() {
         let lines = vec![plain("hello"), plain("world")];
-        let out = wrap_for_viewport(&lines, 40, 10);
+        let out = wrap_for_viewport(&lines, 40, 10, &ChatScroll::default()).0;
         assert_eq!(render(&out), "hello\nworld");
     }
 
     #[test]
     fn long_line_wraps_at_word_boundary() {
         let lines = vec![plain(&"word ".repeat(50))];
-        let out = wrap_for_viewport(&lines, 20, 100);
+        let out = wrap_for_viewport(&lines, 20, 100, &ChatScroll::default()).0;
         assert!(out.len() > 1, "should wrap");
         for l in &out {
             let w: usize = l.spans.iter().map(|s| s.content.as_ref().width()).sum();
@@ -241,7 +267,7 @@ mod tests {
     #[test]
     fn over_height_keeps_tail_not_head() {
         let lines = vec![plain(&format!("{}TAIL", "word ".repeat(500)))];
-        let out = wrap_for_viewport(&lines, 20, 10);
+        let out = wrap_for_viewport(&lines, 20, 10, &ChatScroll::default()).0;
         assert_eq!(out.len(), 10);
         let text = render(&out);
         assert!(text.trim_end().ends_with("TAIL"), "tail should be newest content: {text:?}");
@@ -252,14 +278,14 @@ mod tests {
     #[test]
     fn embedded_newline_creates_lines() {
         let lines = vec![plain("line1\nline2\nline3")];
-        let out = wrap_for_viewport(&lines, 40, 10);
+        let out = wrap_for_viewport(&lines, 40, 10, &ChatScroll::default()).0;
         assert_eq!(render(&out), "line1\nline2\nline3");
     }
 
     #[test]
     fn empty_logical_line_preserved() {
         let lines = vec![plain("a"), plain(""), plain("b")];
-        let out = wrap_for_viewport(&lines, 40, 10);
+        let out = wrap_for_viewport(&lines, 40, 10, &ChatScroll::default()).0;
         assert_eq!(render(&out), "a\n\nb");
     }
 
@@ -267,7 +293,7 @@ mod tests {
     fn cjk_width_counts_double() {
         // 10 个中文字 = 20 宽，宽度 10 → 每行 5 个
         let lines = vec![plain(&"中".repeat(10))];
-        let out = wrap_for_viewport(&lines, 10, 100);
+        let out = wrap_for_viewport(&lines, 10, 100, &ChatScroll::default()).0;
         assert_eq!(out.len(), 2);
         assert_eq!(render(&out), "中中中中中\n中中中中中");
     }
@@ -275,7 +301,7 @@ mod tests {
     #[test]
     fn unbroken_long_token_hard_splits() {
         let lines = vec![plain(&"x".repeat(45))];
-        let out = wrap_for_viewport(&lines, 10, 100);
+        let out = wrap_for_viewport(&lines, 10, 100, &ChatScroll::default()).0;
         assert_eq!(out.len(), 5); // 45 chars / 10 wide
         assert_eq!(render(&out).replace('\n', ""), "x".repeat(45));
     }
@@ -287,7 +313,7 @@ mod tests {
             Span::styled("aa ", style),
             Span::raw("bb cc dd ee ff gg hh ii jj"),
         ])];
-        let out = wrap_for_viewport(&lines, 10, 100);
+        let out = wrap_for_viewport(&lines, 10, 100, &ChatScroll::default()).0;
         assert!(out.len() >= 2);
         // 首个 span 的样式保留
         let first = out[0]
@@ -309,7 +335,7 @@ mod tests {
             Span::styled("word ".repeat(10), bg),
         ])
         .style(bg)];
-        let out = wrap_for_viewport(&lines, 20, 100);
+        let out = wrap_for_viewport(&lines, 20, 100, &ChatScroll::default()).0;
         assert!(out.len() > 1, "应拆行: {}", out.len());
         for l in &out {
             assert_eq!(l.style.bg, Some(ratatui::style::Color::Rgb(40, 44, 52)), "子行保留 bg");
@@ -320,7 +346,7 @@ mod tests {
 
         // 硬切路径：超宽单 token
         let lines = vec![Line::from(Span::styled("x".repeat(45), bg)).style(bg)];
-        let out = wrap_for_viewport(&lines, 10, 100);
+        let out = wrap_for_viewport(&lines, 10, 100, &ChatScroll::default()).0;
         assert_eq!(out.len(), 5);
         for l in &out {
             assert_eq!(l.style.bg, Some(ratatui::style::Color::Rgb(40, 44, 52)), "硬切子行保留 bg");
@@ -330,7 +356,62 @@ mod tests {
 
         // 无 bg 的行不补 pad（不改变既有行为）
         let lines = vec![plain("hi")];
-        let out = wrap_for_viewport(&lines, 20, 10);
+        let out = wrap_for_viewport(&lines, 20, 10, &ChatScroll::default()).0;
         assert_eq!(render(&out), "hi");
+    }
+
+    /// 任务 2.1：钉住态按 top 开窗口（中段内容），不被新内容/底部挤动。
+    #[test]
+    fn pinned_window_starts_at_top_and_keeps_mid_content() {
+        let lines: Vec<Line> = (0..50).map(|i| plain(&format!("L{i:02}"))).collect();
+        let scroll = ChatScroll {
+            top: 10,
+            following: false,
+            viewport: 0,
+        };
+        let (out, next) = wrap_for_viewport(&lines, 20, 5, &scroll);
+        assert_eq!(render(&out), "L10\nL11\nL12\nL13\nL14", "窗口应从 top 起");
+        assert_eq!(next.top, 10, "中段 top 原样回写");
+        assert!(!next.following, "中段维持钉住");
+        assert_eq!(next.viewport, 5, "回写视口高供页长计算");
+    }
+
+    /// 任务 2.1：following 态 = 原底部锚定（回归网）；top 越界 clamp 到底
+    /// 并恢复跟随（规格场景 3 兜底路径）。
+    #[test]
+    fn following_keeps_tail_and_out_of_range_top_clamps_to_bottom() {
+        let lines: Vec<Line> = (0..50).map(|i| plain(&format!("L{i:02}"))).collect();
+
+        // following：取末尾，与原行为逐字节一致
+        let (out, next) = wrap_for_viewport(&lines, 20, 5, &ChatScroll::default());
+        assert_eq!(render(&out), "L45\nL46\nL47\nL48\nL49");
+        assert!(next.following);
+        assert_eq!(next.top, 45);
+
+        // 钉住但 top 越界（内容骤减后残留 stale top）：clamp 到底 + 恢复跟随
+        let stale = ChatScroll {
+            top: 60,
+            following: false,
+            viewport: 0,
+        };
+        let (out, next) = wrap_for_viewport(&lines, 20, 5, &stale);
+        assert_eq!(render(&out), "L45\nL46\nL47\nL48\nL49", "越界应 clamp 到底");
+        assert!(next.following, "clamp 到底应恢复跟随");
+        assert_eq!(next.top, 45);
+    }
+
+    /// 任务 2.1：内容不足一屏时窗口全量、视为贴底（恢复跟随）。
+    #[test]
+    fn short_content_pinned_restores_follow() {
+        let lines = vec![plain("a"), plain("b")];
+        let scroll = ChatScroll {
+            top: 7,
+            following: false,
+            viewport: 0,
+        };
+        let (out, next) = wrap_for_viewport(&lines, 20, 10, &scroll);
+        assert_eq!(render(&out), "a\nb");
+        assert!(next.following, "内容不足一屏即视为贴底");
+        assert_eq!(next.top, 0);
     }
 }

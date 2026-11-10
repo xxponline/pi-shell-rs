@@ -9,6 +9,7 @@ use ratatui::Frame;
 use pi_shell_rs::session::{Phase, SessionState, Usage};
 
 use crate::app::chat::{chat_lines, RenderFlags};
+use crate::app::scroll::ChatScroll;
 use crate::app::wrap::wrap_for_viewport;
 use unicode_width::UnicodeWidthChar;
 
@@ -38,11 +39,17 @@ pub struct ViewUi<'a> {
     pub local_queue: &'a [String],
     /// 斜杠补全菜单（Some=打开，渲染于输入框下方）。
     pub completion: Option<&'a crate::app::autocomplete::CompletionState>,
+    /// 消息区滚动状态（design D1；按值 Copy，渲染端经返回值回写）。
+    pub scroll: ChatScroll,
 }
 
 
 /// 从不可变状态渲染一帧（含浮层）。
-pub fn render(frame: &mut Frame, state: &SessionState, ui: &ViewUi<'_>) {
+///
+/// 输入: frame — ratatui 帧；state — 会话状态；ui — 一帧的 UI 附加输入
+/// 输出: 吸收后的 `ChatScroll`（渲染端回写：视口首行/贴底跟随/视口高，
+///       design D2——调用方应将其存回 App 滚动状态）；副作用为绘制整帧
+pub fn render(frame: &mut Frame, state: &SessionState, ui: &ViewUi<'_>) -> ChatScroll {
     let area = frame.area();
     let queue = queue_lines(state, ui.local_queue);
     let queue_h = queue.len() as u16;
@@ -67,7 +74,7 @@ pub fn render(frame: &mut Frame, state: &SessionState, ui: &ViewUi<'_>) {
         .split(area);
 
     render_header(frame, chunks[0], state, ui);
-    render_chat(frame, chunks[1], state, ui.flags);
+    let scroll = render_chat(frame, chunks[1], state, ui.flags, ui.scroll);
     if queue_h > 0 {
         frame.render_widget(
             Paragraph::new(queue).style(Style::default().fg(Color::DarkGray)),
@@ -106,6 +113,7 @@ pub fn render(frame: &mut Frame, state: &SessionState, ui: &ViewUi<'_>) {
             current_session: ui.current_session,
             local_queue: ui.local_queue,
             completion: ui.completion,
+            scroll: ui.scroll,
         }
     };
     render_editor(frame, chunks[4], &editor_ui, state.phase);
@@ -116,6 +124,7 @@ pub fn render(frame: &mut Frame, state: &SessionState, ui: &ViewUi<'_>) {
     if let Some(overlay) = ui.overlay {
         crate::app::overlay::render_overlay(frame, overlay, ui.current_session);
     }
+    scroll
 }
 
 /// 构建队列带行：`[steer]`/`[queue]` 前缀，最多 2 行，超出显示 `…N more`。
@@ -251,18 +260,30 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, state: &Session
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// 渲染消息区（滚动窗口）。
+///
+/// 输入:
+///   frame  — ratatui 帧
+///   area   — 消息区矩形（三分区布局的 Min(1) 块）
+///   state  — 会话状态（chat_lines 展开源）
+///   flags  — thinking/工具展开偏好
+///   scroll — 当前滚动状态（following 贴底 / 钉住开窗）
+/// 输出: 吸收后的 ChatScroll（窗口首行、贴底判定、视口高回写）；
+///       副作用为在 area 上绘制消息区
 fn render_chat(
     frame: &mut Frame,
     area: ratatui::layout::Rect,
     state: &SessionState,
     flags: RenderFlags,
-) {
+    scroll: ChatScroll,
+) -> ChatScroll {
     let lines = chat_lines(state, flags);
-    // 自行换行并底部锚定：ratatui 的 Wrap+scroll 偏移按换行后行数计，
-    // 我们无法精确预知，会导致最新内容被挤出视口（见 wrap 模块说明）。
-    let wrapped = wrap_for_viewport(&lines, area.width, area.height);
+    // 自行换行后按滚动状态开窗口：ratatui 的 Wrap+scroll 偏移按换行后行数
+    // 计，我们无法精确预知，会导致最新内容被挤出视口（见 wrap 模块说明）。
+    let (wrapped, next) = wrap_for_viewport(&lines, area.width, area.height, &scroll);
     let paragraph = Paragraph::new(wrapped);
     frame.render_widget(paragraph.block(Block::default().borders(Borders::NONE)), area);
+    next
 }
 
 /// 输入区高度：clamp(逻辑行数 + 2 边框, 3, 8)——随行数增长但不挤压消息区。
@@ -502,6 +523,52 @@ mod render_tests {
             buf.contains("TAIL-MARKER-END"),
             "reply tail must be visible in viewport; got:\n{buf}"
         );
+    }
+
+    /// 任务 2.2：render 返回吸收后的滚动状态（following / pinned / 越界三态）。
+    #[test]
+    fn render_returns_absorbed_scroll_state() {
+        let state = long_reply_state();
+        let fb = std::cell::Cell::new(ChatScroll::default());
+        let draw_with = |scroll: ChatScroll| {
+            let backend = TestBackend::new(40, 12);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    let ui = ViewUi {
+                        input: "",
+                        scroll,
+                        ..ViewUi::default()
+                    };
+                    fb.set(render(frame, &state, &ui));
+                })
+                .unwrap();
+            fb.get()
+        };
+
+        // following 态：贴底、回写视口高（40x12 → chat = 12 − 1 header − 3 editor）
+        let following = draw_with(ChatScroll::default());
+        assert!(following.following, "following 态渲染后仍贴底");
+        assert_eq!(following.viewport, 8, "回写消息区视口高");
+        assert!(following.top > 0, "内容溢出时贴底 top 应大于 0");
+
+        // pinned 态（top=0）：视口钉在头部，不恢复跟随
+        let pinned = draw_with(ChatScroll {
+            top: 0,
+            following: false,
+            viewport: 0,
+        });
+        assert!(!pinned.following, "中段维持钉住");
+        assert_eq!(pinned.top, 0, "钉住首行回写");
+
+        // stale top 越界：clamp 到底并恢复跟随，首行与贴底态一致
+        let stale = draw_with(ChatScroll {
+            top: usize::MAX,
+            following: false,
+            viewport: 0,
+        });
+        assert!(stale.following, "越界 clamp 到底应恢复跟随");
+        assert_eq!(stale.top, following.top, "clamp 到底与贴底首行一致");
     }
 
     #[test]
