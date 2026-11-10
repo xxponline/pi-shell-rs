@@ -85,6 +85,28 @@ label（条目名；`/` 菜单中 value==label 视觉不变）。
 **Enter 只应用不提交**（同 `@` 菜单）。行首 `/` 且其后无空白时 Tab 不触发
 （斜杠命令上下文由斜杠菜单负责）。
 
+### 工具卡片
+
+工具调用以结构化卡片渲染（头行 + 结果体），对照原生 pi：
+
+- **运行中流式输出**：`tool_execution_update` 的部分结果实时进卡片，长命令
+  执行期间可见已到达的输出，无需等结束。
+- **计时**：运行中显示 `Elapsed 4.2s`（每秒刷新），结束后 `Took 4.2s`
+  （服务端 `durationMs` 优先）；格式 `4.2s` / `1m 30s` / `2h 3m 4s`。
+- **背景面板**：整卡背景按状态着色（运行灰 / 成功墨绿 / 失败暗红），
+  叠加在状态文字之上。
+- **头行**：`● name · 关键参数 · 状态 · 计时`。bash 为 `$ <cmd>` +
+  `(timeout Ns)`；read 带行范围（`:1-20`）与折叠态 compact 分类
+  （`[skill] <目录名>`、`resource`、`docs`）；grep/find/ls 带 glob/limit；
+  未知工具为 `name key="value"` 参数摘要（展开态逐参数分行）。
+- **折叠预览**（Ctrl+O 切换）：按工具保留行数——bash **尾部** 5 行
+  （exit code 在末尾可见）、grep 15、find/ls 20、write 10（带总行数）、
+  其余头部 10 行；截断时带 `... (N earlier/more lines, ctrl+o to expand)`
+  提示。exit 状态行与截断警告不参与折叠，始终可见。
+- **截断警告**：带具体数字/路径——bash `[Full output: <path>]` + 行数/字节
+  详情，grep/find/ls 各自 limit（`500 matches limit` 等），read 三形态
+  （首行超限/行数/字节）。
+
 ## 界面布局
 
 ```
@@ -98,8 +120,8 @@ label（条目名；`/` 菜单中 value==label 视觉不变）。
 │ │ fn main() { … }                  │
 │ └─                                 │
 │ <thinking N chars>                 │  思考块（默认折叠，Ctrl+T 展开）
-│ ● read Cargo.toml · done · 12ms    │  工具卡片（红=error 黄=running 绿=done）
-│ exit 0                             │  展开态含结果/diff（Ctrl+O 切换）
+│ ● read Cargo.toml · done · Took 0.0s│  工具卡片（红=error 黄=running 绿=done）
+│ exit 0                             │  运行中流式输出+Elapsed；展开态含结果/diff（Ctrl+O 切换）
 └────────────────────────────────────┘
 [queue] 排队中的 follow_up 消息        ← 队列带（空队列不占行，最多 2 行）
 [widget] 扩展 setWidget 的行              ← widget 区（未设置不占行）
@@ -144,7 +166,7 @@ label（条目名；`/` 菜单中 value==label 视觉不变）。
 | /resume·/tree 内 ctrl+d | 会话两段式删除（再按一次确认；拒绝删除活跃会话） |
 | /tree 内 ctrl+o / ←→ | 过滤模式循环 / 折叠展开子树 |
 | /tree 内直接键入 | **即时搜索**：可打印字符入查询（空白分词、全部命中、大小写不敏感子串）；backspace 删字符；Esc 先清查询（面板保持）再按才关；标题区显示 `filter:… · search:"…" (n 命中)`，零命中黄字提示；搜索与过滤/折叠正交叠加 |
-| Ctrl+O | 切换工具卡片输出展开/折叠（默认显示头行+前 3 行） |
+| Ctrl+O | 切换工具卡片输出展开/折叠（默认按工具折叠：bash 尾 5 行 / grep 15 / find·ls 20 / 其余头 10 行，带隐藏行数提示） |
 | Ctrl+L | 打开模型选择器（↑/↓ 导航，Enter 应用，Esc 取消） |
 | Ctrl+P / Shift+Ctrl+P | 循环切换模型（下一个 / 上一个） |
 | Shift+Tab | 循环 thinking 级别 |

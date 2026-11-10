@@ -168,6 +168,9 @@ macOS 实现）。
 | 13 | Windows 键位分支 | 仅 macOS | 忽略（个人项目） |
 | 14 | **树内标签编辑**（shift+L 改消息 label） | **不做**：三重排除——① 消息 label 只能经扩展 API 写入，**RPC 无写 label 方法**，不加新 RPC 就无法落地；② pi 自身的 `app.tree.editLabel` 键位是**未接线的死键**（`TreeSelector.onLabelEdit` 回调从未被 interactive-mode 传入），无既有行为可对齐；③ 会话显示名编辑已由 `/name`（现有 `set_session_name` RPC）覆盖 | 忽略（约束排除） |
 | 15 | **tab 纯路径补全**（force 下钻、单条直插）；`@`/Path 菜单回车只应用不提交 | ✅ 已对齐（`add-path-tab-completion`：Tab 列 cwd/路径候选、force 态持续重过滤退格不关、恰 1 条直接插入；Enter 语义修正为仅斜杠菜单 fall-through 提交） | ~~中~~ 已完成 |
+| 16 | 工具卡片状态**仅**背景色（运行灰/成功绿/失败红），无 `running/done` 状态文字 | ✅ 保留圆点+状态文字——规格 `tui-app`「工具调用卡片」明文要求“显示状态（进行中/成功/失败）与耗时”；后续工具卡片对齐 change 可叠加背景面板，但不替代文字 | 忽略（规格背离，保持现状） |
+| 17 | read 卡片折叠态**不显示**结果（仅头行 + expand 提示） | ✅ 保留折叠预览（头部 10 行）——规格要求“read 显示文件路径与**内容预览**”；折叠即预览是刻意的可用性差异 | 忽略（规格背离，保持现状） |
+| 18 | **工具卡片渲染**：运行中流式输出、Elapsed/Took 计时、背景面板、bash 折叠取尾、截断警告带数字、头行 prompt/行范围/limit/compact 分类 | ✅ 已对齐（`align-tool-card-rendering`：partialResult 进状态并实时渲染、计时格式对齐 pi、三态背景面板、exit 行与警告不受折叠、各工具 limit 警告与行数提示） | ~~中~~ 已完成 |
 
 ## 6. 已实现且对齐的部分
 

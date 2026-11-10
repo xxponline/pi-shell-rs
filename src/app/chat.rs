@@ -6,7 +6,7 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use pi_shell_rs::session::{Block, Entry, SessionState};
+use pi_shell_rs::session::{Block, Entry, SessionState, ToolExecution, ToolStatus};
 
 /// 渲染偏好标志（App 级 UI 状态，经键位切换）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -204,15 +204,35 @@ fn append_blocks(out: &mut Vec<Line<'static>>, blocks: &[Block], flags: RenderFl
                 }
             }
             Block::ToolCall { name, args_json, tool, .. } => {
-                // 工具调用渲染为结构化卡片（展开态由 flags.expand_tools 控制）。
-                out.extend(crate::app::tools::tool_lines(
+                // 工具调用渲染为结构化卡片（展开态由 flags.expand_tools 控制）；
+                // 背景面板按状态着色（design D5），状态文字/圆点保留（spec #16）。
+                let bg = tool_panel_bg(tool);
+                for mut line in crate::app::tools::tool_lines(
                     name,
                     args_json,
                     tool,
                     flags.expand_tools,
-                ));
+                ) {
+                    line.style = Style::default().bg(bg);
+                    out.push(line);
+                }
             }
         }
+    }
+}
+
+/// 工具卡片背景面板色（design D5）：由 pi dark.json 的 okhsl 转 RGB——
+/// `toolPendingBg` okhsl(229 5% 24%) 运行灰、`toolSuccessBg` okhsl(158 46% 25%)
+/// 成功墨绿、`toolErrorBg` okhsl(19 54% 25%) 失败暗红（转换经 pi oklab.ts
+/// 权威算法核算）。
+///
+/// 输入: tool — 执行状态（读 status/is_error）
+/// 输出: 面板背景色（spec #16：背景叠加、不替代状态文字）
+fn tool_panel_bg(tool: &ToolExecution) -> Color {
+    match tool.status {
+        ToolStatus::Pending | ToolStatus::Running => Color::Rgb(52, 56, 58),
+        ToolStatus::Ended if tool.is_error => Color::Rgb(91, 40, 42),
+        ToolStatus::Ended => Color::Rgb(37, 65, 49),
     }
 }
 
@@ -375,8 +395,9 @@ mod tests {
         use pi_shell_rs::session::{Block, ToolExecution, ToolStatus};
         let mut s = SessionState::new();
         s.handle(&serde_json::json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
-        // 构造一个多行结果的工具块
-        let result = serde_json::json!({"content":[{"type":"text","text":"l1\nl2\nl3\nl4\nl5\nl6"}]});
+        // 构造一个多行结果的工具块（read 折叠头部 10 行，造 15 行体现差异）
+        let text: String = (1..=15).map(|i| format!("l{i}\n")).collect();
+        let result = serde_json::json!({"content":[{"type":"text","text": text}]});
         s.transcript.push(pi_shell_rs::session::Entry::Assistant {
             turn: 1,
             blocks: vec![Block::ToolCall {
@@ -388,6 +409,7 @@ mod tests {
                     is_error: false,
                     result: Some(result),
                     duration_ms: Some(3),
+                    ..Default::default()
                 },
             }],
             usage: None,
@@ -398,8 +420,9 @@ mod tests {
             RenderFlags { show_thinking: false, expand_tools: true },
         ));
         assert!(collapsed.contains("l1"), "{collapsed}");
-        assert!(!collapsed.contains("l6"), "折叠态不应到 l6: {collapsed}");
-        assert!(expanded.contains("l6"), "展开态应含 l6: {expanded}");
+        assert!(!collapsed.contains("l11"), "折叠态不应到 l11: {collapsed}");
+        assert!(collapsed.contains("more lines, ctrl+o to expand"), "提示行: {collapsed}");
+        assert!(expanded.contains("l15"), "展开态应含 l15: {expanded}");
     }
 
     #[test]
@@ -520,5 +543,78 @@ mod tests {
         assert!(text.contains("已截断"), "超限提示: {text}");
         assert!(text.contains("row599"), "保留末尾");
         assert!(!text.contains("row0\n"), "丢弃开头（或至少不含首行）");
+    }
+
+    /// design D5 / spec 状态背景面板：三态着色、状态文字保留、非卡片行无背景。
+    #[test]
+    fn tool_card_panel_bg_three_states() {
+        let mk = |status: ToolStatus, is_error: bool| Block::ToolCall {
+            id: "c1".into(),
+            name: "bash".into(),
+            args_json: r#"{"command":"ls"}"#.into(),
+            tool: ToolExecution {
+                status,
+                is_error,
+                result: Some(serde_json::json!({"content":[{"type":"text","text":"out"}]})),
+                ..Default::default()
+            },
+        };
+        let mut s = SessionState::new();
+        s.handle(&serde_json::json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+        s.transcript.push(Entry::Assistant {
+            turn: 1,
+            blocks: vec![
+                mk(ToolStatus::Running, false),
+                mk(ToolStatus::Ended, false),
+                mk(ToolStatus::Ended, true),
+            ],
+            usage: None,
+        });
+        let lines = chat_lines(&s, RenderFlags::default());
+
+        // 每张卡片的所有行带对应 bg，且状态文字保留（spec #16）
+        let expect = [
+            Color::Rgb(52, 56, 58),  // 运行灰
+            Color::Rgb(37, 65, 49),  // 成功墨绿
+            Color::Rgb(91, 40, 42),  // 失败暗红
+        ];
+        let status_texts = ["running", "done", "error"];
+        for (i, (&bg, status)) in expect.iter().zip(status_texts.iter()).enumerate() {
+            // 找到该卡片的起始行（含工具名的头行）
+            let start = lines
+                .iter()
+                .position(|l| {
+                    l.spans.iter().any(|sp| sp.content.as_ref() == "bash")
+                        && l.spans.iter().any(|sp| sp.content.as_ref().contains(status))
+                })
+                .unwrap_or_else(|| panic!("卡 {i} 头行未找到"));
+            // 卡片行 = 从头行起连续带该 bg 的行
+            let mut j = start;
+            while j < lines.len() && lines[j].style.bg == Some(bg) {
+                j += 1;
+            }
+            assert!(j > start, "卡 {i} 头行应带面板 bg");
+            assert!(
+                j == lines.len() || lines[j].style.bg != Some(bg),
+                "卡 {i} 面板在卡片结束处终止"
+            );
+            // 状态文字仍可见（背景不替代文字，spec #16）
+            let head_text: String = lines[start]
+                .spans
+                .iter()
+                .map(|sp| sp.content.as_ref())
+                .collect();
+            assert!(head_text.contains(status), "状态文字保留: {head_text}");
+        }
+
+        // 非卡片行（用户消息等）无背景
+        let mut s2 = SessionState::new();
+        s2.handle(&serde_json::json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}));
+        s2.handle(&serde_json::json!({"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}));
+        let lines2 = chat_lines(&s2, RenderFlags::default());
+        assert!(
+            lines2.iter().all(|l| l.style.bg.is_none()),
+            "非卡片行不应有背景"
+        );
     }
 }

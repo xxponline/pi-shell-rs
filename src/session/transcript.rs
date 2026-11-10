@@ -318,6 +318,8 @@ impl SessionState {
             is_error: msg.get("isError").and_then(|b| b.as_bool()).unwrap_or(false),
             result: Some(Value::Object(result_obj)),
             duration_ms: msg.get("durationMs").and_then(|d| d.as_u64()),
+            partial: None,
+            started_at: None,
         };
         for entry in transcript.iter_mut().rev() {
             if let Entry::Assistant { blocks, .. } = entry {
@@ -375,6 +377,29 @@ impl SessionState {
     /// Whether an assistant message is currently accumulating.
     pub fn is_in_flight(&self) -> bool {
         !self.inflight.is_empty()
+    }
+
+    /// 是否存在运行中的工具调用（design D3：驱动计时刷新的条件重绘）。
+    ///
+    /// 输入: self — 会话状态
+    /// 输出: true = in_flight 块或已落盘 transcript 条目中有 Running 工具
+    pub fn has_running_tool(&self) -> bool {
+        let is_running = |blocks: &[Block]| {
+            blocks.iter().any(|b| {
+                matches!(
+                    b,
+                    Block::ToolCall { tool, .. }
+                        if matches!(tool.status, crate::session::blocks::ToolStatus::Running)
+                )
+            })
+        };
+        if is_running(&self.inflight) {
+            return true;
+        }
+        self.transcript.iter().any(|e| match e {
+            Entry::Assistant { blocks, .. } => is_running(blocks),
+            _ => false,
+        })
     }
 
     /// Apply one top-level wire event (weakly typed JSON). Unknown event types
@@ -671,23 +696,30 @@ impl SessionState {
         };
         let exec = crate::session::blocks::ToolExecution {
             status: crate::session::blocks::ToolStatus::Running,
+            started_at: Some(std::time::Instant::now()),
             ..Default::default()
         };
         self.apply_tool(id.to_string(), exec);
     }
 
     fn on_tool_update(&mut self, event: &Value) {
-        // Updates carry partialResult; we only need to mark running existence.
-        if let Some(id) = event.get("toolCallId").and_then(|i| i.as_str())
-            && !self.has_tool(id) {
-                self.apply_tool(
-                    id.to_string(),
-                    crate::session::blocks::ToolExecution {
-                        status: crate::session::blocks::ToolStatus::Running,
-                        ..Default::default()
-                    },
-                );
-            }
+        // partialResult 存为运行中部分结果（D1）；无该字段的 update 不清空
+        // 已有 partial（merge 继承规则），首见时同时打点执行起点（D2）。
+        let Some(id) = event.get("toolCallId").and_then(|i| i.as_str()) else {
+            return;
+        };
+        let known = self.has_tool(id);
+        let exec = crate::session::blocks::ToolExecution {
+            status: crate::session::blocks::ToolStatus::Running,
+            partial: event.get("partialResult").cloned(),
+            started_at: if known {
+                None
+            } else {
+                Some(std::time::Instant::now())
+            },
+            ..Default::default()
+        };
+        self.apply_tool(id.to_string(), exec);
     }
 
     fn on_tool_end(&mut self, event: &Value) {
@@ -699,6 +731,10 @@ impl SessionState {
             is_error: event.get("isError").and_then(|b| b.as_bool()).unwrap_or(false),
             result: event.get("result").cloned(),
             duration_ms: event.get("durationMs").and_then(|d| d.as_u64()),
+            // 终态不带部分结果与起点：merge 规则负责清空既有 partial，
+            // 起点由 merge 保留 base 侧（min 合并）。
+            partial: None,
+            started_at: None,
         };
         self.apply_tool(id.to_string(), exec);
     }
@@ -974,6 +1010,8 @@ impl SessionState {
                 Value::Object(obj)
             }),
             duration_ms: tr.get("durationMs").and_then(|d| d.as_u64()),
+            partial: None,
+            started_at: None,
         };
         self.apply_tool(id.to_string(), exec);
     }
@@ -1027,14 +1065,38 @@ fn merge_tool(
     new: crate::session::blocks::ToolExecution,
 ) -> crate::session::blocks::ToolExecution {
     crate::session::blocks::ToolExecution {
-        status: if matches!(new.status, crate::session::blocks::ToolStatus::Ended) {
-            crate::session::blocks::ToolStatus::Ended
-        } else {
-            base.status.clone()
+        // 生命周期提升：任一侧 Ended → 终态；否则新 Running 提升 Pending；
+        // base Running 保持（终态后晚到的 Running 不回退，由 Ended 分支兼管）。
+        status: match (&base.status, &new.status) {
+            (crate::session::blocks::ToolStatus::Ended, _)
+            | (_, crate::session::blocks::ToolStatus::Ended) => {
+                crate::session::blocks::ToolStatus::Ended
+            }
+            (_, crate::session::blocks::ToolStatus::Running) => {
+                crate::session::blocks::ToolStatus::Running
+            }
+            (crate::session::blocks::ToolStatus::Running, _) => {
+                crate::session::blocks::ToolStatus::Running
+            }
+            _ => crate::session::blocks::ToolStatus::Pending,
         },
         is_error: new.is_error || base.is_error,
         result: merge_result(base.result.as_ref(), new.result.as_ref()),
         duration_ms: new.duration_ms.or(base.duration_ms),
+        // D1：任一侧 Ended 则 partial 清空（final 替换、晚到 update 不污染）；
+        // 否则新 partial 优先、缺省继承。
+        partial: if matches!(new.status, crate::session::blocks::ToolStatus::Ended)
+            || matches!(base.status, crate::session::blocks::ToolStatus::Ended)
+        {
+            None
+        } else {
+            new.partial.or_else(|| base.partial.clone())
+        },
+        // 起点取最早（start 打点后 update 不再覆盖）。
+        started_at: match (base.started_at, new.started_at) {
+            (Some(b), Some(n)) => Some(std::cmp::min(b, n)),
+            (b, n) => b.or(n),
+        },
     }
 }
 
@@ -1201,6 +1263,81 @@ mod tests {
             },
             _ => panic!(),
         }
+    }
+
+    /// spec session-state：运行中记录部分结果（start → update(partial)）。
+    #[test]
+    fn tool_update_records_partial_while_running() {
+        let mut s = SessionState::new();
+        s.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+        s.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"toolcall_start","contentIndex":0,"id":"c1","toolName":"bash"}}));
+        s.handle(&json!({"type":"tool_execution_start","toolCallId":"c1","toolName":"bash"}));
+        s.handle(&json!({"type":"tool_execution_update","toolCallId":"c1","toolName":"bash",
+            "partialResult":{"content":[{"type":"text","text":"half"}]}}));
+        let tool = find_tool(&s, "c1");
+        assert_eq!(tool.status, crate::session::blocks::ToolStatus::Running, "运行中");
+        let p = tool.partial.as_ref().expect("update 应记录 partialResult");
+        assert_eq!(p["content"][0]["text"], "half", "部分结果内容");
+        assert!(tool.started_at.is_some(), "首见应打点起点");
+
+        // 无 partialResult 字段的 update 不清空已有部分结果
+        s.handle(&json!({"type":"tool_execution_update","toolCallId":"c1","toolName":"bash"}));
+        let tool = find_tool(&s, "c1");
+        assert!(tool.partial.is_some(), "无 partialResult 的 update 不得清空");
+
+        // spec：完整结果替换部分结果，结束后不残留
+        s.handle(&json!({"type":"tool_execution_end","toolCallId":"c1","toolName":"bash","isError":false,
+            "result":{"content":[{"type":"text","text":"full output"}]},"durationMs":7}));
+        let tool = find_tool(&s, "c1");
+        assert_eq!(tool.status, crate::session::blocks::ToolStatus::Ended);
+        assert!(tool.partial.is_none(), "结束后 partial 不得残留");
+        assert_eq!(tool.result.as_ref().unwrap()["content"][0]["text"], "full output");
+        assert_eq!(tool.duration_ms, Some(7));
+    }
+
+    /// design D3：has_running_tool 覆盖 in_flight 与已落盘 transcript 两种
+    /// Running 来源；Ended 不算。
+    #[test]
+    fn has_running_tool_covers_both_sources() {
+        let mut s = SessionState::new();
+        assert!(!s.has_running_tool(), "空状态无运行中工具");
+
+        // 来源 1：in_flight（toolcall_start 后、message_end 前）
+        s.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+        s.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"toolcall_start","contentIndex":0,"id":"t1","toolName":"bash"}}));
+        assert!(!s.has_running_tool(), "仅 toolcall_start 时为 Pending，不算运行中");
+
+        s.handle(&json!({"type":"tool_execution_start","toolCallId":"t1","toolName":"bash"}));
+        assert!(s.has_running_tool(), "in_flight 且 start 后算运行中");
+
+        // 来源 2：已落盘 transcript（message_end 后工具仍 Running）
+        s.handle(&json!({"type":"message_end","message":{"role":"assistant","content":[
+            {"type":"toolCall","id":"t1","name":"bash","arguments":{"command":"x"}}
+        ]}}));
+        assert!(s.has_running_tool(), "已落盘但未 end 的工具仍算运行中");
+
+        // end 后不再算
+        s.handle(&json!({"type":"tool_execution_end","toolCallId":"t1","toolName":"bash","isError":false,
+            "result":{"content":[]},"durationMs":3}));
+        assert!(!s.has_running_tool(), "结束后不算运行中");
+    }
+
+    /// 从 inflight 与 transcript 中按 id 查工具执行（测试辅助）。
+    fn find_tool(s: &SessionState, id: &str) -> crate::session::blocks::ToolExecution {
+        let scan = |blocks: &[Block]| -> Option<crate::session::blocks::ToolExecution> {
+            blocks.iter().find_map(|b| match b {
+                Block::ToolCall { id: bid, tool, .. } if bid == id => Some(tool.clone()),
+                _ => None,
+            })
+        };
+        scan(s.in_flight())
+            .or_else(|| {
+                s.entries().iter().find_map(|e| match e {
+                    Entry::Assistant { blocks, .. } => scan(blocks),
+                    _ => None,
+                })
+            })
+            .unwrap_or_else(|| panic!("tool {id} not found"))
     }
 
     #[test]
@@ -1635,5 +1772,67 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// helper：造一个指定状态/部分结果/起点的 ToolExecution。
+    fn tool(
+        status: crate::session::blocks::ToolStatus,
+        partial: Option<Value>,
+        started: Option<std::time::Instant>,
+    ) -> crate::session::blocks::ToolExecution {
+        crate::session::blocks::ToolExecution {
+            status,
+            partial,
+            started_at: started,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn merge_tool_update_inherits_partial() {
+        use crate::session::blocks::ToolStatus;
+        // update→update：新 partial 优先，无新 partial 时继承旧的
+        let base = tool(ToolStatus::Running, Some(json!({"content":[{"text":"a"}]})), None);
+        let new = tool(ToolStatus::Running, Some(json!({"content":[{"text":"ab"}]})), None);
+        let m = merge_tool(&base, new);
+        assert_eq!(m.partial.unwrap()["content"][0]["text"], "ab", "新 partial 优先");
+
+        let new2 = tool(ToolStatus::Running, None, None);
+        let m2 = merge_tool(&base, new2);
+        assert_eq!(m2.partial.unwrap()["content"][0]["text"], "a", "无新 partial 继承旧的");
+    }
+
+    #[test]
+    fn merge_tool_end_clears_partial() {
+        use crate::session::blocks::ToolStatus;
+        // update→end：终态替换，partial 清空、result 为完整结果
+        let base = tool(ToolStatus::Running, Some(json!({"content":[{"text":"part"}]})), None);
+        let end = crate::session::blocks::ToolExecution {
+            status: ToolStatus::Ended,
+            result: Some(json!({"content":[{"text":"full"}]})),
+            duration_ms: Some(42),
+            ..Default::default()
+        };
+        let m = merge_tool(&base, end);
+        assert!(m.partial.is_none(), "end 后 partial 必须清空");
+        assert_eq!(m.result.unwrap()["content"][0]["text"], "full");
+        assert_eq!(m.duration_ms, Some(42));
+        assert_eq!(m.status, ToolStatus::Ended);
+    }
+
+    #[test]
+    fn merge_tool_late_update_after_end_does_not_pollute() {
+        use crate::session::blocks::ToolStatus;
+        // end→晚到 update：任一侧 Ended 则 partial 保持 None，状态保持 Ended
+        let ended = crate::session::blocks::ToolExecution {
+            status: ToolStatus::Ended,
+            result: Some(json!({"content":[{"text":"final"}]})),
+            ..Default::default()
+        };
+        let late = tool(ToolStatus::Running, Some(json!({"content":[{"text":"late"}]})), None);
+        let m = merge_tool(&ended, late);
+        assert!(m.partial.is_none(), "晚到 update 不得污染终态");
+        assert_eq!(m.status, ToolStatus::Ended, "状态保持终态");
+        assert_eq!(m.result.unwrap()["content"][0]["text"], "final", "result 不被覆盖");
     }
 }

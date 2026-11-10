@@ -27,8 +27,26 @@ pub fn wrap_for_viewport(
 
     let mut wrapped: Vec<Line<'static>> = Vec::new();
     for line in lines {
+        // 父行 style（如工具卡片 bg 面板）传播到拆分出的子行（design D5）：
+        // Paragraph 只给有文本的单元格上色，行尾还得补 pad。
+        let style = line.style;
+        let start = wrapped.len();
         for sub in split_on_newlines(line) {
             wrap_one(&sub, width, &mut wrapped);
+        }
+        for l in &mut wrapped[start..] {
+            l.style = style;
+        }
+    }
+
+    // 带 bg 的行补齐到视口宽（整行面板着色，否则行尾露底色）。
+    for l in &mut wrapped {
+        if l.style.bg.is_some() {
+            let cur: usize = l.spans.iter().map(|s| s.content.as_ref().width()).sum();
+            if cur < width {
+                l.spans
+                    .push(Span::styled(" ".repeat(width - cur), l.style));
+            }
         }
     }
 
@@ -279,5 +297,40 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
         assert!(first.starts_with("aa"));
+    }
+
+    /// design D5：带 bg 的父行拆行后子行仍带 bg，且行尾补 pad 到视口宽
+    /// （整行面板着色）。
+    #[test]
+    fn bg_style_propagates_and_pads_to_width() {
+        let bg = Style::default().bg(ratatui::style::Color::Rgb(40, 44, 52));
+        // 贪心拆行路径：多词行
+        let lines = vec![Line::from(vec![
+            Span::styled("word ".repeat(10), bg),
+        ])
+        .style(bg)];
+        let out = wrap_for_viewport(&lines, 20, 100);
+        assert!(out.len() > 1, "应拆行: {}", out.len());
+        for l in &out {
+            assert_eq!(l.style.bg, Some(ratatui::style::Color::Rgb(40, 44, 52)), "子行保留 bg");
+            let w: usize = l.spans.iter().map(|s| s.content.as_ref().width()).sum();
+            assert_eq!(w, 20, "行尾补 pad 到视口宽");
+            assert!(l.spans.last().unwrap().content.as_ref().ends_with(' ') || w == 0);
+        }
+
+        // 硬切路径：超宽单 token
+        let lines = vec![Line::from(Span::styled("x".repeat(45), bg)).style(bg)];
+        let out = wrap_for_viewport(&lines, 10, 100);
+        assert_eq!(out.len(), 5);
+        for l in &out {
+            assert_eq!(l.style.bg, Some(ratatui::style::Color::Rgb(40, 44, 52)), "硬切子行保留 bg");
+            let w: usize = l.spans.iter().map(|s| s.content.as_ref().width()).sum();
+            assert_eq!(w, 10, "硬切行补 pad 到视口宽");
+        }
+
+        // 无 bg 的行不补 pad（不改变既有行为）
+        let lines = vec![plain("hi")];
+        let out = wrap_for_viewport(&lines, 20, 10);
+        assert_eq!(render(&out), "hi");
     }
 }

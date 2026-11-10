@@ -318,117 +318,150 @@ impl App {
         io::Error: From<B::Error>,
     {
         self.draw(terminal)?;
+        // design D3：运行中工具的计时刷新（Elapsed 走字）——Timeout 分支按
+        // 1s 粒度条件重绘；正常事件重绘不重置该窗口（多画一帧无害）。
+        let mut last_tick_draw = std::time::Instant::now();
 
         while !self.should_quit {
-            match ui_rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(UiEvent::Key(key)) => {
-                    self.log_event("key", &format!("{key:?}"));
-                    self.handle_key(key, commander, report_tx);
-                    self.draw(terminal)?;
-                }
-                Ok(UiEvent::Rpc(raw)) => {
-                    self.log_event("rpc", &raw.to_string());
-                    if raw.get("type").and_then(|t| t.as_str()) == Some("extension_ui_request") {
-                        // 扩展 UI 请求走 App 层分发，不进 session 归约。
-                        self.handle_extension_request(&raw);
-                    } else {
-                        self.state.handle(&raw);
-                    }
-                    // compaction 结束边沿：补发压缩期间排队的提交
-                    if raw.get("type").and_then(|t| t.as_str()) == Some("compaction_end") {
-                        self.flush_compact_queue(commander, report_tx);
-                    }
-                    self.draw(terminal)?;
-                }
-                Ok(UiEvent::AsyncData { kind, seq, data }) => {
-                    self.log_event("async", &format!("{kind:?} seq={seq}"));
-                    self.handle_async_data(kind, seq, &data);
-                    // 缓存类数据到达后重算补全（如 /model 参数候选）
-                    self.refresh_completion();
-                    self.draw(terminal)?;
-                }
-                Ok(UiEvent::ParseError(raw)) => {
-                    self.log_event("parse_error", &raw);
-                    self.notice = Some((format!("[parse_error] {raw}"), Color::Red));
-                    self.draw(terminal)?;
-                }
-                Ok(UiEvent::Closed) => {
-                    self.log_event("closed", "stdout closed");
-                    self.notice = Some(("pi 连接已关闭".to_string(), Color::Red));
-                    self.should_quit = true;
-                }
-                Ok(UiEvent::SendFailed(err)) => {
-                    self.log_event("send_failed", &err);
-                    // bash 传输级失败：复位运行态（单命令门控下归属明确）
-                    if self.state.bash_running {
-                        self.state.abort_bash_state();
-                        self.notice = Some((format!("bash 执行失败: {err}"), Color::Red));
-                    } else {
-                        self.notice = Some((err, Color::Red));
-                    }
-                    self.draw(terminal)?;
-                }
-                Ok(UiEvent::OpenExternalEditor) => {
-                    self.log_event("key", "external editor: suspend");
-                    // 暂停键盘闸门 → 挂起 TUI → 阻塞编辑 → 恢复 → 全量重绘
-                    crate::app::terminal::set_keyboard_paused(true);
-                    crate::app::terminal::suspend_for_child();
-                    let cmd = crate::app::external_editor::resolve_command(&self.settings_path());
-                    let content = self.editor.text();
-                    let result = crate::app::external_editor::edit_in_external(&cmd, &content);
-                    crate::app::terminal::resume_from_child();
-                    crate::app::terminal::set_keyboard_paused(false);
-                    match result {
-                        Ok(new_text) => {
-                            self.editor.replace(&new_text);
-                            self.log_event(
-                                "key",
-                                &format!("external editor: {} bytes in", new_text.len()),
-                            );
-                        }
-                        Err(msg) => {
-                            // 失败：黄条提示，输入保持不变（spec）
-                            self.notice = Some((msg, Color::Yellow));
+            // design D4：首个事件阻塞等待，随后 drain 积压逐个处理，整批只
+            // 重绘一次（FIFO 不丢事件；合并高频 tool_execution_update 的重绘）。
+            let mut batch = vec![ui_rx.recv_timeout(Duration::from_millis(200))];
+            if batch[0].is_ok() {
+                loop {
+                    match ui_rx.try_recv() {
+                        Ok(ev) => batch.push(Ok(ev)),
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            batch.push(Err(mpsc::RecvTimeoutError::Disconnected));
+                            break;
                         }
                     }
-                    // 不调用 terminal.clear()：ratatui 0.30 的 clear 会先发
-                    // ESC[6n 查光标位置（无应答终端超时报错、有应答时又与
-                    // 键盘线程抢 stdin）。编辑器跑在主屏，alt-screen 的 TUI
-                    // 帧未被污染——直接重绘即可覆盖输入框等变更单元格。
-                    self.draw(terminal)?;
                 }
-                Ok(UiEvent::CommandsFetched(data)) => {
-                    self.log_event("async", "commands fetched");
-                    self.apply_commands_fetched(&data);
-                    self.refresh_completion();
-                    self.draw(terminal)?;
+            }
+            let mut need_draw = false;
+            for ev in batch {
+                match ev {
+                    Ok(UiEvent::Key(key)) => {
+                        self.log_event("key", &format!("{key:?}"));
+                        self.handle_key(key, commander, report_tx);
+                        need_draw = true;
+                    }
+                    Ok(UiEvent::Rpc(raw)) => {
+                        self.log_event("rpc", &raw.to_string());
+                        if raw.get("type").and_then(|t| t.as_str()) == Some("extension_ui_request") {
+                            // 扩展 UI 请求走 App 层分发，不进 session 归约。
+                            self.handle_extension_request(&raw);
+                        } else {
+                            self.state.handle(&raw);
+                        }
+                        // compaction 结束边沿：补发压缩期间排队的提交
+                        if raw.get("type").and_then(|t| t.as_str()) == Some("compaction_end") {
+                            self.flush_compact_queue(commander, report_tx);
+                        }
+                        need_draw = true;
+                    }
+                    Ok(UiEvent::AsyncData { kind, seq, data }) => {
+                        self.log_event("async", &format!("{kind:?} seq={seq}"));
+                        self.handle_async_data(kind, seq, &data);
+                        // 缓存类数据到达后重算补全（如 /model 参数候选）
+                        self.refresh_completion();
+                        need_draw = true;
+                    }
+                    Ok(UiEvent::ParseError(raw)) => {
+                        self.log_event("parse_error", &raw);
+                        self.notice = Some((format!("[parse_error] {raw}"), Color::Red));
+                        need_draw = true;
+                    }
+                    Ok(UiEvent::Closed) => {
+                        self.log_event("closed", "stdout closed");
+                        self.notice = Some(("pi 连接已关闭".to_string(), Color::Red));
+                        self.should_quit = true;
+                    }
+                    Ok(UiEvent::SendFailed(err)) => {
+                        self.log_event("send_failed", &err);
+                        // bash 传输级失败：复位运行态（单命令门控下归属明确）
+                        if self.state.bash_running {
+                            self.state.abort_bash_state();
+                            self.notice = Some((format!("bash 执行失败: {err}"), Color::Red));
+                        } else {
+                            self.notice = Some((err, Color::Red));
+                        }
+                        need_draw = true;
+                    }
+                    Ok(UiEvent::OpenExternalEditor) => {
+                        self.log_event("key", "external editor: suspend");
+                        // 暂停键盘闸门 → 挂起 TUI → 阻塞编辑 → 恢复 → 全量重绘
+                        crate::app::terminal::set_keyboard_paused(true);
+                        crate::app::terminal::suspend_for_child();
+                        let cmd = crate::app::external_editor::resolve_command(&self.settings_path());
+                        let content = self.editor.text();
+                        let result = crate::app::external_editor::edit_in_external(&cmd, &content);
+                        crate::app::terminal::resume_from_child();
+                        crate::app::terminal::set_keyboard_paused(false);
+                        match result {
+                            Ok(new_text) => {
+                                self.editor.replace(&new_text);
+                                self.log_event(
+                                    "key",
+                                    &format!("external editor: {} bytes in", new_text.len()),
+                                );
+                            }
+                            Err(msg) => {
+                                // 失败：黄条提示，输入保持不变（spec）
+                                self.notice = Some((msg, Color::Yellow));
+                            }
+                        }
+                        // 不调用 terminal.clear()：ratatui 0.30 的 clear 会先发
+                        // ESC[6n 查光标位置（无应答终端超时报错、有应答时又与
+                        // 键盘线程抢 stdin）。编辑器跑在主屏，alt-screen 的 TUI
+                        // 帧未被污染——直接重绘即可覆盖输入框等变更单元格。
+                        need_draw = true;
+                    }
+                    Ok(UiEvent::CommandsFetched(data)) => {
+                        self.log_event("async", "commands fetched");
+                        self.apply_commands_fetched(&data);
+                        self.refresh_completion();
+                        need_draw = true;
+                    }
+                    Ok(UiEvent::OpenModelSelect) => {
+                        self.log_event("info", "open model select (fallback)");
+                        self.open_model_select(commander, report_tx);
+                        need_draw = true;
+                    }
+                    Ok(UiEvent::Info(text)) => {
+                        self.log_event("info", &text);
+                        self.notice = Some((text, Color::Green));
+                        need_draw = true;
+                    }
+                    Ok(UiEvent::RestoreQueued(data)) => {
+                        self.log_event("dequeue", &data.to_string());
+                        self.restore_queued(&data);
+                        need_draw = true;
+                    }
+                    Ok(UiEvent::Shutdown) => {
+                        self.log_event("shutdown", "host requested");
+                        self.should_quit = true;
+                    }
+                    Ok(UiEvent::Resize) => {
+                        // embed: 宿主已写共享槽；standalone: draw 内 autoresize 经 ioctl 取新尺寸。
+                        need_draw = true;
+                    }
+                    // Idle timeout：无状态变化不重绘；但运行中工具需要每秒走字
+                    //（design D3，判定抽为纯函数便于单测）。
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if Self::timer_redraw_due(self.state.has_running_tool(), last_tick_draw.elapsed()) {
+                            need_draw = true;
+                            last_tick_draw = std::time::Instant::now();
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => self.should_quit = true,
                 }
-                Ok(UiEvent::OpenModelSelect) => {
-                    self.log_event("info", "open model select (fallback)");
-                    self.open_model_select(commander, report_tx);
-                    self.draw(terminal)?;
+                if self.should_quit {
+                    break;
                 }
-                Ok(UiEvent::Info(text)) => {
-                    self.log_event("info", &text);
-                    self.notice = Some((text, Color::Green));
-                    self.draw(terminal)?;
-                }
-                Ok(UiEvent::RestoreQueued(data)) => {
-                    self.log_event("dequeue", &data.to_string());
-                    self.restore_queued(&data);
-                    self.draw(terminal)?;
-                }
-                Ok(UiEvent::Shutdown) => {
-                    self.log_event("shutdown", "host requested");
-                    self.should_quit = true;
-                }
-                Ok(UiEvent::Resize) => {
-                    // embed: 宿主已写共享槽；standalone: draw 内 autoresize 经 ioctl 取新尺寸。
-                    self.draw(terminal)?;
-                }
-                // Idle timeout: no state changed, so no repaint.
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => self.should_quit = true,
+            }
+            if need_draw {
+                self.draw(terminal)?;
             }
         }
         Ok(())
@@ -2280,6 +2313,16 @@ impl App {
                 }
             }
         });
+    }
+
+    /// Timeout 分支的计时重绘判定（design D3，纯函数便于单测）：
+    /// 存在运行中工具且距上次 tick 重绘 ≥1s 才重绘（Elapsed 走字）。
+    ///
+    /// 输入: has_running_tool — 是否存在 Running 工具；since_last — 距上次
+    ///       tick 重绘的时长
+    /// 输出: true = 应重绘
+    fn timer_redraw_due(has_running_tool: bool, since_last: Duration) -> bool {
+        has_running_tool && since_last >= Duration::from_secs(1)
     }
 
     /// 纯按键 → 意图映射（不触碰状态，便于单测）。
@@ -4704,6 +4747,18 @@ done
     }
 
     // ── Tab 强制路径补全（spec：path-completion） ──
+
+    #[test]
+    fn timer_redraw_due_gates_on_running_tool() {
+        use std::time::Duration;
+        // 无运行中工具 → 永不重绘
+        assert!(!App::timer_redraw_due(false, Duration::from_secs(10)));
+        // 有运行中工具但未到 1s → 不重绘
+        assert!(!App::timer_redraw_due(true, Duration::from_millis(999)));
+        // 有运行中工具且 ≥1s → 重绘（Elapsed 走字）
+        assert!(App::timer_redraw_due(true, Duration::from_secs(1)));
+        assert!(App::timer_redraw_due(true, Duration::from_secs(5)));
+    }
 
     #[test]
     fn key_intent_tab_triggers_force_path() {
