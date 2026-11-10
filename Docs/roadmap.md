@@ -208,12 +208,11 @@ model/session/tree/thinking 选择器，extension_ui 9 种 method，write/grep/f
   /session 信息面板、切换后状态重建（get_messages）
 - 剩余：树内搜索/标签编辑、pi 其余 17 个斜杠命令、双击 esc（#5）、bash 模式（#6）、
   剪贴板/外部编辑器（#9）
-- **待办（已挂账）：滚轮/滚动条/搜索等滚动增强**——消息区键盘整页回看已落地
-  （`add-message-scrollback`：PageUp/PageDown 整页、follow 三态、骤变 clamp
-  恢复跟随）。剩余：鼠标滚轮/滚动条可视化（需开 EnableMouseCapture，event.rs
-  现约定鼠标事件即丢，与工具卡片点击展开④同属一块）、alt-screen 搜索
-  （ctrl+shift+f）、prompt 跳转（OSC133）、行级/半页滚动键；宽度变化重换行的
-  offset 漂移接受（pi 同样漂移）。
+- **待办（已挂账）：滚动条/搜索等滚动增强**——消息区键盘整页回看已落地
+  （`add-message-scrollback`）、鼠标滚轮已落地（`add-mouse-wheel-scroll`：
+  捕获已开、行粒度 + 速度加速 + Alt 倍率）。剩余：**滚动条可视化/悬停
+  （暂不做）**、alt-screen 搜索（ctrl+shift+f）、prompt 跳转（OSC133）、
+  行级/半页滚动键；宽度变化重换行的 offset 漂移接受（pi 同样漂移）。
 - **待办（已挂账）：工具卡片对齐 change 的移出项**——后续工具卡片对齐（运行中
   流式输出/计时器/背景面板/头行/截断警告）明确不含以下五项，原因各异：
   ① edit 执行中预计算 diff：渲染层需在 args 到齐后异步读文件出 preview，

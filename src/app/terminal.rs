@@ -10,7 +10,10 @@ use std::io;
 use std::panic;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crossterm::event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use crossterm::terminal::disable_raw_mode;
 use ratatui::DefaultTerminal;
 
@@ -50,6 +53,9 @@ pub fn suspend_for_child() {
     if KB_PUSHED.swap(false, Ordering::SeqCst) {
         let _ = crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags);
     }
+    // 鼠标捕获与 alt-screen 成对关闭（design D1）：子进程必须拿到
+    // 不报鼠标的干净终端，否则外部编辑器会被滚轮/点击事件干扰。
+    let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
     let _ = crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen);
     let _ = disable_raw_mode();
 }
@@ -61,6 +67,8 @@ pub fn suspend_for_child() {
 /// 输出: 无返回值；副作用为终端模式恢复
 pub fn resume_from_child() {
     let _ = crossterm::execute!(io::stdout(), crossterm::terminal::EnterAlternateScreen);
+    // 恢复鼠标捕获（design D1，与 suspend 成对）。
+    let _ = crossterm::execute!(io::stdout(), EnableMouseCapture);
     let _ = crossterm::terminal::enable_raw_mode();
     // 复用启动时的能力探测结论，不在此处查询（查询要读光标位置应答，
     // 会与键盘线程的 crossterm 全局读锁互斥 → 死锁，见 KB_SUPPORTED 注释）
@@ -125,14 +133,21 @@ impl TerminalGuard {
         Ok(Self { raw_enabled: false })
     }
 
-    /// Hand ownership of the screen to ratatui (enters alternate screen).
+    /// Hand ownership of the screen to ratatui (enters alternate screen)，
+    /// 并开启鼠标捕获（design D1：与 alt-screen 成对进入，滚轮输入的前提）。
     pub fn take_terminal(&mut self) -> DefaultTerminal {
-        ratatui::init()
+        let term = ratatui::init();
+        let _ = crossterm::execute!(io::stdout(), EnableMouseCapture);
+        term
     }
 
     /// 恢复终端到正常状态（幂等）：退出 alt screen、退出 raw mode、
     /// 若推送过 kitty 键盘增强则弹出。
     pub fn restore_now() {
+        // 鼠标捕获关闭收口点（design D1）：finish/Drop/panic 三路共用本
+        // 函数，且先于退 alt-screen（与进入时 init 后开启镜像对称）；
+        // 漏此点即退出后终端仍在报鼠标。
+        let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
         // ratatui::restore() leaves the alternate screen and disables raw mode.
         ratatui::restore();
         if KB_PUSHED.swap(false, Ordering::SeqCst) {

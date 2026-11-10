@@ -355,6 +355,12 @@ impl App {
                         self.handle_key(key, commander, report_tx);
                         need_draw = true;
                     }
+                    Ok(UiEvent::Wheel(lines)) => {
+                        self.log_event("key", &format!("wheel {lines:+}"));
+                        if self.handle_wheel(lines) {
+                            need_draw = true;
+                        }
+                    }
                     Ok(UiEvent::Rpc(raw)) => {
                         self.log_event("rpc", &raw.to_string());
                         if raw.get("type").and_then(|t| t.as_str()) == Some("extension_ui_request") {
@@ -474,6 +480,26 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// 滚轮滚动消息区（design D4 分发）。
+    ///
+    /// 输入: lines — 有符号行数（负=上滚看更早内容、正=下滚看更新内容；
+    ///       加速与 Alt 倍率已在事件源线程算好）
+    /// 输出: true = 视口变化需重绘；false = 浮层打开被忽略（或行数为 0，
+    ///       不改 scroll、不触发重绘）；副作用为翻转 scroll 状态
+    fn handle_wheel(&mut self, lines: i16) -> bool {
+        // 浮层遮挡时忽略（design D4：不滚被遮住的消息区）；补全菜单
+        // 打开不受影响（菜单非浮层、非滚视图）。
+        if self.overlay.is_some() || lines == 0 {
+            return false;
+        }
+        if lines < 0 {
+            self.scroll.scroll_up_lines(lines.unsigned_abs() as usize);
+        } else {
+            self.scroll.scroll_down_lines(lines as usize);
+        }
+        true
     }
 
     /// 编辑键统一分派：字符/光标移动/删除/kill-ring/yank/undo。
@@ -3456,6 +3482,47 @@ mod input_tests {
         app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), &commander, &tx);
         assert_eq!(app.scroll.top, 50, "浮层吞键，不动消息区滚动");
         assert!(app.scroll.following, "跟随标志不受影响");
+    }
+
+    /// 任务 4.1：滚轮分发——上滚打断跟随按行移动、下滚不改跟随、
+    /// 浮层打开被忽略、补全菜单打开时仍滚消息区。
+    #[test]
+    fn wheel_dispatch_scrolls_chat_and_respects_overlay() {
+        let mut app = App::new();
+        app.scroll.viewport = 20;
+        app.scroll.top = 50;
+        app.scroll.following = true;
+
+        // ① 上滚：打断跟随、按行数上移、触发重绘
+        assert!(app.handle_wheel(-3), "上滚应触发重绘");
+        assert!(!app.scroll.following, "上滚打断贴底跟随");
+        assert_eq!(app.scroll.top, 47, "按行数上移（50−3）");
+
+        // ② 下滚：饱和下移、不直接改 following
+        assert!(app.handle_wheel(2), "下滚应触发重绘");
+        assert_eq!(app.scroll.top, 49, "按行数下移");
+        assert!(!app.scroll.following, "下滚不直接改跟随（回底恢复由 absorb 判定）");
+
+        // ③ 浮层打开：忽略，状态不变、不重绘
+        app.overlay = Some(Overlay::Tree {
+            tree: Vec::new(),
+            leaf_id: None,
+            rows: Vec::new(),
+            cursor: 0,
+            folded: std::collections::HashSet::new(),
+            filter: crate::app::tree::FilterMode::Default,
+            search: String::new(),
+            loading: true,
+            seq: 0,
+        });
+        assert!(!app.handle_wheel(-5), "浮层打开应忽略");
+        assert_eq!(app.scroll.top, 49, "浮层打开滚动不改状态");
+
+        // ④ 补全菜单打开：仍滚消息区（菜单非浮层、非滚视图）
+        app.overlay = None;
+        app.completion.open = true;
+        assert!(app.handle_wheel(-2), "菜单打开仍滚消息区");
+        assert_eq!(app.scroll.top, 47, "菜单打开时滚动生效");
     }
 
     #[test]

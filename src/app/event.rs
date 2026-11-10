@@ -4,10 +4,12 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-use crossterm::event::{KeyEvent};
+use crossterm::event::{KeyEvent, KeyModifiers};
 use crossterm::event::{self as ct_event};
 use pi_shell_rs::rpc::{ClientEvent, RpcClient};
 use serde_json::Value;
+
+use crate::app::scroll::{WheelAccel, ALT_WHEEL_MULTIPLIER};
 
 /// Everything the main loop reacts to.
 #[derive(Debug, Clone)]
@@ -25,6 +27,9 @@ pub enum UiEvent {
     /// embed：宿主写共享槽后注入；standalone：SIGWINCH → crossterm Resize 转发，
     /// draw 时经 ioctl 取新尺寸。
     Resize,
+    /// 滚轮滚动消息区：有符号行数（负=上滚看更早内容、正=下滚看更新内容）；
+    /// 行数已在事件源线程经 WheelAccel 加速并含 Alt 倍率（design D2）。
+    Wheel(i16),
     /// A detached command send reported failure.
     SendFailed(String),
     /// `clear_queue` 的返回数据（alt+up 取回排队消息，主线程回填输入框）。
@@ -112,6 +117,9 @@ pub fn spawn_event_sources(
     let key_tx = tx.clone();
     if !embedded {
     let thread_key_tx = key_tx.clone();
+    // 滚轮加速器随线程存活（design D2：时间戳在读取点打点，避免
+    // 主循环 batch 处理时时间戳塌缩、速度信息丢失）。
+    let mut accel = WheelAccel::new();
     thread::spawn(move || loop {
         // 暂停闸门前置（design D3 修订）：暂停期不进入 crossterm poll——
         // 既不会消费子进程（外部编辑器）的 stdin 字节，也不持有全局事件读锁
@@ -128,8 +136,9 @@ pub fn spawn_event_sources(
                 }
                 match ct_event::read() {
                     Ok(ev) => {
-                        // Resize 必须转发（否则改终端尺寸后不重绘）；鼠标等 stage 2 忽略
-                        if let Some(ui_ev) = ui_event_from_crossterm(ev)
+                        // Resize 必须转发（否则改终端尺寸后不重绘）；滚轮翻译
+                        // 为 UiEvent::Wheel，其余鼠标事件（点击/移动）仍丢
+                        if let Some(ui_ev) = ui_event_from_crossterm(ev, &mut accel)
                             && thread_key_tx.send(ui_ev).is_err()
                         {
                             break;
@@ -180,13 +189,29 @@ pub fn spawn_event_sources(
 
 /// 把 crossterm 原始事件翻译成 [`UiEvent`]；不关心的事件返回 `None`。
 ///
-/// 输入: ev — 键盘线程 `poll`/`read` 得到的 crossterm 事件
+/// 输入: ev — 键盘线程 `poll`/`read` 得到的 crossterm 事件；
+///       accel — 滚轮加速器（状态随事件源线程存活，读取点打时戳）
 /// 输出: Key → `UiEvent::Key`；Resize → `UiEvent::Resize`（触发重绘，
-///       autoresize 在 draw 时取新尺寸）；鼠标等 stage 2 忽略项 → `None`
-fn ui_event_from_crossterm(ev: ct_event::Event) -> Option<UiEvent> {
+///       autoresize 在 draw 时取新尺寸）；滚轮 → `UiEvent::Wheel(行数)`
+///       （负=上滚、正=下滚，已含加速与 Alt 倍率）；点击/移动/拖拽/
+///       横向滚轮 → `None`（点击转发属 add-tool-card-click，design D4/D7）
+fn ui_event_from_crossterm(ev: ct_event::Event, accel: &mut WheelAccel) -> Option<UiEvent> {
     match ev {
         ct_event::Event::Key(key) => Some(UiEvent::Key(key)),
         ct_event::Event::Resize(..) => Some(UiEvent::Resize),
+        ct_event::Event::Mouse(m) => {
+            let dir = match m.kind {
+                ct_event::MouseEventKind::ScrollUp => -1i8,
+                ct_event::MouseEventKind::ScrollDown => 1i8,
+                _ => return None,
+            };
+            let now = accel.now_ms();
+            let mut lines = accel.next(dir, now);
+            if m.modifiers.contains(KeyModifiers::ALT) {
+                lines *= ALT_WHEEL_MULTIPLIER;
+            }
+            Some(UiEvent::Wheel(dir as i16 * lines as i16))
+        }
         _ => None,
     }
 }
@@ -202,7 +227,10 @@ mod tests {
     fn key_event_passes_through() {
         let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
         assert!(matches!(
-            ui_event_from_crossterm(ct_event::Event::Key(key)),
+            ui_event_from_crossterm(
+                ct_event::Event::Key(key),
+                &mut WheelAccel::with_accelerate(false)
+            ),
             Some(UiEvent::Key(_))
         ));
     }
@@ -212,22 +240,93 @@ mod tests {
     #[test]
     fn resize_event_becomes_ui_resize() {
         assert!(matches!(
-            ui_event_from_crossterm(ct_event::Event::Resize(120, 40)),
+            ui_event_from_crossterm(
+                ct_event::Event::Resize(120, 40),
+                &mut WheelAccel::with_accelerate(false)
+            ),
             Some(UiEvent::Resize)
         ));
     }
 
-    /// 鼠标等 stage 2 忽略项返回 None（不进事件通道）。
-    /// 输入: crossterm Mouse 事件；输出: None
+    /// 任务 2.2：滚轮翻译为有符号行数（上滚负、下滚正）。
+    /// 输入: ScrollUp/ScrollDown；输出: UiEvent::Wheel(∓1)（不加速=1 行）
     #[test]
-    fn mouse_event_is_ignored() {
+    fn wheel_scroll_translates_to_signed_lines() {
         use crossterm::event::{MouseEvent, MouseEventKind};
-        let mouse = MouseEvent {
-            kind: MouseEventKind::Moved,
-            column: 1,
-            row: 1,
+        let mk = |kind| MouseEvent {
+            kind,
+            column: 5,
+            row: 3,
             modifiers: KeyModifiers::empty(),
         };
-        assert!(ui_event_from_crossterm(ct_event::Event::Mouse(mouse)).is_none());
+        let mut accel = WheelAccel::with_accelerate(false);
+        assert!(
+            matches!(
+                ui_event_from_crossterm(
+                    ct_event::Event::Mouse(mk(MouseEventKind::ScrollUp)),
+                    &mut accel
+                ),
+                Some(UiEvent::Wheel(n)) if n == -1
+            ),
+            "上滚 = 负行数"
+        );
+        assert!(
+            matches!(
+                ui_event_from_crossterm(
+                    ct_event::Event::Mouse(mk(MouseEventKind::ScrollDown)),
+                    &mut accel
+                ),
+                Some(UiEvent::Wheel(n)) if n == 1
+            ),
+            "下滚 = 正行数"
+        );
+    }
+
+    /// 任务 2.2：Alt+滚轮 = 5 倍行数（ALT_WHEEL_MULTIPLIER，design D5）。
+    /// 输入: ScrollDown + ALT；输出: UiEvent::Wheel(5)（不加速 1×5）
+    #[test]
+    fn alt_wheel_multiplies_five() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let mouse = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 3,
+            modifiers: KeyModifiers::ALT,
+        };
+        assert!(matches!(
+            ui_event_from_crossterm(
+                ct_event::Event::Mouse(mouse),
+                &mut WheelAccel::with_accelerate(false)
+            ),
+            Some(UiEvent::Wheel(n)) if n == ALT_WHEEL_MULTIPLIER as i16
+        ));
+    }
+
+    /// 任务 2.2：点击/移动/拖拽/横向滚轮仍丢弃——边界钉给
+    /// add-tool-card-click（其 change 才开 Down 转发，design D4/D7）。
+    /// 输入: 各类非滚轮鼠标事件；输出: None
+    #[test]
+    fn click_and_motion_still_dropped_for_add_tool_card_click() {
+        use crossterm::event::{MouseEvent, MouseEventKind, MouseButton};
+        let mk = |kind| MouseEvent {
+            kind,
+            column: 5,
+            row: 3,
+            modifiers: KeyModifiers::empty(),
+        };
+        let mut accel = WheelAccel::with_accelerate(false);
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Moved,
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::ScrollLeft,
+            MouseEventKind::ScrollRight,
+        ] {
+            assert!(
+                ui_event_from_crossterm(ct_event::Event::Mouse(mk(kind)), &mut accel).is_none(),
+                "{kind:?} 应仍被丢弃"
+            );
+        }
     }
 }

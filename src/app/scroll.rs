@@ -71,6 +71,31 @@ impl ChatScroll {
         self.top = self.top.saturating_add(self.page());
     }
 
+    /// 滚轮上滚 n 行（看更早内容）：打断贴底跟随并饱和上移。
+    ///
+    /// 输入: n — 移动行数（正数；加速器产出）；0 为无操作（不改状态）
+    /// 输出: 副作用为 following=false、top 减 n（不低于 0）；
+    ///       已在顶部时保持 top=0 但跟随仍被打断
+    pub fn scroll_up_lines(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.following = false;
+        self.top = self.top.saturating_sub(n);
+    }
+
+    /// 滚轮下滚 n 行（看更新内容）：饱和下移。
+    ///
+    /// 输入: n — 移动行数（正数）；0 为无操作（不改状态）
+    /// 输出: 副作用为 top 加 n（饱和防溢出）；不改 following——
+    ///       是否已到底、是否恢复跟随由渲染端 absorb 判定
+    pub fn scroll_down_lines(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.top = self.top.saturating_add(n);
+    }
+
     /// 吸收渲染端反馈：回写视口首行并据"是否贴底"恢复/维持跟随。
     ///
     /// 输入:
@@ -83,6 +108,139 @@ impl ChatScroll {
         self.top = effective_top;
         self.following = at_bottom;
     }
+}
+
+// ─────────────────────────── 滚轮加速器 ───────────────────────────
+
+/// 间隔 < 此值的事件属同一物理 notch（Ghostty 约 4ms 连发）：不加速也不更新均值。
+const BURST_GAP_MS: u64 = 5;
+/// 间隔 > 此值视为手势结束（重新从 1 行起步）。
+const GESTURE_GAP_MS: u64 = 200;
+/// 平均间隔映射基准：100ms 间隔 = 每事件 1 行，更快按比例放大。
+const REFERENCE_GAP_MS: f64 = 100.0;
+/// 自动加速的每事件行数上限（对齐 pi MAX_AUTO_LINES）。
+const MAX_AUTO_LINES: f64 = 6.0;
+/// Alt+滚轮行数倍率（对齐 pi ALT_WHEEL_SCROLL_MULTIPLIER）。
+pub const ALT_WHEEL_MULTIPLIER: u16 = 5;
+
+/// 滚轮事件 → 行数的变速加速器（仅 auto 模式，移植 pi `WheelScrollAccelerator`）。
+///
+/// 背景：本地 darwin 终端已由 OS 逐行加速（`accelerate=false`，防双倍）；
+/// 其余平台/SSH 按事件间隔加速——慢速单发 1 行，快速连滚最多 6 行/事件。
+/// 纯状态机、无 TTY：`next(dir, now_ms)` 由事件源线程在读取点打点调用。
+pub struct WheelAccel {
+    /// 起点时刻（把单调时钟折算成毫秒；测试直接喂 now_ms）。
+    t0: std::time::Instant,
+    /// 上一事件时刻（None = 尚无事件，首事件必然重置手势）。
+    last_ms: Option<u64>,
+    /// 上一事件方向（0 = 无；换向重置加速）。
+    last_dir: i8,
+    /// 指数移动平均的事件间隔（ms；None = 手势未建立）。
+    avg_gap: Option<f64>,
+    /// 分数行进位（如 1.667 行 → 本次 1 行、进位 0.667）。
+    carry: f64,
+    /// 是否按速度加速（false = 恒 1 行/事件）。
+    accelerate: bool,
+}
+
+impl WheelAccel {
+    /// 按本机判定构造（本地 darwin 非 SSH = 不加速，其余加速）。
+    ///
+    /// 输入: 无
+    /// 输出: 可直接用于事件翻译的加速器
+    pub fn new() -> Self {
+        Self::with_accelerate(!terminal_accelerates_wheel())
+    }
+
+    /// 以指定加速开关构造（测试与平台判定分层用）。
+    ///
+    /// 输入: accelerate — true=按速度加速；false=恒 1 行/事件
+    /// 输出: 新加速器实例（手势状态未建立）
+    pub fn with_accelerate(accelerate: bool) -> Self {
+        Self {
+            t0: std::time::Instant::now(),
+            last_ms: None,
+            last_dir: 0,
+            avg_gap: None,
+            carry: 0.0,
+            accelerate,
+        }
+    }
+
+    /// 自构造以来的单调毫秒（事件源线程读取点打点用）。
+    ///
+    /// 输入: 无
+    /// 输出: 毫秒数（饱和为 u64）
+    pub fn now_ms(&self) -> u64 {
+        self.t0.elapsed().as_millis() as u64
+    }
+
+    /// 把一个滚轮事件换算为移动行数（移植 pi `next`）。
+    ///
+    /// 输入: dir — 方向（-1 上滚 / +1 下滚）；now_ms — 事件时刻（单调毫秒）
+    /// 输出: 行数（≥1）；不加速模式恒 1；加速模式按事件间隔缩放——
+    ///       <5ms 连发 = 同一 notch 恒 1；换向/停顿 >200ms 重置为 1；
+    ///       分数进位累积（确定性：同输入序列 → 同输出）
+    pub fn next(&mut self, dir: i8, now_ms: u64) -> u16 {
+        if !self.accelerate {
+            return 1;
+        }
+        let gap = match self.last_ms {
+            Some(last) => now_ms.saturating_sub(last),
+            // 首事件：无上一时刻，必然走“手势未建立”分支。
+            None => u64::MAX,
+        };
+        let same_gesture =
+            self.last_ms.is_some() && dir == self.last_dir && gap <= GESTURE_GAP_MS;
+        self.last_ms = Some(now_ms);
+        self.last_dir = dir;
+        if !same_gesture {
+            self.avg_gap = None;
+            self.carry = 0.0;
+            return 1;
+        }
+        if gap < BURST_GAP_MS {
+            // 同一 notch 的高速连发：不加速，也不更新均值/进位（pi 同）。
+            return 1;
+        }
+        let avg = match self.avg_gap {
+            Some(a) => (a + gap as f64) / 2.0,
+            None => gap as f64,
+        };
+        self.avg_gap = Some(avg);
+        let lines = (REFERENCE_GAP_MS / avg).clamp(1.0, MAX_AUTO_LINES) + self.carry;
+        let whole = lines.floor();
+        self.carry = lines - whole;
+        whole as u16
+    }
+}
+
+impl Default for WheelAccel {
+    /// 默认 = 按本机判定构造（与 `new()` 一致）。
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 终端是否已对滚轮做过加速（移植 pi `terminalAcceleratesWheel`）。
+///
+/// 输入: 无（读平台与 SSH_* 环境变量）
+/// 输出: true = 本地 macOS(darwin) 且非 SSH（OS 已逐行上报，我们不再加速）
+pub fn terminal_accelerates_wheel() -> bool {
+    terminal_accelerates_wheel_if(
+        cfg!(target_os = "macos"),
+        ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
+            .iter()
+            .any(|k| std::env::var(k).is_ok()),
+    )
+}
+
+/// 纯判定核心（可测，不读环境）。
+///
+/// 输入: is_macos — 平台是否 macOS(darwin)；ssh — 是否 SSH 会话
+/// 输出: true = 终端已加速（本地 macOS 且非 SSH）
+fn terminal_accelerates_wheel_if(is_macos: bool, ssh: bool) -> bool {
+    is_macos && !ssh
 }
 
 #[cfg(test)]
@@ -166,5 +324,134 @@ mod tests {
         s.absorb(180, true);
         assert_eq!(s.top, 180);
         assert!(s.following, "贴底即恢复跟随");
+    }
+
+    /// 任务 1.1：滚轮上滚打断跟随并按行数上移；饱和不越界。
+    #[test]
+    fn wheel_scroll_up_breaks_follow_and_moves_by_lines() {
+        let mut s = ChatScroll {
+            top: 50,
+            following: true,
+            viewport: 20,
+        };
+        s.scroll_up_lines(16);
+        assert!(!s.following, "上滚应打断贴底跟随");
+        assert_eq!(s.top, 34, "按行数上移（50−16）");
+
+        s.scroll_up_lines(100);
+        assert_eq!(s.top, 0, "顶部饱和不越界");
+        assert!(!s.following);
+    }
+
+    /// 任务 1.1：滚轮下滚不改 following（回底恢复交给渲染端 absorb）。
+    #[test]
+    fn wheel_scroll_down_keeps_following_flag() {
+        let mut s = ChatScroll {
+            top: 10,
+            following: false,
+            viewport: 20,
+        };
+        s.scroll_down_lines(5);
+        assert_eq!(s.top, 15, "按行数下移");
+        assert!(!s.following, "下滚不直接改 following");
+
+        // following 态下下滚也不直接改标志（渲染端每帧重算 top 并 absorb）
+        let mut f = ChatScroll {
+            top: 100,
+            following: true,
+            viewport: 20,
+        };
+        f.scroll_down_lines(3);
+        assert!(f.following, "following 态下滚保持标志");
+
+        // 饱和防溢出
+        f.top = usize::MAX;
+        f.scroll_down_lines(1);
+        assert_eq!(f.top, usize::MAX, "饱和防溢出");
+    }
+
+    /// 任务 1.1：n=0 为无操作（不打断跟随）。
+    #[test]
+    fn wheel_scroll_zero_is_noop() {
+        let mut s = ChatScroll {
+            top: 10,
+            following: true,
+            viewport: 20,
+        };
+        s.scroll_up_lines(0);
+        assert!(s.following, "0 行不打断跟随");
+        assert_eq!(s.top, 10);
+        s.scroll_down_lines(0);
+        assert_eq!(s.top, 10);
+    }
+
+    // ────────── 任务 2.1：WheelAccel 对拍（pi wheel-scroll.test.ts auto 用例） ──────────
+
+    /// 以固定时刻序列跑一次加速（方向恒 +1），返回每事件行数。
+    fn wheel_auto(times: &[u64]) -> Vec<u16> {
+        let mut a = WheelAccel::with_accelerate(true);
+        times.iter().map(|&t| a.next(1, t)).collect()
+    }
+
+    /// 慢速（≥150ms 间隔）恒 1 行；50ms→2、20ms→5、10ms→6（上限）。
+    #[test]
+    fn wheel_accel_velocity_table_matches_pi() {
+        assert_eq!(wheel_auto(&[0, 150, 300, 450]), [1, 1, 1, 1], "150ms→1");
+        assert_eq!(wheel_auto(&[1000, 1050, 1100, 1150]), [1, 2, 2, 2], "50ms→2");
+        assert_eq!(wheel_auto(&[2000, 2020, 2040, 2060]), [1, 5, 5, 5], "20ms→5");
+        assert_eq!(wheel_auto(&[3000, 3010, 3020, 3030]), [1, 6, 6, 6], "10ms→6（上限）");
+    }
+
+    /// <5ms 连发 = 同一 notch，不加速也不更新均值（burst 用例）。
+    #[test]
+    fn wheel_accel_burst_same_notch_not_accelerated() {
+        assert_eq!(wheel_auto(&[0, 3, 6, 9]), [1, 1, 1, 1]);
+    }
+
+    /// 换向与停顿（>200ms）重置加速为 1。
+    #[test]
+    fn wheel_accel_resets_on_direction_change_and_pause() {
+        let mut a = WheelAccel::with_accelerate(true);
+        assert_eq!(a.next(1, 0), 1);
+        assert_eq!(a.next(1, 20), 5);
+        assert_eq!(a.next(1, 40), 5);
+        assert_eq!(a.next(-1, 60), 1, "换向重置");
+        assert_eq!(a.next(1, 500), 1, "停顿 >200ms 重置");
+        assert_eq!(a.next(1, 520), 5, "新手势重新加速");
+    }
+
+    /// 分数行进位：60ms 间隔 1.667 行 → [1,1,2]（carry 累积）。
+    #[test]
+    fn wheel_accel_fractional_carry_accumulates() {
+        assert_eq!(wheel_auto(&[0, 60, 120]), [1, 1, 2]);
+    }
+
+    /// 不加速模式恒 1 行（本机 darwin 本地路径）。
+    #[test]
+    fn wheel_accel_disabled_always_one_line() {
+        let mut a = WheelAccel::with_accelerate(false);
+        assert_eq!(a.next(1, 0), 1);
+        assert_eq!(a.next(1, 10), 1);
+        assert_eq!(a.next(-1, 20), 1);
+    }
+
+    /// 确定性：同输入序列两个实例输出一致。
+    #[test]
+    fn wheel_accel_deterministic_for_same_inputs() {
+        let times = [0u64, 30, 60, 90, 150, 170];
+        let mut a = WheelAccel::with_accelerate(true);
+        let mut b = WheelAccel::with_accelerate(true);
+        for &t in &times {
+            assert_eq!(a.next(1, t), b.next(1, t), "t={t} 应一致");
+        }
+    }
+
+    /// 平台判定纯函数：仅本地 darwin 非 SSH 视为“终端已加速”。
+    #[test]
+    fn wheel_accel_platform_judgment_matches_pi() {
+        assert!(terminal_accelerates_wheel_if(true, false), "darwin 本地 → 已加速");
+        assert!(!terminal_accelerates_wheel_if(true, true), "darwin + SSH → 需自行加速");
+        assert!(!terminal_accelerates_wheel_if(false, false), "非 darwin → 需自行加速");
+        assert!(!terminal_accelerates_wheel_if(false, true), "非 darwin + SSH → 需自行加速");
     }
 }
