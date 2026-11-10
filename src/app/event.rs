@@ -30,6 +30,9 @@ pub enum UiEvent {
     /// 滚轮滚动消息区：有符号行数（负=上滚看更早内容、正=下滚看更新内容）；
     /// 行数已在事件源线程经 WheelAccel 加速并含 Alt 倍率（design D2）。
     Wheel(i16),
+    /// 左键点击（0-based 屏幕坐标）——仅 `Down(Left)` 转发，抬起/移动/
+    /// 拖拽/右键仍丢（add-tool-card-click 边界，design D4）。
+    Click { x: u16, y: u16 },
     /// A detached command send reported failure.
     SendFailed(String),
     /// `clear_queue` 的返回数据（alt+up 取回排队消息，主线程回填输入框）。
@@ -193,13 +196,18 @@ pub fn spawn_event_sources(
 ///       accel — 滚轮加速器（状态随事件源线程存活，读取点打时戳）
 /// 输出: Key → `UiEvent::Key`；Resize → `UiEvent::Resize`（触发重绘，
 ///       autoresize 在 draw 时取新尺寸）；滚轮 → `UiEvent::Wheel(行数)`
-///       （负=上滚、正=下滚，已含加速与 Alt 倍率）；点击/移动/拖拽/
-///       横向滚轮 → `None`（点击转发属 add-tool-card-click，design D4/D7）
+///       （负=上滚、正=下滚，已含加速与 Alt 倍率）；左键按下 →
+///       `UiEvent::Click{x,y}`；抬起/移动/拖拽/右键/横向滚轮 → `None`
 fn ui_event_from_crossterm(ev: ct_event::Event, accel: &mut WheelAccel) -> Option<UiEvent> {
     match ev {
         ct_event::Event::Key(key) => Some(UiEvent::Key(key)),
         ct_event::Event::Resize(..) => Some(UiEvent::Resize),
         ct_event::Event::Mouse(m) => {
+            // 任务 3.1：仅左键按下转发（add-tool-card-click，design D4）——
+            // 抬起/移动/拖拽/右键仍丢。
+            if let ct_event::MouseEventKind::Down(ct_event::MouseButton::Left) = m.kind {
+                return Some(UiEvent::Click { x: m.column, y: m.row });
+            }
             let dir = match m.kind {
                 ct_event::MouseEventKind::ScrollUp => -1i8,
                 ct_event::MouseEventKind::ScrollDown => 1i8,
@@ -302,22 +310,34 @@ mod tests {
         ));
     }
 
-    /// 任务 2.2：点击/移动/拖拽/横向滚轮仍丢弃——边界钉给
-    /// add-tool-card-click（其 change 才开 Down 转发，design D4/D7）。
-    /// 输入: 各类非滚轮鼠标事件；输出: None
+    /// 任务 3.1：仅左键 Down 转发为 Click（add-tool-card-click 边界——
+    /// 前置 add-mouse-wheel-scroll 的"Down/Up 仍丢"断言在此按计划翻转，
+    /// 仅 Down(Left) 一项）；抬起/移动/拖拽/右键/横向滚轮仍丢弃。
+    /// 输入: 各类鼠标事件；输出: 左键按下 → Some(Click{0-based 坐标})，其余 None
     #[test]
-    fn click_and_motion_still_dropped_for_add_tool_card_click() {
+    fn only_left_down_forwarded_for_add_tool_card_click_boundary() {
         use crossterm::event::{MouseEvent, MouseEventKind, MouseButton};
         let mk = |kind| MouseEvent {
             kind,
-            column: 5,
-            row: 3,
+            column: 7,
+            row: 4,
             modifiers: KeyModifiers::empty(),
         };
         let mut accel = WheelAccel::with_accelerate(false);
+
+        // 转发：左键按下 → Click（坐标原样、0-based）
+        assert!(matches!(
+            ui_event_from_crossterm(
+                ct_event::Event::Mouse(mk(MouseEventKind::Down(MouseButton::Left))),
+                &mut accel
+            ),
+            Some(UiEvent::Click { x: 7, y: 4 })
+        ));
+
+        // 仍丢：抬起 / 右键按下 / 移动 / 拖拽 / 横向滚轮
         for kind in [
-            MouseEventKind::Down(MouseButton::Left),
             MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Right),
             MouseEventKind::Moved,
             MouseEventKind::Drag(MouseButton::Left),
             MouseEventKind::ScrollLeft,

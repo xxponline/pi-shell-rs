@@ -34,7 +34,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use pi_shell_rs::rpc::{CommandSender, ResponsePolicy, RpcClient};
 use pi_shell_rs::session::{Phase, SessionState};
 use ratatui::style::Color;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use crate::app::editor::EditorBuffer;
 use crate::app::event::{AsyncKind, UiEvent};
@@ -117,6 +117,11 @@ pub struct App {
     state: SessionState,
     /// 消息区滚动状态（design D1；渲染端经 draw 回写，D2）。
     scroll: ChatScroll,
+    /// 单卡工具展开覆盖表（toolCallId → 是否展开；Ctrl+O 全局切换时清空，
+    /// design D1——≡ pi setToolsExpanded 遍历广播）。
+    user_tool_expanded: HashMap<String, bool>,
+    /// 工具卡片绝对屏行命中表（上一帧渲染反馈，design D2；点击分发用）。
+    card_hits: Vec<wrap::CardHit>,
     /// 多行编辑器缓冲（行数组+光标+kill-ring+undo）。
     editor: EditorBuffer,
     /// 瞬时提示与颜色（error 红 / warning 黄 / info 默认色）。
@@ -190,6 +195,8 @@ impl App {
         Self {
             state: SessionState::new(),
             scroll: ChatScroll::default(),
+            user_tool_expanded: HashMap::new(),
+            card_hits: Vec::new(),
             editor: EditorBuffer::new(),
             notice: None,
             should_quit: false,
@@ -361,6 +368,12 @@ impl App {
                             need_draw = true;
                         }
                     }
+                    Ok(UiEvent::Click { x, y }) => {
+                        self.log_event("key", &format!("click at {x},{y}"));
+                        if self.handle_click(y) {
+                            need_draw = true;
+                        }
+                    }
                     Ok(UiEvent::Rpc(raw)) => {
                         self.log_event("rpc", &raw.to_string());
                         if raw.get("type").and_then(|t| t.as_str()) == Some("extension_ui_request") {
@@ -500,6 +513,45 @@ impl App {
             self.scroll.scroll_down_lines(lines as usize);
         }
         true
+    }
+
+    /// 左键点击分发：行号 → 卡片 → 翻转单卡展开（design D3/D4）。
+    ///
+    /// 输入: y — 0-based 屏幕行（x 不参与——只判行不判列，卡片行满宽语义，
+    ///       design D3；坐标日志在事件臂）
+    /// 输出: true = 命中并翻转（需重绘）；false = 浮层打开/非聊天区/
+    ///       未命中（不改状态）；副作用为写覆盖表（相对当前生效值取反）
+    fn handle_click(&mut self, y: u16) -> bool {
+        // 浮层遮挡时忽略（design D3，与滚轮同规则）。
+        if self.overlay.is_some() {
+            return false;
+        }
+        let Some(id) = self.card_at(y) else {
+            return false;
+        };
+        // 翻转相对当前生效值（覆盖优先、否则全局，design D1）。
+        let effective = *self.user_tool_expanded.get(&id).unwrap_or(&self.expand_tools);
+        self.user_tool_expanded.insert(id.clone(), !effective);
+        self.log_event("key", &format!("tool card {id} expanded -> {}", !effective));
+        true
+    }
+
+    /// 坐标 → 卡片 id（design D3）：`y=0` 是 header，聊天区行 = `y-1`；
+    /// 越过上帧视口高无动作；绝对屏行 = 上帧 `scroll.top` + 行号，线性扫
+    /// 上帧命中表（同帧一致；append-only 增长不移位既有绝对号，design D2）。
+    ///
+    /// 输入: y — 0-based 屏幕行
+    /// 输出: Some(toolCallId) 命中卡片；None = 非卡片行/越界
+    fn card_at(&self, y: u16) -> Option<String> {
+        let row = y.checked_sub(1)? as usize;
+        if row >= self.scroll.viewport as usize {
+            return None;
+        }
+        let abs = self.scroll.top + row;
+        self.card_hits
+            .iter()
+            .find(|h| abs >= h.start && abs < h.end)
+            .map(|h| h.id.clone())
     }
 
     /// 编辑键统一分派：字符/光标移动/删除/kill-ring/yank/undo。
@@ -2451,6 +2503,10 @@ impl App {
             }
             KeyIntent::ToggleTools => {
                 self.expand_tools = !self.expand_tools;
+                // 单卡覆盖清空（design D1）：≡ pi setToolsExpanded 遍历
+                // 广播 setExpanded(新全局值)——全局切换后所有卡跟随新全局，
+                // 此后单卡点击仍可独立切换（spec 场景 4）。
+                self.user_tool_expanded.clear();
                 self.log_event("key", &format!("tools toggled -> {}", self.expand_tools));
                 None
             }
@@ -3276,12 +3332,15 @@ impl App {
                 None
             },
             scroll: self.scroll,
+            tool_expanded: Some(&self.user_tool_expanded),
         };
-        // 渲染回写（design D2）：ratatui 闭包返回 ()，经 Cell 带出吸收后的
-        // 滚动状态（视口首行/贴底跟随/视口高），闭包结束后存回。
-        let fb = std::cell::Cell::new(self.scroll);
+        // 渲染回写（design D2）：ratatui 闭包返回 ()，经 Cell 带出
+        // (滚动状态, 卡片命中区间)，闭包结束后存回。
+        let fb = std::cell::Cell::new((self.scroll, Vec::<wrap::CardHit>::new()));
         terminal.draw(|frame| fb.set(view::render(frame, &self.state, &ui)))?;
-        self.scroll = fb.get();
+        let (scroll, hits) = fb.take();
+        self.scroll = scroll;
+        self.card_hits = hits;
         Ok(())
     }
 
@@ -3407,6 +3466,31 @@ mod input_tests {
         assert!(app.expand_tools);
     }
 
+    /// 任务 1.2：Ctrl+O 广播语义——全局切换清空单卡覆盖（spec 场景 4，
+    /// ≡ pi setToolsExpanded 遍历广播，design D1）。
+    #[test]
+    fn ctrl_o_clears_per_card_overrides_on_global_toggle() {
+        let mut app = App::new();
+        // 模拟单卡点击产生的覆盖
+        app.user_tool_expanded.insert("c1".into(), true);
+        app.user_tool_expanded.insert("c2".into(), false);
+        assert!(!app.expand_tools, "全局默认折叠");
+
+        let ctrl_o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        app.apply_intent(ctrl_o, KeyIntent::ToggleTools);
+        assert!(app.expand_tools, "全局翻转为展开");
+        assert!(
+            app.user_tool_expanded.is_empty(),
+            "单卡覆盖被清空（广播后所有卡跟随新全局）"
+        );
+
+        // 再切回：同样清空（覆盖表不跨全局切换存活）
+        app.user_tool_expanded.insert("c3".into(), true);
+        app.apply_intent(ctrl_o, KeyIntent::ToggleTools);
+        assert!(!app.expand_tools, "全局翻回折叠");
+        assert!(app.user_tool_expanded.is_empty(), "覆盖表再次清空");
+    }
+
     #[test]
     fn key_intent_mapping_matches_spec() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -3523,6 +3607,53 @@ mod input_tests {
         app.completion.open = true;
         assert!(app.handle_wheel(-2), "菜单打开仍滚消息区");
         assert_eq!(app.scroll.top, 47, "菜单打开时滚动生效");
+    }
+
+    /// 任务 4.1：点击分发——命中翻转单卡且不影响他卡、非命中行/越界/
+    /// 浮层均无效、已展开卡再点恢复折叠（design D3/D4）。
+    #[test]
+    fn click_toggles_hit_card_and_respects_bounds_overlay() {
+        let mut app = App::new();
+        app.scroll.viewport = 50;
+        app.scroll.top = 0;
+        app.card_hits = vec![
+            wrap::CardHit { start: 10, end: 20, id: "c1".into() },
+            wrap::CardHit { start: 30, end: 40, id: "c2".into() },
+        ];
+        assert!(!app.expand_tools, "全局默认折叠");
+
+        // ① 点折叠卡（行 12 ∈ [10,20) → y=13）：c1 展开、c2 不变
+        assert!(app.handle_click(13), "命中应翻转并需重绘");
+        assert_eq!(app.user_tool_expanded.get("c1"), Some(&true), "c1 展开");
+        assert!(!app.user_tool_expanded.contains_key("c2"), "他卡不变");
+
+        // ⑤ 已展开卡再点：恢复折叠（覆盖表写入 false）
+        assert!(app.handle_click(13));
+        assert_eq!(app.user_tool_expanded.get("c1"), Some(&false), "再点恢复折叠");
+
+        // ② 非命中行（如运行中卡不入表的行 25）无效
+        assert!(!app.handle_click(26), "非命中行无动作");
+        assert_eq!(app.user_tool_expanded.len(), 1, "覆盖表不变");
+
+        // ④ 行号越界安全：header(y=0)、越过视口、超大 y 均无 panic
+        assert!(!app.handle_click(0), "header 行无效");
+        assert!(!app.handle_click(51), "越过视口无效");
+        assert!(!app.handle_click(u16::MAX), "超大 y 安全");
+
+        // ③ 浮层打开时点击被忽略
+        app.overlay = Some(Overlay::Tree {
+            tree: Vec::new(),
+            leaf_id: None,
+            rows: Vec::new(),
+            cursor: 0,
+            folded: std::collections::HashSet::new(),
+            filter: crate::app::tree::FilterMode::Default,
+            search: String::new(),
+            loading: true,
+            seq: 0,
+        });
+        assert!(!app.handle_click(31), "浮层打开时点击被忽略");
+        assert_eq!(app.user_tool_expanded.len(), 1, "浮层下覆盖表不变");
     }
 
     #[test]
