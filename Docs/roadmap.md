@@ -206,8 +206,6 @@ model/session/tree/thinking 选择器，extension_ui 9 种 method，write/grep/f
 - **4b add-session-management ✅**：斜杠设施 + 会话选择器/切换、会话树（导航·折叠·
   过滤·fork）、新建/克隆/重命名/两段式删除、compact（含压缩期间本地排队补发）、
   /session 信息面板、切换后状态重建（get_messages）
-- 剩余：树内搜索/标签编辑、pi 其余 17 个斜杠命令、双击 esc（#5）、bash 模式（#6）、
-  剪贴板/外部编辑器（#9）
 - **待办（已挂账）：滚动增强剩余项**——消息区整页回看
   （`add-message-scrollback`）、鼠标滚轮（`add-mouse-wheel-scroll`）、
   滚动条（`add-message-scrollbar`：瞬态显隐/悬停/拖拽 scrub 全量）均已落地。
@@ -224,8 +222,8 @@ model/session/tree/thinking 选择器，extension_ui 9 种 method，write/grep/f
 操作逻辑对齐 ✅（change `align-interaction-semantics`）：按
 [`pi-tui-interaction.md`](./pi-tui-interaction.md) 差异清单完成 #1/2/3/4/8/10——
 流式 steer、ctrl+c/ctrl+d/esc 语义、队列恢复、多行编辑器（光标/词行删除/
-kill-ring/yank/undo）。剩余：#5 双击 esc、#6 bash 模式、#7 slash 命令、
-#9 剪贴板/外部编辑器等（见差异表）。
+kill-ring/yank/undo）。其余小项见差异表（#11 扩展快捷键——无扩展运行时、
+#12 选择器分页、#9 残差：选区复制/剪贴板文件列表粘贴）。
 
 ## 7. 既定技术决策记录
 

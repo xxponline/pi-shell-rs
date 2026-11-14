@@ -17,7 +17,9 @@
 | （自动） | 预选最佳匹配（精确 > 首个前缀）；`/model `、`/thinking ` 空格后出参数候选 |
 
 参数候选数据惰性拉取一次（首次键入 `/model ` 时发 `get_available_models`，缓存后复用；
-`/reload` 可使其失效重拉）。`@文件` 与路径补全**未实现**（pi 的 fd 集成，另一套机制）。
+`/reload` 可使其失效重拉）。`@文件` 补全已落地（`add-at-file-completion`：`@` 前缀
++ fd 递归模糊，键位见 `tui-usage.md`）；Tab 路径补全已落地
+（`add-path-tab-completion`：路径候选/force 态重过滤/单条直插）。
 
 ## 24 个命令
 

@@ -187,7 +187,6 @@ label（条目名；`/` 菜单中 value==label 视觉不变）。
 
 - **不支持的 markdown**：表格按原文纯文本显示；LaTeX/mermaid 不渲染
   （降级为暗色原文/代码样式）；图片不显示（显示 `(image: url)` 提示）。
-- **模型/会话选择器、compact 流程**尚未实现（阶段 4）。
 - Windows 键位差异（pi 在 Windows 用 ctrl+q 等）未做平台分支——当前只按
   macOS 键位实现。
 - 开启鼠标捕获后**原生鼠标选择失效**：拖拽选中文本需按住 Shift 由终端透传
