@@ -19,6 +19,8 @@ pub const PAGE_SCROLL_OVERLAP: usize = 4;
 ///   钉在原内容上不被新内容抢占。
 /// - `viewport` — 上次渲染的消息区高度（页长计算用；渲染端每帧回写），
 ///   resize 后下一帧自纠，首帧前为 0（页长退化为 1 行）。
+/// - `content_len` — 内容总行数（换行后；渲染端每帧回写，供滚动条几何，
+///   design D1）；首帧前为 0。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChatScroll {
     /// 视口首行（换行后绝对行号）。
@@ -27,6 +29,8 @@ pub struct ChatScroll {
     pub following: bool,
     /// 上次渲染的消息区高度（页长计算用）。
     pub viewport: u16,
+    /// 内容总行数（渲染端每帧回写，滚动条几何用，design D1）。
+    pub content_len: usize,
 }
 
 impl Default for ChatScroll {
@@ -37,6 +41,7 @@ impl Default for ChatScroll {
             top: 0,
             following: true,
             viewport: 0,
+            content_len: 0,
         }
     }
 }
@@ -108,6 +113,43 @@ impl ChatScroll {
         self.top = effective_top;
         self.following = at_bottom;
     }
+
+    /// 绝对定位视口首行（滚动条跳转/拖拽 scrub 用，复刻 pi `scrollTo`）。
+    ///
+    /// 输入: top — 目标视口首行（换行后绝对行号，可越界）
+    /// 输出: 副作用为 clamp 到 [0, max_top] 并按是否到底恢复/清除跟随
+    ///       （max_top = content_len − viewport；内容不足一屏时为 0
+    ///       → 恒贴底）；与 page/scroll 系不同，此函数直接写绝对位置
+    pub fn set_top_abs(&mut self, top: usize) {
+        let max_top = self.content_len.saturating_sub(self.viewport as usize);
+        let t = top.min(max_top);
+        self.top = t;
+        self.following = t >= max_top;
+    }
+}
+
+/// 滚动条瞬态隐藏延迟（对齐 pi `scrollbarHideDelayMs` 默认 1000ms；判定经
+/// 事件循环 200ms tick，实际隐延迟 1.0–1.2s，design D3 记录接受）。
+pub const SCROLLBAR_HIDE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// 滚动条拖拽状态（add-message-scrollbar design D5）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollbarDrag {
+    /// 按下点距 thumb 顶的行偏移（抓 thumb）；点轨道时为 thumb 高的一半。
+    pub grab_offset: usize,
+}
+
+/// 滚动条瞬态判隐（纯函数，design D3）。
+///
+/// 输入: visible — 当前是否显示；hovered — 悬停中（压制计时）；
+///       activity_age — 距最近一次滚动移动的时长
+/// 输出: true = 应隐藏（可见且非悬停且 ≥ SCROLLBAR_HIDE_DELAY）
+pub fn scrollbar_should_hide(
+    visible: bool,
+    hovered: bool,
+    activity_age: std::time::Duration,
+) -> bool {
+    visible && !hovered && activity_age >= SCROLLBAR_HIDE_DELAY
 }
 
 // ─────────────────────────── 滚轮加速器 ───────────────────────────
@@ -254,6 +296,44 @@ mod tests {
         assert!(s.following, "默认应贴底跟随");
         assert_eq!(s.top, 0);
         assert_eq!(s.viewport, 0);
+        assert_eq!(s.content_len, 0, "首帧前内容总行数为 0");
+    }
+
+    /// 任务 1.1：set_top_abs 绝对定位——中段钉住、越界 clamp、贴底恢复
+    /// 跟随、内容不足一屏恒贴底（复刻 pi scrollTo，滚动条跳转/拖拽用）。
+    #[test]
+    fn set_top_abs_clamps_and_restores_follow() {
+        let mut s = ChatScroll {
+            top: 0,
+            following: true,
+            viewport: 20,
+            content_len: 100,
+        };
+
+        // 中段：钉住
+        s.set_top_abs(40);
+        assert_eq!(s.top, 40, "中段定位");
+        assert!(!s.following, "中段不跟随");
+
+        // 越界：clamp 到 max_top=80 并恢复跟随
+        s.set_top_abs(999);
+        assert_eq!(s.top, 80, "越界 clamp 到底");
+        assert!(s.following, "到底恢复跟随");
+
+        // 贴底定位本身即跟随态
+        s.set_top_abs(80);
+        assert!(s.following);
+
+        // 内容不足一屏：max_top=0 → 恒贴底
+        let mut fit = ChatScroll {
+            top: 0,
+            following: false,
+            viewport: 50,
+            content_len: 10,
+        };
+        fit.set_top_abs(5);
+        assert_eq!(fit.top, 0, "不足一屏 clamp 到 0");
+        assert!(fit.following, "不足一屏恒贴底");
     }
 
     /// 任务 1.2：页长 = viewport − 重叠行，viewport 不足时退化为 1。
@@ -276,6 +356,7 @@ mod tests {
     #[test]
     fn page_up_breaks_follow_and_saturates_at_top() {
         let mut s = ChatScroll {
+            content_len: 0,
             top: 10,
             following: true,
             viewport: 20,
@@ -294,6 +375,7 @@ mod tests {
     #[test]
     fn page_down_saturates_and_keeps_following_flag() {
         let mut s = ChatScroll {
+            content_len: 0,
             top: 10,
             following: false,
             viewport: 20,
@@ -311,6 +393,7 @@ mod tests {
     #[test]
     fn absorb_restores_follow_at_bottom_and_keeps_pin_midway() {
         let mut s = ChatScroll {
+            content_len: 0,
             top: 500,
             following: false,
             viewport: 20,
@@ -330,6 +413,7 @@ mod tests {
     #[test]
     fn wheel_scroll_up_breaks_follow_and_moves_by_lines() {
         let mut s = ChatScroll {
+            content_len: 0,
             top: 50,
             following: true,
             viewport: 20,
@@ -347,6 +431,7 @@ mod tests {
     #[test]
     fn wheel_scroll_down_keeps_following_flag() {
         let mut s = ChatScroll {
+            content_len: 0,
             top: 10,
             following: false,
             viewport: 20,
@@ -357,6 +442,7 @@ mod tests {
 
         // following 态下下滚也不直接改标志（渲染端每帧重算 top 并 absorb）
         let mut f = ChatScroll {
+            content_len: 0,
             top: 100,
             following: true,
             viewport: 20,
@@ -374,6 +460,7 @@ mod tests {
     #[test]
     fn wheel_scroll_zero_is_noop() {
         let mut s = ChatScroll {
+            content_len: 0,
             top: 10,
             following: true,
             viewport: 20,

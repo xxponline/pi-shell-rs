@@ -43,6 +43,7 @@ use crate::app::terminal::{TerminalGuard, TerminalSinks};
 
 /// 消息区滚动状态（design D1；view/wrap/App 共用）。
 pub use crate::app::scroll::ChatScroll;
+use crate::app::scroll::{scrollbar_should_hide, ScrollbarDrag};
 
 /// 按键意图（`key_intent` 的纯映射产物，便于单测）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +124,15 @@ pub struct App {
     /// thinking 单块展开覆盖表（全局渲染序号 → 是否展开；Ctrl+T 全局切换时
     /// 清空，design D3——≡ pi setHideThinkingBlock 的 overrides.clear()）。
     thinking_overrides: HashMap<usize, bool>,
+    /// 滚动条瞬态状态（add-message-scrollbar design D3）：visible 仅由滚动
+    /// 活动点亮（内容超视口才亮）、activity=最近滚动移动、hovered=悬停
+    /// （压制判隐）、drag=拖拽 scrub 中（4.2）。
+    scrollbar_visible: bool,
+    scrollbar_activity: Option<std::time::Instant>,
+    scrollbar_hovered: bool,
+    scrollbar_drag: Option<ScrollbarDrag>,
+    /// 消息区上帧布局（滚动条列命中判定用，design D5；同 card_hits 模式）。
+    chat_area: ratatui::layout::Rect,
     /// 可点击内容（工具卡/thinking）绝对屏行命中表（上一帧渲染反馈，
     /// design D1/D2；点击分发用）。
     card_hits: Vec<wrap::Hit>,
@@ -201,6 +211,11 @@ impl App {
             scroll: ChatScroll::default(),
             user_tool_expanded: HashMap::new(),
             thinking_overrides: HashMap::new(),
+            scrollbar_visible: false,
+            scrollbar_activity: None,
+            scrollbar_hovered: false,
+            scrollbar_drag: None,
+            chat_area: ratatui::layout::Rect::default(),
             card_hits: Vec::new(),
             editor: EditorBuffer::new(),
             notice: None,
@@ -375,7 +390,23 @@ impl App {
                     }
                     Ok(UiEvent::Click { x, y }) => {
                         self.log_event("key", &format!("click at {x},{y}"));
-                        if self.handle_click(y) {
+                        // 滚动条列按下被消费（design D5）；否则既有点击。
+                        if self.handle_scrollbar_press(x, y) || self.handle_click(y) {
+                            need_draw = true;
+                        }
+                    }
+                    Ok(UiEvent::PointerMove { x, y }) => {
+                        if self.handle_pointer_move(x, y) {
+                            need_draw = true;
+                        }
+                    }
+                    Ok(UiEvent::PointerDrag { x, y }) => {
+                        if self.handle_pointer_drag(x, y) {
+                            need_draw = true;
+                        }
+                    }
+                    Ok(UiEvent::PointerUp) => {
+                        if self.handle_pointer_up() {
                             need_draw = true;
                         }
                     }
@@ -486,6 +517,10 @@ impl App {
                             need_draw = true;
                             last_tick_draw = std::time::Instant::now();
                         }
+                        // 滚动条瞬态判隐（单沿：仅真实隐藏才重绘，design D3）。
+                        if self.tick_scrollbar(std::time::Instant::now()) {
+                            need_draw = true;
+                        }
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => self.should_quit = true,
                 }
@@ -512,11 +547,191 @@ impl App {
         if self.overlay.is_some() || lines == 0 {
             return false;
         }
+        let top_before = self.scroll.top;
         if lines < 0 {
             self.scroll.scroll_up_lines(lines.unsigned_abs() as usize);
         } else {
             self.scroll.scroll_down_lines(lines as usize);
         }
+        // 滚动移动才点亮滚动条（design D3，对齐 pi moved!==0 才 mark）。
+        if self.scroll.top != top_before {
+            self.mark_scroll_activity();
+        }
+        true
+    }
+
+    /// 记录一次滚动移动（滚动条瞬态显示触发，design D3）。
+    ///
+    /// 输入: 无（读 scroll.content_len/viewport 判 overflow）
+    /// 输出: 无返回值；副作用为 activity=now、visible=内容超出视口才点亮
+    ///       （不足一屏恒不显示）；调用方本就伴随重绘，无需额外回报
+    fn mark_scroll_activity(&mut self) {
+        self.scrollbar_activity = Some(std::time::Instant::now());
+        self.scrollbar_visible = self.scroll.content_len > self.scroll.viewport as usize;
+    }
+
+    /// 事件循环超时支：滚动条瞬态判隐（单沿——仅真实隐藏时返回 true）。
+    ///
+    /// 输入: now — 当前时刻（测试注入）
+    /// 输出: true = 发生 visible→hidden 翻转（需重绘）
+    fn tick_scrollbar(&mut self, now: std::time::Instant) -> bool {
+        let Some(at) = self.scrollbar_activity else {
+            return false;
+        };
+        if scrollbar_should_hide(
+            self.scrollbar_visible,
+            self.scrollbar_hovered,
+            now.duration_since(at),
+        ) {
+            self.scrollbar_visible = false;
+            return true;
+        }
+        false
+    }
+
+    /// 当前帧滚动条几何（上帧 content_len/top + 上帧 chat_area，design D2
+    /// 共用判定）；首帧前（chat_area 为空）→ None。
+    ///
+    /// 输入: 无
+    /// 输出: Some(几何) / None（区域空或内容不足一屏）
+    fn scrollbar_geometry(&self) -> Option<wrap::ScrollbarGeometry> {
+        if self.chat_area.width == 0 || self.chat_area.height == 0 {
+            return None;
+        }
+        wrap::scrollbar_geometry(
+            self.scroll.content_len,
+            self.chat_area.height as usize,
+            self.scroll.top,
+        )
+    }
+
+    /// 指针是否命中滚动条列 + 轨道行（design D5 悬停/按下共用；列 =
+    /// 消息区最右列）。内容不足一屏时列判定仍成立，但消费/揭示由
+    /// geometry 门控（与现状点击语义一致）。
+    ///
+    /// 输入: x/y — 0-based 屏幕坐标
+    /// 输出: true = 命中
+    fn scrollbar_hit_at(&self, x: u16, y: u16) -> bool {
+        let area = self.chat_area;
+        if area.width == 0 {
+            return false;
+        }
+        x == area.x + area.width - 1
+            && y >= area.y
+            && y < area.y.saturating_add(area.height)
+    }
+
+    /// 左键按下 → 滚动条列消费（design D5，复刻 pi
+    /// handleScrollbarMouseEvent）：命中列+轨道行且内容超视口才消费——
+    /// 点 thumb 记 grabOffset；点轨道 thumb 中心跳到指针；按下即起拖并
+    /// 点亮计时。浮层/未命中/不足一屏 → false（不消费，走既有
+    /// handle_click）。
+    ///
+    /// 输入: x/y — 0-based 屏幕坐标
+    /// 输出: true = 被滚动条消费（状态已变，需重绘）
+    fn handle_scrollbar_press(&mut self, x: u16, y: u16) -> bool {
+        if self.overlay.is_some() || !self.scrollbar_hit_at(x, y) {
+            return false;
+        }
+        let Some(geo) = self.scrollbar_geometry() else {
+            return false; // 内容不足一屏：不消费（与现状点击语义一致）
+        };
+        let rel = (y as usize).saturating_sub(self.chat_area.y as usize);
+        let on_thumb = rel >= geo.thumb_top && rel < geo.thumb_top + geo.thumb_height;
+        let grab = if on_thumb {
+            rel - geo.thumb_top
+        } else {
+            geo.thumb_height / 2 // 点轨道：以 thumb 半高为偏移起拖（pi 同）
+        };
+        self.scrollbar_drag = Some(ScrollbarDrag { grab_offset: grab });
+        self.scrollbar_hovered = true; // 按下即悬停（pi press → setScrollbarHover）
+        if !on_thumb {
+            self.scrollbar_scrub_to(y); // 点轨道立即跳转
+        }
+        self.mark_scroll_activity(); // 按下点亮/刷新计时（拖拽全程保持）
+        self.log_event("key", "scrollbar press");
+        true
+    }
+
+    /// 指针移动：拖拽中优先 scrub；否则悬停判定（design D5/D6）。
+    ///
+    /// 输入: x/y — 0-based 屏幕坐标
+    /// 输出: true = 状态翻转（悬停进出/scrub 位置变化，需重绘）；
+    ///       浮层打开 → false（三类 pointer 全忽略）
+    fn handle_pointer_move(&mut self, x: u16, y: u16) -> bool {
+        if self.overlay.is_some() {
+            return false;
+        }
+        if self.scrollbar_drag.is_some() {
+            return self.scrollbar_scrub_to(y);
+        }
+        let hit = self.scrollbar_hit_at(x, y);
+        if hit == self.scrollbar_hovered {
+            return false; // 无翻转不重绘（Moved 洪水，design D4）
+        }
+        self.scrollbar_hovered = hit;
+        if hit {
+            // 揭示：内容超视口即点亮（pi includeHiddenAuto，design D6）。
+            self.scrollbar_visible = self.scroll.content_len > self.scroll.viewport as usize;
+        } else {
+            // 离开：重启 1s 计时（pi setScrollbarActive(false) → re-arm）。
+            self.scrollbar_activity = Some(std::time::Instant::now());
+        }
+        self.log_event("key", &format!("scrollbar hover -> {hit}"));
+        true
+    }
+
+    /// 左键拖拽移动：拖拽中 scrub 跟手；否则忽略（design D5）。
+    ///
+    /// 输入: x/y — 0-based 屏幕坐标（x 不参与——scrub 只看行）
+    /// 输出: true = top 变化（需重绘）；浮层/未起拖 → false
+    fn handle_pointer_drag(&mut self, _x: u16, y: u16) -> bool {
+        if self.overlay.is_some() || self.scrollbar_drag.is_none() {
+            return false;
+        }
+        self.scrollbar_scrub_to(y)
+    }
+
+    /// 左键抬起：结束拖拽并刷新计时（design D5）；无拖拽 → false。
+    ///
+    /// 输入: 无
+    /// 输出: 恒 false（画面不变不重绘；状态清理供后续 Move 维护悬停）
+    fn handle_pointer_up(&mut self) -> bool {
+        if self.scrollbar_drag.is_none() {
+            return false;
+        }
+        self.scrollbar_drag = None;
+        self.scrollbar_activity = Some(std::time::Instant::now());
+        false
+    }
+
+    /// scrub 核心（design D5，复刻 pi scrollScrollbarToPointer）：指针行 →
+    /// thumb 顶偏移 → 按比例映射绝对 top。
+    ///
+    /// 输入: y — 0-based 屏幕行
+    /// 输出: true = top 变化（需重绘）；无拖拽/几何消失/位置不变 → false
+    fn scrollbar_scrub_to(&mut self, y: u16) -> bool {
+        let Some(drag) = self.scrollbar_drag else {
+            return false;
+        };
+        let Some(geo) = self.scrollbar_geometry() else {
+            self.scrollbar_drag = None; // 几何消失（内容骤变）：结束拖拽
+            return false;
+        };
+        let max_thumb = geo.track_height.saturating_sub(geo.thumb_height);
+        let rel = (y as usize).saturating_sub(self.chat_area.y as usize);
+        let thumb_offset = rel.saturating_sub(drag.grab_offset).min(max_thumb);
+        let new_top = if max_thumb == 0 {
+            0
+        } else {
+            ((thumb_offset as f64 / max_thumb as f64) * geo.max_scroll_top as f64).round()
+                as usize
+        };
+        if self.scroll.top == new_top {
+            return false;
+        }
+        self.scroll.set_top_abs(new_top);
+        self.mark_scroll_activity(); // 拖动也是滚动移动（点亮/计时）
         true
     }
 
@@ -1862,10 +2077,15 @@ impl App {
         // 上方消费块处理、浮层在 overlay_key 吞键，此处仅菜单/浮层关闭时
         // 到达；滚动不影响输入，跳过末尾重算直接返回。
         if let KeyIntent::ScrollPage(dir) = intent {
+            let top_before = self.scroll.top;
             if dir < 0 {
                 self.scroll.page_up();
             } else {
                 self.scroll.page_down();
+            }
+            // 滚动移动才点亮滚动条（design D3，对齐 pi moved!==0 才 mark）。
+            if self.scroll.top != top_before {
+                self.mark_scroll_activity();
             }
             return;
         }
@@ -3362,14 +3582,27 @@ impl App {
             scroll: self.scroll,
             tool_expanded: Some(&self.user_tool_expanded),
             thinking_overrides: Some(&self.thinking_overrides),
+            // 任务 4.1 接瞬态状态（visible/hovered；design D3）。
+            scrollbar: if self.scrollbar_visible {
+                Some(wrap::ScrollbarOverlay {
+                    hovered: self.scrollbar_hovered,
+                })
+            } else {
+                None
+            },
         };
         // 渲染回写（design D2）：ratatui 闭包返回 ()，经 Cell 带出
         // (滚动状态, 卡片命中区间)，闭包结束后存回。
-        let fb = std::cell::Cell::new((self.scroll, Vec::<wrap::Hit>::new()));
+        let fb = std::cell::Cell::new((
+            self.scroll,
+            Vec::<wrap::Hit>::new(),
+            ratatui::layout::Rect::default(),
+        ));
         terminal.draw(|frame| fb.set(view::render(frame, &self.state, &ui)))?;
-        let (scroll, hits) = fb.take();
+        let (scroll, hits, chat_area) = fb.take();
         self.scroll = scroll;
         self.card_hits = hits;
+        self.chat_area = chat_area;
         Ok(())
     }
 
@@ -3663,6 +3896,164 @@ mod input_tests {
         app.completion.open = true;
         assert!(app.handle_wheel(-2), "菜单打开仍滚消息区");
         assert_eq!(app.scroll.top, 47, "菜单打开时滚动生效");
+    }
+
+    /// 任务 4.1：滚动条瞬态状态机——滚动点亮、1s 判隐单沿、hover 压制、
+    /// 内容不足一屏不点亮、仅增长不触发（design D3；spec 场景「滚动后
+    /// 瞬态显示随后隐藏」「内容不足一屏不显示」「仅内容增长不触发显示」）。
+    #[test]
+    fn scrollbar_shows_on_scroll_and_hides_after_1s() {
+        let mut app = App::new();
+        app.scroll.content_len = 100;
+        app.scroll.viewport = 20;
+        assert!(!app.scrollbar_visible);
+
+        // 滚动点亮
+        app.mark_scroll_activity();
+        assert!(app.scrollbar_visible, "滚动后点亮");
+
+        // 未到期不隐、到期单沿隐（第二次 tick 不再报重绘）
+        let at = app.scrollbar_activity.unwrap();
+        assert!(
+            !app.tick_scrollbar(at + Duration::from_millis(999)),
+            "未到期不隐"
+        );
+        assert!(
+            app.tick_scrollbar(at + Duration::from_secs(1)),
+            "到期隐藏并需重绘"
+        );
+        assert!(!app.scrollbar_visible);
+        assert!(
+            !app.tick_scrollbar(at + Duration::from_secs(2)),
+            "单沿：重复判不重绘"
+        );
+
+        // hover 压制判隐
+        app.mark_scroll_activity();
+        app.scrollbar_hovered = true;
+        assert!(!app.tick_scrollbar(at + Duration::from_secs(99)), "悬停不隐");
+
+        // 内容不足一屏：滚动不点亮；之后仅增长也不触发
+        let mut fit = App::new();
+        fit.scroll.content_len = 10;
+        fit.scroll.viewport = 20;
+        fit.mark_scroll_activity();
+        assert!(!fit.scrollbar_visible, "不足一屏不点亮");
+        fit.scroll.content_len = 1000;
+        assert!(!fit.scrollbar_visible, "仅内容增长不点亮");
+
+        // 判隐纯函数真值表
+        assert!(!scrollbar_should_hide(false, false, Duration::from_secs(2)));
+        assert!(!scrollbar_should_hide(true, false, Duration::from_millis(999)));
+        assert!(scrollbar_should_hide(true, false, Duration::from_secs(1)));
+        assert!(!scrollbar_should_hide(true, true, Duration::from_secs(99)));
+    }
+
+    /// 任务 4.2：滚动条按下消费与跳转/scrub（design D5；spec 场景「列上
+    /// 按下被消费并可跳转/拖动」）：列上按下不穿透为卡片点击、点轨道跳转、
+    /// 拖动按比例映射、抬起结束、浮层忽略、非列上按下卡片点击回归。
+    #[test]
+    fn scrollbar_column_down_consumes_and_jumps() {
+        let mut app = App::new();
+        // 上帧状态：内容100 行、视口20、贴底 top=80；chat 区 (0,1,40,20)
+        app.scroll.content_len = 100;
+        app.scroll.viewport = 20;
+        app.scroll.top = 80;
+        app.scroll.following = true;
+        app.chat_area = ratatui::layout::Rect::new(0, 1, 40, 20);
+        // 列上恰有卡片命中——按下仍应被滚动条消费
+        app.card_hits = vec![wrap::Hit {
+            start: 0,
+            end: 20,
+            kind: wrap::HitKind::Tool("t1".into()),
+        }];
+        // geometry(100,20,80) → thumb=4、max=80、maxThumb=16、thumbTop=16
+        // → thumb 屏幕行 [17,21)
+
+        // ① 点轨道上方（y=3，非 thumb）：消费 + 跳转 + 不穿透卡片
+        assert!(app.handle_scrollbar_press(39, 3), "轨道按下被消费");
+        assert!(app.user_tool_expanded.is_empty(), "不穿透为卡片点击");
+        assert!(app.scrollbar_drag.is_some(), "起拖");
+        // rel=2 → grab=2（thumb 半高）→ offset=2−2=0 → top=0
+        assert_eq!(app.scroll.top, 0, "点轨道跳到指针对应位置");
+        assert!(!app.scroll.following, "中段不跟随");
+
+        // ② 拖动：y=17 → rel=16 → offset=16−2=14 → top=round(14/16×80)=70
+        assert!(app.handle_pointer_drag(39, 17), "拖动改变 top");
+        assert_eq!(app.scroll.top, 70, "scrub 按比例映射");
+
+        // ③ 抬起结束拖拽：后续拖拽事件被忽略
+        app.handle_pointer_up();
+        assert!(app.scrollbar_drag.is_none(), "抬起结束拖拽");
+        let top_after_up = app.scroll.top;
+        assert!(!app.handle_pointer_drag(39, 3), "无拖拽时拖拽事件被忽略");
+        assert_eq!(app.scroll.top, top_after_up, "top 不变");
+
+        // ④ 抓 thumb（y=17 在 thumb 内）：不立即跳转，记 grabOffset
+        app.scroll.top = 80;
+        assert!(app.handle_scrollbar_press(39, 17), "thumb 按下被消费");
+        assert_eq!(app.scroll.top, 80, "抓 thumb 不立即跳转");
+        assert_eq!(
+            app.scrollbar_drag.unwrap().grab_offset,
+            0,
+            "grab = rel − thumbTop"
+        );
+
+        // ⑤ 浮层：按下/移动全忽略
+        app.overlay = Some(Overlay::Tree {
+            tree: Vec::new(),
+            leaf_id: None,
+            rows: Vec::new(),
+            cursor: 0,
+            folded: std::collections::HashSet::new(),
+            filter: crate::app::tree::FilterMode::Default,
+            search: String::new(),
+            loading: true,
+            seq: 0,
+        });
+        app.scrollbar_drag = None;
+        assert!(!app.handle_scrollbar_press(39, 3), "浮层下按下不消费");
+        assert!(!app.handle_pointer_move(39, 5), "浮层下移动忽略");
+
+        // ⑥ 非列上按下：不消费；既有卡片点击回归（abs = top + (y−1)）
+        app.overlay = None;
+        assert!(!app.handle_scrollbar_press(10, 5), "非列上不消费");
+        app.scroll.top = 0;
+        assert!(app.handle_click(5), "非列上卡片点击照旧");
+        assert_eq!(app.user_tool_expanded.get("t1"), Some(&true));
+    }
+
+    /// 任务 4.2：悬停转移与揭示（design D6；spec 场景「悬停加粗并常显」
+    /// 分发段）：列上进入 → 揭示点亮 + 翻转才重绘；离开 → 重启计时；
+    /// 不足一屏不揭示；浮层忽略。
+    #[test]
+    fn pointer_move_toggles_hover_and_reveals() {
+        let mut app = App::new();
+        app.scroll.content_len = 100;
+        app.scroll.viewport = 20;
+        app.chat_area = ratatui::layout::Rect::new(0, 1, 40, 20);
+        assert!(!app.scrollbar_visible);
+
+        // 揭示：从未滚动过、悬停列 → 点亮 + 翻转
+        assert!(app.handle_pointer_move(39, 5), "悬停进入应翻转");
+        assert!(app.scrollbar_hovered);
+        assert!(app.scrollbar_visible, "悬停揭示（内容超视口）");
+
+        // 无翻转不重绘（Moved 洪水）
+        assert!(!app.handle_pointer_move(39, 9), "同状态 Move 不重绘");
+
+        // 离开：翻转 + 重启计时
+        assert!(app.handle_pointer_move(38, 5), "离开应翻转");
+        assert!(!app.scrollbar_hovered);
+        assert!(app.scrollbar_activity.is_some(), "离开重启计时");
+
+        // 不足一屏：悬停不点亮
+        let mut fit = App::new();
+        fit.scroll.content_len = 5;
+        fit.scroll.viewport = 20;
+        fit.chat_area = ratatui::layout::Rect::new(0, 1, 40, 20);
+        assert!(fit.handle_pointer_move(39, 5));
+        assert!(!fit.scrollbar_visible, "不足一屏不揭示");
     }
 
     /// 任务 3.1：thinking 单块点击独立翻转——seq1 点开仅键 1 置位、
@@ -4279,6 +4670,7 @@ mod input_tests {
         let mut app = App::new();
         // 钉住态（用户上滚到中段）
         app.scroll = ChatScroll {
+            content_len: 0,
             top: 120,
             following: false,
             viewport: 20,

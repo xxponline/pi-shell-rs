@@ -6,6 +6,7 @@
 //! 截取视口窗口（following=贴底跟随，即原底部锚定行为；钉住=按换行后
 //! 绝对行号开窗），渲染时不再使用 `Wrap`/`scroll`。
 
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -35,6 +36,98 @@ pub struct Hit {
     pub kind: HitKind,
 }
 
+/// 滚动条轨道前景（pi theme `scrollbarTrack` = dark.json
+/// `okhsl(237 7% 33%)`，经 pi 自带 `oklab.ts::okhslToRgb` 实算 → rgb(72,78,82)）。
+pub const SCROLLBAR_TRACK_COLOR: ratatui::style::Color =
+    ratatui::style::Color::Rgb(72, 78, 82);
+
+/// 滚动条拖动条前景（pi theme `scrollbarThumb` = dark.json
+/// `okhsl(232 7% 65%)`，经 pi 自带 `oklab.ts::okhslToRgb` 实算 →
+/// rgb(151,160,165)）。
+pub const SCROLLBAR_THUMB_COLOR: ratatui::style::Color =
+    ratatui::style::Color::Rgb(151, 160, 165);
+
+/// 滚动条几何（渲染与悬停/拖拽命中共用，同帧同参不错位，design D2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollbarGeometry {
+    /// 轨道高（行，= 消息区高）。
+    pub track_height: usize,
+    /// 拖动条高（行，含最小高下限）。
+    pub thumb_height: usize,
+    /// 拖动条顶（相对轨道顶，行）。
+    pub thumb_top: usize,
+    /// 最大可滚距离（content − viewport，scrub 映射用）。
+    pub max_scroll_top: usize,
+}
+
+/// 按 pi `getScrollbarGeometry` 公式计算滚动条几何（design D2）。
+///
+/// 输入: content_len — 内容总行数（换行后）；height — 消息区高（轨道高）；
+///       top — 当前视口首行（越界自动 clamp）
+/// 输出: None = 内容不足一屏或区域高为 0（不画、不可命中）；
+///       Some(几何)——thumb_h = max(min(2,h), round(h*h/content))、
+///       thumbTop = round(top/maxTop * (h−thumb_h))，直接移植 pi 公式
+pub fn scrollbar_geometry(
+    content_len: usize,
+    height: usize,
+    top: usize,
+) -> Option<ScrollbarGeometry> {
+    if height == 0 || content_len <= height {
+        return None;
+    }
+    let min_thumb = height.min(2);
+    let proportional = ((height * height) as f64 / content_len as f64).round() as usize;
+    let thumb_height = min_thumb.max(proportional).min(height);
+    let max_scroll_top = content_len - height;
+    let max_thumb_top = height - thumb_height;
+    let clamped_top = top.min(max_scroll_top);
+    let thumb_top = if max_scroll_top == 0 {
+        0
+    } else {
+        ((clamped_top as f64 / max_scroll_top as f64) * max_thumb_top as f64).round() as usize
+    };
+    Some(ScrollbarGeometry {
+        track_height: height,
+        thumb_height,
+        thumb_top,
+        max_scroll_top,
+    })
+}
+
+/// 滚动条绘制覆盖输入（design D2）：None=本帧不画；hovered=悬停加粗。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollbarOverlay {
+    /// 指针是否悬停在滚动条列（thumb 加粗为 █）。
+    pub hovered: bool,
+}
+
+/// 把行的显示宽截断到 max_w（从尾部逐字删；CJK 双格整字删，不留半字）。
+///
+/// 输入: line — 待截断行（原地）；max_w — 目标最大显示宽
+/// 输出: 无返回值；副作用为修剪 line 末尾 span（可能整 span 移除）
+fn truncate_line_width(line: &mut Line<'static>, max_w: usize) {
+    let mut w: usize = line.spans.iter().map(|s| s.content.as_ref().width()).sum();
+    while w > max_w {
+        let Some(last) = line.spans.last_mut() else {
+            break;
+        };
+        match last.content.as_ref().chars().next_back() {
+            Some(ch) => {
+                w -= ch.width().unwrap_or(0);
+                let mut s = last.content.as_ref().to_string();
+                s.pop();
+                last.content = std::borrow::Cow::Owned(s);
+                if last.content.is_empty() {
+                    line.spans.pop();
+                }
+            }
+            None => {
+                line.spans.pop();
+            }
+        }
+    }
+}
+
 /// 将逻辑行按视口宽度换行，并按滚动状态截取视口窗口。
 ///
 /// 输入:
@@ -46,10 +139,11 @@ pub struct Hit {
 ///   meta   — 逐逻辑行命中标识（与 lines 等长；chat_lines 产出：已有结果
 ///            的工具卡 Some(Tool(id))、非空 thinking 块 Some(Thinking(seq))，
 ///            design D1/D2）
+///   scrollbar — 滚动条覆盖（None=本帧不画，design D2）
 /// 输出:
 ///   `(窗口行序列, 吸收后的 ChatScroll, Vec<Hit>)`——窗口总行数
-///   ≤ height；返回状态已回写 `viewport=height` 并 `absorb(...)`；
-///   hits 为**窗口化之前**的全量绝对屏行区间（供点击命中）。
+///   ≤ height；返回状态已回写 `viewport=height`、`content_len=全量` 并
+///   `absorb(...)`；hits 为**窗口化之前**的全量绝对屏行区间（供点击命中）。
 ///   空逻辑行保留为一个空行，保证段落间距不塌缩。
 pub fn wrap_for_viewport(
     lines: &[Line<'static>],
@@ -57,6 +151,7 @@ pub fn wrap_for_viewport(
     height: u16,
     scroll: &ChatScroll,
     meta: &[Option<HitKind>],
+    scrollbar: Option<ScrollbarOverlay>,
 ) -> (Vec<Line<'static>>, ChatScroll, Vec<Hit>) {
     let width = width.max(1) as usize;
     let height = height.max(1) as usize;
@@ -111,10 +206,42 @@ pub fn wrap_for_viewport(
     }
     wrapped.truncate(height);
 
+    // 滚动条绘制（design D2）：截断显示宽至 width-1 再补末列字符——CJK
+    // 双格尾字整字丢弃；pad+字符同 span（fg=token 色、无 bg，对齐 pi
+    // 整格替换：工具卡面板底色在该格让位）。仅窗口内行（内容超视口时
+    // 窗口必满，轨道覆盖全高）。
+    if let Some(overlay) = scrollbar
+        && let Some(geo) = scrollbar_geometry(len, height, effective_top)
+    {
+        for (i, line) in wrapped.iter_mut().enumerate() {
+            let thumb = i >= geo.thumb_top && i < geo.thumb_top + geo.thumb_height;
+            let glyph = match (thumb, overlay.hovered) {
+                (true, true) => "█",
+                (true, false) => "┃",
+                (false, _) => "│",
+            };
+            let color = if thumb {
+                SCROLLBAR_THUMB_COLOR
+            } else {
+                SCROLLBAR_TRACK_COLOR
+            };
+            let target = width - 1;
+            truncate_line_width(line, target);
+            let cur: usize = line.spans.iter().map(|s| s.content.as_ref().width()).sum();
+            let pad = target.saturating_sub(cur);
+            line.spans.push(Span::styled(
+                format!("{}{glyph}", " ".repeat(pad)),
+                Style::default().fg(color),
+            ));
+        }
+    }
+
     // 回写（design D2）：viewport 供页长计算；absorb 同步 top 并按
     // at_bottom 恢复/维持跟随。
     let mut next = *scroll;
     next.viewport = height as u16;
+    // 内容总行数回写（drain 前全量，滚动条几何用，design D1）。
+    next.content_len = len;
     next.absorb(effective_top, at_bottom);
     (wrapped, next, hits)
 }
@@ -308,14 +435,16 @@ mod tests {
     #[test]
     fn content_fitting_viewport_is_unchanged() {
         let lines = vec![plain("hello"), plain("world")];
-        let out = wrap_for_viewport(&lines, 40, 10, &ChatScroll::default(), &[]).0;
+        let out = wrap_for_viewport(&lines, 40, 10, &ChatScroll::default(), &[],
+        None).0;
         assert_eq!(render(&out), "hello\nworld");
     }
 
     #[test]
     fn long_line_wraps_at_word_boundary() {
         let lines = vec![plain(&"word ".repeat(50))];
-        let out = wrap_for_viewport(&lines, 20, 100, &ChatScroll::default(), &[]).0;
+        let out = wrap_for_viewport(&lines, 20, 100, &ChatScroll::default(), &[],
+        None).0;
         assert!(out.len() > 1, "should wrap");
         for l in &out {
             let w: usize = l.spans.iter().map(|s| s.content.as_ref().width()).sum();
@@ -326,7 +455,8 @@ mod tests {
     #[test]
     fn over_height_keeps_tail_not_head() {
         let lines = vec![plain(&format!("{}TAIL", "word ".repeat(500)))];
-        let out = wrap_for_viewport(&lines, 20, 10, &ChatScroll::default(), &[]).0;
+        let out = wrap_for_viewport(&lines, 20, 10, &ChatScroll::default(), &[],
+        None).0;
         assert_eq!(out.len(), 10);
         let text = render(&out);
         assert!(text.trim_end().ends_with("TAIL"), "tail should be newest content: {text:?}");
@@ -337,14 +467,16 @@ mod tests {
     #[test]
     fn embedded_newline_creates_lines() {
         let lines = vec![plain("line1\nline2\nline3")];
-        let out = wrap_for_viewport(&lines, 40, 10, &ChatScroll::default(), &[]).0;
+        let out = wrap_for_viewport(&lines, 40, 10, &ChatScroll::default(), &[],
+        None).0;
         assert_eq!(render(&out), "line1\nline2\nline3");
     }
 
     #[test]
     fn empty_logical_line_preserved() {
         let lines = vec![plain("a"), plain(""), plain("b")];
-        let out = wrap_for_viewport(&lines, 40, 10, &ChatScroll::default(), &[]).0;
+        let out = wrap_for_viewport(&lines, 40, 10, &ChatScroll::default(), &[],
+        None).0;
         assert_eq!(render(&out), "a\n\nb");
     }
 
@@ -352,7 +484,8 @@ mod tests {
     fn cjk_width_counts_double() {
         // 10 个中文字 = 20 宽，宽度 10 → 每行 5 个
         let lines = vec![plain(&"中".repeat(10))];
-        let out = wrap_for_viewport(&lines, 10, 100, &ChatScroll::default(), &[]).0;
+        let out = wrap_for_viewport(&lines, 10, 100, &ChatScroll::default(), &[],
+        None).0;
         assert_eq!(out.len(), 2);
         assert_eq!(render(&out), "中中中中中\n中中中中中");
     }
@@ -360,7 +493,8 @@ mod tests {
     #[test]
     fn unbroken_long_token_hard_splits() {
         let lines = vec![plain(&"x".repeat(45))];
-        let out = wrap_for_viewport(&lines, 10, 100, &ChatScroll::default(), &[]).0;
+        let out = wrap_for_viewport(&lines, 10, 100, &ChatScroll::default(), &[],
+        None).0;
         assert_eq!(out.len(), 5); // 45 chars / 10 wide
         assert_eq!(render(&out).replace('\n', ""), "x".repeat(45));
     }
@@ -372,7 +506,8 @@ mod tests {
             Span::styled("aa ", style),
             Span::raw("bb cc dd ee ff gg hh ii jj"),
         ])];
-        let out = wrap_for_viewport(&lines, 10, 100, &ChatScroll::default(), &[]).0;
+        let out = wrap_for_viewport(&lines, 10, 100, &ChatScroll::default(), &[],
+        None).0;
         assert!(out.len() >= 2);
         // 首个 span 的样式保留
         let first = out[0]
@@ -394,7 +529,8 @@ mod tests {
             Span::styled("word ".repeat(10), bg),
         ])
         .style(bg)];
-        let out = wrap_for_viewport(&lines, 20, 100, &ChatScroll::default(), &[]).0;
+        let out = wrap_for_viewport(&lines, 20, 100, &ChatScroll::default(), &[],
+        None).0;
         assert!(out.len() > 1, "应拆行: {}", out.len());
         for l in &out {
             assert_eq!(l.style.bg, Some(ratatui::style::Color::Rgb(40, 44, 52)), "子行保留 bg");
@@ -405,7 +541,8 @@ mod tests {
 
         // 硬切路径：超宽单 token
         let lines = vec![Line::from(Span::styled("x".repeat(45), bg)).style(bg)];
-        let out = wrap_for_viewport(&lines, 10, 100, &ChatScroll::default(), &[]).0;
+        let out = wrap_for_viewport(&lines, 10, 100, &ChatScroll::default(), &[],
+        None).0;
         assert_eq!(out.len(), 5);
         for l in &out {
             assert_eq!(l.style.bg, Some(ratatui::style::Color::Rgb(40, 44, 52)), "硬切子行保留 bg");
@@ -415,7 +552,8 @@ mod tests {
 
         // 无 bg 的行不补 pad（不改变既有行为）
         let lines = vec![plain("hi")];
-        let out = wrap_for_viewport(&lines, 20, 10, &ChatScroll::default(), &[]).0;
+        let out = wrap_for_viewport(&lines, 20, 10, &ChatScroll::default(), &[],
+        None).0;
         assert_eq!(render(&out), "hi");
     }
 
@@ -424,11 +562,13 @@ mod tests {
     fn pinned_window_starts_at_top_and_keeps_mid_content() {
         let lines: Vec<Line> = (0..50).map(|i| plain(&format!("L{i:02}"))).collect();
         let scroll = ChatScroll {
+            content_len: 0,
             top: 10,
             following: false,
             viewport: 0,
         };
-        let (out, next, _) = wrap_for_viewport(&lines, 20, 5, &scroll, &[]);
+        let (out, next, _) = wrap_for_viewport(&lines, 20, 5, &scroll, &[],
+        None);
         assert_eq!(render(&out), "L10\nL11\nL12\nL13\nL14", "窗口应从 top 起");
         assert_eq!(next.top, 10, "中段 top 原样回写");
         assert!(!next.following, "中段维持钉住");
@@ -442,21 +582,193 @@ mod tests {
         let lines: Vec<Line> = (0..50).map(|i| plain(&format!("L{i:02}"))).collect();
 
         // following：取末尾，与原行为逐字节一致
-        let (out, next, _) = wrap_for_viewport(&lines, 20, 5, &ChatScroll::default(), &[]);
+        let (out, next, _) = wrap_for_viewport(&lines, 20, 5, &ChatScroll::default(), &[],
+        None);
         assert_eq!(render(&out), "L45\nL46\nL47\nL48\nL49");
         assert!(next.following);
         assert_eq!(next.top, 45);
 
         // 钉住但 top 越界（内容骤减后残留 stale top）：clamp 到底 + 恢复跟随
         let stale = ChatScroll {
+            content_len: 0,
             top: 60,
             following: false,
             viewport: 0,
         };
-        let (out, next, _) = wrap_for_viewport(&lines, 20, 5, &stale, &[]);
+        let (out, next, _) = wrap_for_viewport(&lines, 20, 5, &stale, &[],
+        None);
         assert_eq!(render(&out), "L45\nL46\nL47\nL48\nL49", "越界应 clamp 到底");
         assert!(next.following, "clamp 到底应恢复跟随");
         assert_eq!(next.top, 45);
+    }
+
+    /// 任务 1.1：每帧回写 content_len（drain 前全量总行数，滚动条几何用，
+    /// design D1）——窗口化不改变 total，following/钉住两态一致。
+    #[test]
+    fn content_len_updated_each_wrap() {
+        let lines: Vec<Line> = (0..50).map(|i| plain(&format!("L{i:02}"))).collect();
+        let (_out, next, _) = wrap_for_viewport(&lines, 20, 10, &ChatScroll::default(), &[],
+        None);
+        assert_eq!(next.content_len, 50, "总行数 = drain 前全量");
+        assert_eq!(next.top, 40, "following 取末尾");
+
+        let pinned = ChatScroll {
+            top: 10,
+            following: false,
+            viewport: 0,
+            content_len: 0,
+        };
+        let (_out2, next2, _) = wrap_for_viewport(&lines, 20, 5, &pinned, &[],
+        None);
+        assert_eq!(next2.content_len, 50, "钉住态也回写总行数");
+        assert_eq!(next2.top, 10, "钉住 top 不变");
+    }
+
+    /// 任务 2.1：滚动条绘制——末列字形（轨道│/常态thumb┃/悬停thumb█）、
+    /// CJK 双格尾字整字丢弃、工具卡 bg 行末格让位、内容不足不画（design D2）。
+    #[test]
+    fn scrollbar_paints_last_column_with_glyphs_and_clears_bg() {
+        // 常态：50 行、视口10、贴底（top=40）→ geometry thumb=2、thumbTop=8
+        let lines: Vec<Line> = (0..50).map(|i| plain(&format!("L{i:02}"))).collect();
+        let (out, _next, _) = wrap_for_viewport(
+            &lines,
+            10,
+            10,
+            &ChatScroll::default(),
+            &[],
+            Some(ScrollbarOverlay { hovered: false }),
+        );
+        assert_eq!(out.len(), 10, "窗口满高");
+        for (i, l) in out.iter().enumerate() {
+            let last = l.spans.last().unwrap().content.as_ref();
+            let expect = if i >= 8 { "┃" } else { "│" };
+            assert!(last.ends_with(expect), "行 {i} 末字形 {last:?} 应为 {expect}");
+            let w: usize = l.spans.iter().map(|s| s.content.as_ref().width()).sum();
+            assert_eq!(w, 10, "行 {i} 补齐到视口宽");
+        }
+        assert!(
+            out[0].spans[0].content.as_ref().starts_with("L40"),
+            "内容保留（窗口从 top 起）"
+        );
+
+        // 悬停：thumb 加粗为 █，轨道不变
+        let (hover, _, _) = wrap_for_viewport(
+            &lines,
+            10,
+            10,
+            &ChatScroll::default(),
+            &[],
+            Some(ScrollbarOverlay { hovered: true }),
+        );
+        assert!(
+            hover[9].spans.last().unwrap().content.as_ref().ends_with('█'),
+            "悬停 thumb 加粗"
+        );
+        assert!(
+            hover[0].spans.last().unwrap().content.as_ref().ends_with('│'),
+            "轨道字形不变"
+        );
+
+        // CJK 双格尾字整字丢弃（逻辑行14 宽被换行成 10 宽行 → 截到 9 →
+        // 补 1 空格 + 字形）；内容需超视口才画（不足一屏不画已在下方断言）
+        let mut cjk: Vec<Line> = (0..15).map(|i| plain(&format!("S{i:02}"))).collect();
+        cjk.push(plain("中中中中中中中"));
+        let (cjk_out, _, _) = wrap_for_viewport(
+            &cjk,
+            10,
+            10,
+            &ChatScroll::default(),
+            &[],
+            Some(ScrollbarOverlay { hovered: false }),
+        );
+        let cjk_row = cjk_out
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.as_ref().contains('中')))
+            .expect("换行后 CJK 行在窗口内");
+        let text: String = cjk_row.spans.iter().map(|s| s.content.as_ref()).collect();
+        let w: usize = cjk_row.spans.iter().map(|s| s.content.as_ref().width()).sum();
+        assert_eq!(w, 10, "行宽 = 视口宽: {text:?}");
+        assert!(text.starts_with("中中中中"), "整字保留 4 个: {text:?}");
+        assert!(!text.contains("中中中中中"), "不留第 5 个中: {text:?}");
+        assert!(
+            text.ends_with('│') || text.ends_with('┃'),
+            "末列为滚动条字形: {text:?}"
+        );
+
+        // bg 行：末格让位（字形 span 无 bg，内容段保留 bg）
+        let bg = Style::default().bg(ratatui::style::Color::Rgb(1, 2, 3));
+        let bg_lines: Vec<Line> = (0..50)
+            .map(|i| {
+                Line::from(vec![Span::styled(format!("L{i:02}"), bg)])
+                    .style(bg)
+            })
+            .collect();
+        let (bg_out, _, _) = wrap_for_viewport(
+            &bg_lines,
+            10,
+            10,
+            &ChatScroll::default(),
+            &[],
+            Some(ScrollbarOverlay { hovered: false }),
+        );
+        let l0 = &bg_out[0];
+        assert!(
+            l0.spans.first().unwrap().style.bg.is_some(),
+            "内容段保留 bg"
+        );
+        assert_eq!(
+            l0.spans.last().unwrap().style.bg,
+            None,
+            "字形格无 bg（整格替换）"
+        );
+
+        // 内容不足一屏：geometry=None → 不画
+        let short = vec![plain("only")];
+        let (s_out, _, _) = wrap_for_viewport(
+            &short,
+            10,
+            10,
+            &ChatScroll::default(),
+            &[],
+            Some(ScrollbarOverlay { hovered: false }),
+        );
+        let st: String = s_out[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(st, "only", "内容不足不画");
+    }
+
+    /// 任务 1.2：滚动条几何公式向量（移植 pi getScrollbarGeometry）。
+    #[test]
+    fn scrollbar_geometry_vectors_match_pi() {
+        // 内容不足一屏 / 区域高 0 → None（不画、不可命中）
+        assert_eq!(scrollbar_geometry(10, 20, 0), None, "内容不足一屏");
+        assert_eq!(scrollbar_geometry(20, 20, 0), None, "恰好一屏也不画");
+        assert_eq!(scrollbar_geometry(100, 0, 0), None, "区域高 0");
+
+        // 比例 thumb：content=100,h=20 → round(400/100)=4
+        let g = scrollbar_geometry(100, 20, 0).unwrap();
+        assert_eq!(g.thumb_height, 4, "比例高度");
+        assert_eq!(g.max_scroll_top, 80, "最大可滚距离");
+        assert_eq!(g.thumb_top, 0, "顶部在轨道顶");
+        let bottom = scrollbar_geometry(100, 20, 80).unwrap();
+        assert_eq!(bottom.thumb_top, 20 - 4, "贴底在轨道底端（h−thumb）");
+        let mid = scrollbar_geometry(100, 20, 40).unwrap();
+        assert_eq!(mid.thumb_top, 8, "中段按比例（40/80 × 16）");
+
+        // 越界 top clamp
+        assert_eq!(
+            scrollbar_geometry(100, 20, 999).unwrap().thumb_top,
+            16,
+            "越界 top 按贴底算"
+        );
+
+        // 最小 thumb 高 = 2（内容远高于视口）
+        let tiny = scrollbar_geometry(1000, 20, 0).unwrap();
+        assert_eq!(tiny.thumb_height, 2, "最小拖动条高 2");
+
+        // 勉强一屏多：content=21,h=20 → round(400/21)=19
+        let barely = scrollbar_geometry(21, 20, 0).unwrap();
+        assert_eq!(barely.thumb_height, 19, "thumb 不超过轨道高");
+        assert_eq!(barely.max_scroll_top, 1);
     }
 
     /// 任务 2.1：内容不足一屏时窗口全量、视为贴底（恢复跟随）。
@@ -464,11 +776,13 @@ mod tests {
     fn short_content_pinned_restores_follow() {
         let lines = vec![plain("a"), plain("b")];
         let scroll = ChatScroll {
+            content_len: 0,
             top: 7,
             following: false,
             viewport: 0,
         };
-        let (out, next, _) = wrap_for_viewport(&lines, 20, 10, &scroll, &[]);
+        let (out, next, _) = wrap_for_viewport(&lines, 20, 10, &scroll, &[],
+        None);
         assert_eq!(render(&out), "a\nb");
         assert!(next.following, "内容不足一屏即视为贴底");
         assert_eq!(next.top, 0);
@@ -486,7 +800,8 @@ mod tests {
         ];
         let meta = vec![None, Some(HitKind::Tool("c1".into())), None];
         let (out, _next, hits) =
-            wrap_for_viewport(&lines, 20, 100, &ChatScroll::default(), &meta);
+            wrap_for_viewport(&lines, 20, 100, &ChatScroll::default(), &meta,
+        None);
         assert_eq!(hits.len(), 1, "应恰一个命中区间: {hits:?}");
         let h = &hits[0];
         assert_eq!(h.kind, HitKind::Tool("c1".into()), "强类型 kind 断言");
@@ -512,11 +827,13 @@ mod tests {
         meta[80] = Some(HitKind::Tool("c1".into()));
         meta[81] = Some(HitKind::Thinking(7));
         let scroll = ChatScroll {
+            content_len: 0,
             top: 50,
             following: false,
             viewport: 0,
         };
-        let (out, _next, hits) = wrap_for_viewport(&lines, 20, 10, &scroll, &meta);
+        let (out, _next, hits) = wrap_for_viewport(&lines, 20, 10, &scroll, &meta,
+        None);
         assert_eq!(out.len(), 10);
         assert_eq!(out[0].spans[0].content.as_ref(), "L050", "窗口从 top 起");
         assert_eq!(hits.len(), 2, "不同 kind 各成一段: {hits:?}");

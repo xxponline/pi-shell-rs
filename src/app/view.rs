@@ -45,21 +45,24 @@ pub struct ViewUi<'a> {
     pub tool_expanded: Option<&'a std::collections::HashMap<String, bool>>,
     /// thinking 单块展开覆盖表（None=无覆盖，全部跟随全局，design D3/D5）。
     pub thinking_overrides: Option<&'a std::collections::HashMap<usize, bool>>,
+    /// 滚动条绘制覆盖（None=本帧不画，design D2）。
+    pub scrollbar: Option<crate::app::wrap::ScrollbarOverlay>,
 }
 
 
 /// 从不可变状态渲染一帧（含浮层）。
 ///
 /// 输入: frame — ratatui 帧；state — 会话状态；ui — 一帧的 UI 附加输入
-/// 输出: `(吸收后的 ChatScroll, Vec<Hit>)`——前者为渲染端回写
-///       （视口首行/贴底跟随/视口高，design D2），后者为可点击内容
-///       （工具卡/thinking）绝对屏行命中区间（design D1/D2）；
+/// 输出: `(吸收后的 ChatScroll, Vec<Hit>, 消息区 Rect)`——前者为渲染端回写
+///       （视口首行/贴底跟随/视口高，design D2），次者为可点击内容
+///       （工具卡/thinking）绝对屏行命中区间（design D1/D2），末者为
+///       消息区上帧布局（滚动条列命中判定，design D5）；
 ///       副作用为绘制整帧
 pub fn render(
     frame: &mut Frame,
     state: &SessionState,
     ui: &ViewUi<'_>,
-) -> (ChatScroll, Vec<crate::app::wrap::Hit>) {
+) -> (ChatScroll, Vec<crate::app::wrap::Hit>, ratatui::layout::Rect) {
     let area = frame.area();
     let queue = queue_lines(state, ui.local_queue);
     let queue_h = queue.len() as u16;
@@ -92,6 +95,7 @@ pub fn render(
         ui.scroll,
         ui.tool_expanded,
         ui.thinking_overrides,
+        ui.scrollbar,
     );
     if queue_h > 0 {
         frame.render_widget(
@@ -134,6 +138,7 @@ pub fn render(
             scroll: ui.scroll,
             tool_expanded: ui.tool_expanded,
             thinking_overrides: ui.thinking_overrides,
+            scrollbar: ui.scrollbar,
         }
     };
     render_editor(frame, chunks[4], &editor_ui, state.phase);
@@ -144,7 +149,7 @@ pub fn render(
     if let Some(overlay) = ui.overlay {
         crate::app::overlay::render_overlay(frame, overlay, ui.current_session);
     }
-    (scroll, hits)
+    (scroll, hits, chunks[1])
 }
 
 /// 构建队列带行：`[steer]`/`[queue]` 前缀，最多 2 行，超出显示 `…N more`。
@@ -293,6 +298,9 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, state: &Session
 /// 输出: `(吸收后的 ChatScroll, Vec<Hit>)`——前者为窗口首行/贴底判定/
 ///       视口高回写，后者为可点击内容绝对屏行命中区间（design D1/D2）；
 ///       副作用为在 area 上绘制消息区
+// 参：frame/area/state/flags/scroll/tool_expanded/thinking_overrides/
+// scrollbar —— 逐参语义直白优于打包结构（design D5 取舍）。
+#[allow(clippy::too_many_arguments)]
 fn render_chat(
     frame: &mut Frame,
     area: ratatui::layout::Rect,
@@ -301,6 +309,7 @@ fn render_chat(
     scroll: ChatScroll,
     tool_expanded: Option<&std::collections::HashMap<String, bool>>,
     thinking_overrides: Option<&std::collections::HashMap<usize, bool>>,
+    scrollbar: Option<crate::app::wrap::ScrollbarOverlay>,
 ) -> (ChatScroll, Vec<crate::app::wrap::Hit>) {
     let empty = std::collections::HashMap::new();
     let overrides = tool_expanded.unwrap_or(&empty);
@@ -310,7 +319,7 @@ fn render_chat(
     // 自行换行后按滚动状态开窗口：ratatui 的 Wrap+scroll 偏移按换行后行数
     // 计，我们无法精确预知，会导致最新内容被挤出视口（见 wrap 模块说明）。
     let (wrapped, next, hits) =
-        wrap_for_viewport(&lines, area.width, area.height, &scroll, &meta);
+        wrap_for_viewport(&lines, area.width, area.height, &scroll, &meta, scrollbar);
     let paragraph = Paragraph::new(wrapped);
     frame.render_widget(paragraph.block(Block::default().borders(Borders::NONE)), area);
     (next, hits)
@@ -562,6 +571,7 @@ mod render_tests {
         let fb = std::cell::Cell::new((
             ChatScroll::default(),
             Vec::<crate::app::wrap::Hit>::new(),
+            ratatui::layout::Rect::default(),
         ));
         let draw_with = |scroll: ChatScroll| {
             let backend = TestBackend::new(40, 12);
@@ -587,6 +597,7 @@ mod render_tests {
 
         // pinned 态（top=0）：视口钉在头部，不恢复跟随
         let pinned = draw_with(ChatScroll {
+            content_len: 0,
             top: 0,
             following: false,
             viewport: 0,
@@ -596,6 +607,7 @@ mod render_tests {
 
         // stale top 越界：clamp 到底并恢复跟随，首行与贴底态一致
         let stale = draw_with(ChatScroll {
+            content_len: 0,
             top: usize::MAX,
             following: false,
             viewport: 0,
@@ -634,6 +646,7 @@ mod render_tests {
         let fb = std::cell::Cell::new((
             ChatScroll::default(),
             Vec::<crate::app::wrap::Hit>::new(),
+            ratatui::layout::Rect::default(),
         ));
         terminal
             .draw(|frame| {
@@ -644,7 +657,7 @@ mod render_tests {
                 fb.set(render(frame, &state, &ui));
             })
             .unwrap();
-        let (_scroll, hits) = fb.take();
+        let (_scroll, hits, _area) = fb.take();
 
         assert_eq!(hits.len(), 1, "应恰一个卡片命中: {hits:?}");
         assert_eq!(
@@ -762,6 +775,65 @@ mod render_tests {
             !plain_buf.contains("secret thoughts"),
             "无覆盖时折叠: {plain_buf}"
         );
+    }
+
+    /// 任务 2.2：ViewUi.scrollbar 透传到 wrap——Some → 末列滚动条字形，
+    /// None → 无（design D2 生产接线，view 段）。
+    #[test]
+    fn render_paints_scrollbar_when_overlay_present() {
+        use crate::app::wrap::ScrollbarOverlay;
+        let state = long_reply_state();
+
+        // Some：末列出现轨道/拖动条字形
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let ui = ViewUi {
+                    input: "",
+                    scrollbar: Some(ScrollbarOverlay { hovered: false }),
+                    ..ViewUi::default()
+                };
+                let _ = render(frame, &state, &ui);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let track = crate::app::wrap::SCROLLBAR_TRACK_COLOR;
+        let thumb = crate::app::wrap::SCROLLBAR_THUMB_COLOR;
+        let is_bar = |sym: &str, fg: Option<Color>| {
+            (sym == "│" || sym == "┃") && (fg == Some(track) || fg == Some(thumb))
+        };
+        let mut bar_rows = 0;
+        for y in 0..12u16 {
+            let cell = &buf[(39, y)];
+            if is_bar(cell.symbol(), cell.style().fg) {
+                bar_rows += 1;
+            }
+        }
+        assert!(bar_rows >= 5, "轨道应覆盖消息区多数行: {bar_rows}");
+
+        // None：末列无滚动条字形（编辑器右边框的 │ 不计——颜色过滤）
+        let backend2 = TestBackend::new(40, 12);
+        let mut terminal2 = Terminal::new(backend2).unwrap();
+        terminal2
+            .draw(|frame| {
+                let ui = ViewUi {
+                    input: "",
+                    scrollbar: None,
+                    ..ViewUi::default()
+                };
+                let _ = render(frame, &state, &ui);
+            })
+            .unwrap();
+        let buf2 = terminal2.backend().buffer();
+        let mut none_rows = 0;
+        for y in 0..12u16 {
+            let cell = &buf2[(39, y)];
+            if is_bar(cell.symbol(), cell.style().fg) {
+                none_rows += 1;
+            }
+        }
+        assert_eq!(none_rows, 0, "None 不画滚动条");
     }
 
     #[test]
