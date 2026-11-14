@@ -19,6 +19,10 @@ pub enum HitKind {
     Tool(String),
     /// thinking 块（全局渲染序号，空块也计数，design D2）。
     Thinking(usize),
+    /// 语义消息起点（用户/assistant 条目首逻辑行的全局序号，add-
+    /// prompt-jump-scroll-keys design D1——无覆盖表，点击 no-op、
+    /// 跳转取区间起点）。
+    MessageStart(usize),
 }
 
 /// 可点击内容在**绝对屏行**空间的命中区间（design D1/D2）。
@@ -136,8 +140,9 @@ fn truncate_line_width(line: &mut Line<'static>, max_w: usize) {
 ///   height — 视口高度（窗口行数上限，至少 1）
 ///   scroll — 滚动状态：following 取末尾（贴底跟随，即原底部锚定行为）；
 ///            钉住取 `[top, top+height)`，top 越界时 clamp 到底
-///   meta   — 逐逻辑行命中标识（与 lines 等长；chat_lines 产出：已有结果
-///            的工具卡 Some(Tool(id))、非空 thinking 块 Some(Thinking(seq))，
+///   meta   — 逐逻辑行命中标记组（与 lines 等长；chat_lines 产出：已有
+///            结果的工具卡含 Tool(id)、非空 thinking 块含 Thinking(seq)、
+///            消息首行含 MessageStart(seq)——每行 Vec 多标记共存，
 ///            design D1/D2）
 ///   scrollbar — 滚动条覆盖（None=本帧不画，design D2）
 /// 输出:
@@ -150,20 +155,21 @@ pub fn wrap_for_viewport(
     width: u16,
     height: u16,
     scroll: &ChatScroll,
-    meta: &[Option<HitKind>],
+    meta: &[Vec<HitKind>],
     scrollbar: Option<ScrollbarOverlay>,
 ) -> (Vec<Line<'static>>, ChatScroll, Vec<Hit>) {
     let width = width.max(1) as usize;
     let height = height.max(1) as usize;
 
     let mut wrapped: Vec<Line<'static>> = Vec::new();
-    // 逐屏行的命中标识：一条逻辑行的全部子行同 meta（logical→screen 传播）。
-    let mut screen_meta: Vec<Option<HitKind>> = Vec::new();
+    // 逐屏行的命中标记组：一条逻辑行的全部子行继承同一组（logical→
+    // screen 传播）。
+    let mut screen_meta: Vec<Vec<HitKind>> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         // 父行 style（如工具卡片 bg 面板）传播到拆分出的子行（design D5）：
         // Paragraph 只给有文本的单元格上色，行尾还得补 pad。
         let style = line.style;
-        let mark = meta.get(i).cloned().flatten();
+        let mark = meta.get(i).cloned().unwrap_or_default();
         let start = wrapped.len();
         for sub in split_on_newlines(line) {
             wrap_one(&sub, width, &mut wrapped);
@@ -246,27 +252,42 @@ pub fn wrap_for_viewport(
     (wrapped, next, hits)
 }
 
-/// 把逐屏行标识扫描为连续命中区间（纯函数，design D1）。
+/// 把逐行多标记扫描为连续命中区间（纯函数，design D1 两遍序）。
 ///
-/// 输入: meta — 逐屏行命中标识（Some(kind) = 该行属于该命中对象）
-/// 输出: 半开区间 `[start, end)` 序列（绝对屏行号，按出现顺序）；相邻
-///       不同 kind 各成一段；同对象因内容重建出现多段也各成一段
-///       （分发取首段，无害）
-fn collect_hits(meta: &[Option<HitKind>]) -> Vec<Hit> {
+/// 输入: meta — 逐逻辑行标记组（每行可含多个 HitKind）
+/// 输出: 半开区间 `[start, end)` 序列（绝对屏行号）——**先内容类
+///       （Tool/Thinking）、后 MessageStart**：hit_at 首匹配天然内容
+///       动作优先，MessageStart 仅在无内容标记的行被命中（点击 no-op）；
+///       同 kind 连续成段、相邻不同段分开（跳转按 kind 过滤与序无关）
+fn collect_hits(meta: &[Vec<HitKind>]) -> Vec<Hit> {
     let mut hits = Vec::new();
+    collect_runs(meta, &mut hits, |k| !matches!(k, HitKind::MessageStart(_)));
+    collect_runs(meta, &mut hits, |k| matches!(k, HitKind::MessageStart(_)));
+    hits
+}
+
+/// 单遍：按 want 谓词选 kind，行序扫描连续同 kind 段（design D1）。
+///
+/// 输入: meta — 逐行标记组；hits — 结果追加器；want — 本次遍历的目标
+///       kind 判定
+/// 输出: 无返回值；副作用为向 hits 追加区间
+fn collect_runs(
+    meta: &[Vec<HitKind>],
+    hits: &mut Vec<Hit>,
+    want: impl Fn(&HitKind) -> bool,
+) {
     let mut i = 0;
     while i < meta.len() {
-        let Some(kind) = meta[i].clone() else {
+        let Some(kind) = meta[i].iter().find(|k| want(k)).cloned() else {
             i += 1;
             continue;
         };
         let start = i;
-        while i < meta.len() && meta[i].as_ref() == Some(&kind) {
+        while i < meta.len() && meta[i].contains(&kind) {
             i += 1;
         }
         hits.push(Hit { start, end: i, kind });
     }
-    hits
 }
 
 /// 把一个逻辑行按 span 内的 `\n` 拆成多个子行（保留每个 span 的样式）。
@@ -736,6 +757,54 @@ mod tests {
         assert_eq!(st, "only", "内容不足不画");
     }
 
+    /// 任务 1.2：MessageStart 分组（add-prompt-jump design D1）——首行
+    /// 超宽换行成多屏行 → 同 seq 连续成一段、start=首屏行；相邻不同
+    /// seq 分段；pinned 态绝对号不变。
+    #[test]
+    fn message_start_spans_wrapped_rows_and_stays_absolute() {
+        let lines = vec![
+            plain(&"word ".repeat(30)),
+            plain("mid"),
+            plain("next msg"),
+            plain("tail"),
+        ];
+        let meta = vec![
+            vec![HitKind::MessageStart(0)],
+            vec![],
+            vec![HitKind::MessageStart(1)],
+            vec![],
+        ];
+        let (out, _next, hits) = wrap_for_viewport(
+            &lines,
+            20,
+            100,
+            &ChatScroll::default(),
+            &meta,
+            None,
+        );
+        assert!(out.len() > 4, "首行应换行成多屏行: {}", out.len());
+        assert_eq!(hits.len(), 2, "两个起点各成一段: {hits:?}");
+        assert_eq!(hits[0].kind, HitKind::MessageStart(0));
+        assert_eq!(hits[0].start, 0, "起点 = 首屏行绝对号");
+        assert!(hits[0].end > hits[0].start, "超宽行跨多屏行连续");
+        assert_eq!(hits[1].kind, HitKind::MessageStart(1));
+        assert!(hits[1].start > hits[0].end, "不同 seq 分段");
+
+        // pinned：绝对号不含窗口偏移
+        let scroll = ChatScroll {
+            top: 3,
+            following: false,
+            viewport: 0,
+            content_len: 0,
+        };
+        let (_o2, _n2, hits2) = wrap_for_viewport(&lines, 20, 5, &scroll, &meta, None);
+        assert_eq!(
+            (hits2[0].start, hits2[0].end),
+            (hits[0].start, hits[0].end),
+            "pinned 态绝对号不变"
+        );
+    }
+
     /// 任务 1.2：滚动条几何公式向量（移植 pi getScrollbarGeometry）。
     #[test]
     fn scrollbar_geometry_vectors_match_pi() {
@@ -798,7 +867,7 @@ mod tests {
             plain(&"word ".repeat(30)),
             plain("tail"),
         ];
-        let meta = vec![None, Some(HitKind::Tool("c1".into())), None];
+        let meta = vec![vec![], vec![HitKind::Tool("c1".into())], vec![]];
         let (out, _next, hits) =
             wrap_for_viewport(&lines, 20, 100, &ChatScroll::default(), &meta,
         None);
@@ -823,9 +892,9 @@ mod tests {
     #[test]
     fn hits_are_absolute_when_pinned_and_kind_typed() {
         let lines: Vec<Line> = (0..200).map(|i| plain(&format!("L{i:03}"))).collect();
-        let mut meta = vec![None; 200];
-        meta[80] = Some(HitKind::Tool("c1".into()));
-        meta[81] = Some(HitKind::Thinking(7));
+        let mut meta = vec![Vec::new(); 200];
+        meta[80].push(HitKind::Tool("c1".into()));
+        meta[81].push(HitKind::Thinking(7));
         let scroll = ChatScroll {
             content_len: 0,
             top: 50,

@@ -43,7 +43,7 @@ use crate::app::terminal::{TerminalGuard, TerminalSinks};
 
 /// 消息区滚动状态（design D1；view/wrap/App 共用）。
 pub use crate::app::scroll::ChatScroll;
-use crate::app::scroll::{scrollbar_should_hide, ScrollbarDrag};
+use crate::app::scroll::{prompt_jump_target, scrollbar_should_hide, ScrollbarDrag};
 
 /// 按键意图（`key_intent` 的纯映射产物，便于单测）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +77,16 @@ enum KeyIntent {
     ForcePath,
     /// 消息区整页滚动（PageUp=-1 上翻 / PageDown=+1 下翻；design D4）
     ScrollPage(i8),
+    /// 消息区半页滚动（shift+PageUp=-1 / shift+PageDown=+1；页长一半、
+    /// 至少 1 行；add-prompt-jump design D4）
+    ScrollHalfPage(i8),
+    /// 消息区提示跳转（ctrl+↑/↓ 或 ctrl+shift+↑/↓：-1 上一条 / +1 下一条
+    /// 消息起点；add-prompt-jump design D4）
+    JumpPrompt(i8),
+    /// 消息区绝对顶（ctrl+home）
+    ScrollTop,
+    /// 消息区绝对底（ctrl+end，贴底恢复跟随）
+    ScrollBottom,
     /// 中止生成（流式 esc）
     Abort,
     /// 外部编辑器（ctrl+g；经事件循环挂起/恢复）
@@ -767,6 +777,11 @@ impl App {
                     "key",
                     &format!("thinking block {seq} expanded -> {}", !effective),
                 );
+            }
+            wrap::HitKind::MessageStart(_) => {
+                // 消息起点行点击无动作（add-prompt-jump design D5，
+                // 观察等价 pi 内容行点击；该 kind 不携带状态）。
+                return false;
             }
         }
         true
@@ -2073,18 +2088,63 @@ impl App {
             return;
         }
 
-        // 消息区整页回看（spec：消息区滚动回看；design D4）：菜单位置已在
-        // 上方消费块处理、浮层在 overlay_key 吞键，此处仅菜单/浮层关闭时
-        // 到达；滚动不影响输入，跳过末尾重算直接返回。
-        if let KeyIntent::ScrollPage(dir) = intent {
-            let top_before = self.scroll.top;
-            if dir < 0 {
-                self.scroll.page_up();
-            } else {
-                self.scroll.page_down();
+        // 消息区滚动/跳转（spec：整页回看 + 提示跳转/顶底/半页；design
+        // D5）：菜单位置已在上方消费块处理（含 shift+PageUp 整页）、浮层在
+        // overlay_key 吞键，此处仅菜单/浮层关闭时到达；滚动不影响输入，
+        // 跳过末尾重算直接返回。
+        let scroll_top_before = self.scroll.top;
+        let scrolled = match intent {
+            KeyIntent::ScrollPage(dir) => {
+                if dir < 0 {
+                    self.scroll.page_up();
+                } else {
+                    self.scroll.page_down();
+                }
+                true
             }
-            // 滚动移动才点亮滚动条（design D3，对齐 pi moved!==0 才 mark）。
-            if self.scroll.top != top_before {
+            KeyIntent::ScrollHalfPage(dir) => {
+                // 半页 = 页长一半、至少 1 行（design D5：复用行数滚动，
+                // 零新滚动 API——up 打断跟随、down 交给 absorb 判恢复）。
+                let half = (self.scroll.page() / 2).max(1);
+                if dir < 0 {
+                    self.scroll.scroll_up_lines(half);
+                } else {
+                    self.scroll.scroll_down_lines(half);
+                }
+                true
+            }
+            KeyIntent::JumpPrompt(dir) => {
+                // 上帧命中表里的消息起点绝对行（design D1）→ 纯函数目标
+                // → set_top_abs（clamp + 端点恢复跟随，design D2/D5）。
+                let starts: Vec<usize> = self
+                    .card_hits
+                    .iter()
+                    .filter_map(|h| match h.kind {
+                        wrap::HitKind::MessageStart(_) => Some(h.start),
+                        _ => None,
+                    })
+                    .collect();
+                let max_top = self
+                    .scroll
+                    .content_len
+                    .saturating_sub(self.scroll.viewport as usize);
+                let target = prompt_jump_target(&starts, self.scroll.top, max_top, dir);
+                self.scroll.set_top_abs(target);
+                true
+            }
+            KeyIntent::ScrollTop => {
+                self.scroll.set_top_abs(0);
+                true
+            }
+            KeyIntent::ScrollBottom => {
+                self.scroll.set_top_abs(self.scroll.content_len);
+                true
+            }
+            _ => false,
+        };
+        if scrolled {
+            // 滚动移动才点亮滚动条（design D5，对齐 pi moved!==0 才 mark）。
+            if self.scroll.top != scroll_top_before {
                 self.mark_scroll_activity();
             }
             return;
@@ -2676,6 +2736,7 @@ impl App {
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
             Esc if streaming => KeyIntent::Abort,
             // 空闲 esc：无操作（对齐 pi；退出走 ctrl+d/双击 ctrl+c）
@@ -2698,6 +2759,10 @@ impl App {
             Enter if alt => KeyIntent::SendFollowUp,
             Enter => KeyIntent::Submit,
             Up if alt => KeyIntent::Dequeue,
+            // prompt 跳转（ctrl+↑/↓；ctrl+shift+↑/↓ 同动作——pi 两键同义，
+            // add-prompt-jump design D4）——先于 Edit 族捕获
+            Up if ctrl => KeyIntent::JumpPrompt(-1),
+            Down if ctrl => KeyIntent::JumpPrompt(1),
             Char('l') if ctrl && !key.modifiers.contains(KeyModifiers::SHIFT) => {
                 KeyIntent::OpenModelSelect
             }
@@ -2709,11 +2774,15 @@ impl App {
             BackTab => KeyIntent::CycleThinking,
             // Tab：菜单未开时强制路径补全（菜单开启的 Tab 已被上方消费块截获）
             Tab if key.modifiers == KeyModifiers::NONE => KeyIntent::ForcePath,
-            // 消息区整页回看（spec：消息区滚动回看；design D4）。菜单位置的
-            // PageUp/Down 已在 handle_key 前序消费块拦截、浮层在 overlay_key
-            // 吞键，均不入此意图。
+            // 消息区滚动/跳转（spec：整页回看 + 提示跳转/顶底/半页；
+            // design D4）。菜单的 PageUp/Down（含 shift）已在 handle_key
+            // 前序消费块拦截、浮层在 overlay_key 吞键，均不入此意图。
+            PageUp if shift => KeyIntent::ScrollHalfPage(-1),
             PageUp => KeyIntent::ScrollPage(-1),
+            PageDown if shift => KeyIntent::ScrollHalfPage(1),
             PageDown => KeyIntent::ScrollPage(1),
+            Home if ctrl => KeyIntent::ScrollTop,
+            End if ctrl => KeyIntent::ScrollBottom,
             // 编辑族：光标移动 / 删除键 / 字符（含未绑定的 ctrl/alt 组合，
             // 由 apply_intent 的 Edit 分派决定是编辑还是忽略）
             Left | Right | Up | Down | Home | End | Delete => {
@@ -2772,7 +2841,11 @@ impl App {
             }
             KeyIntent::Ignore => None,
             KeyIntent::ForcePath => None, // handle_key 在 apply_intent 之前拦截
-            KeyIntent::ScrollPage(_) => None, // handle_key 在 apply_intent 之前拦截
+            KeyIntent::ScrollPage(_)
+            | KeyIntent::ScrollHalfPage(_)
+            | KeyIntent::JumpPrompt(_)
+            | KeyIntent::ScrollTop
+            | KeyIntent::ScrollBottom => None, // handle_key 在前序块拦截
             KeyIntent::ExternalEditor => None, // handle_key 单独发事件
             KeyIntent::PasteClipboard => {
                 self.paste_clipboard();
@@ -3722,6 +3795,134 @@ mod input_tests {
         app.apply_intent(ctrl_t, intent);
         assert!(!app.show_thinking);
         assert!(app.thinking_overrides.is_empty());
+    }
+
+    /// 任务 2.1：滚动/跳转键映射先于 Edit 族（add-prompt-jump design D4）。
+    #[test]
+    fn jump_and_absolute_keys_map_before_edit_family() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let k = |code, mods| KeyEvent::new(code, mods);
+        let c = KeyModifiers::CONTROL;
+        let s = KeyModifiers::SHIFT;
+        let a = KeyModifiers::ALT;
+        let none = KeyModifiers::NONE;
+
+        // ctrl+↑/↓ → JumpPrompt（ctrl+shift+↑/↓ 同动作，pi 两键同义）
+        assert_eq!(App::key_intent(k(KeyCode::Up, c), false), KeyIntent::JumpPrompt(-1));
+        assert_eq!(App::key_intent(k(KeyCode::Up, c | s), false), KeyIntent::JumpPrompt(-1));
+        assert_eq!(App::key_intent(k(KeyCode::Down, c), false), KeyIntent::JumpPrompt(1));
+        assert_eq!(App::key_intent(k(KeyCode::Down, c | s), false), KeyIntent::JumpPrompt(1));
+
+        // ctrl+home/end → 顶/底（pi 默认键）
+        assert_eq!(App::key_intent(k(KeyCode::Home, c), false), KeyIntent::ScrollTop);
+        assert_eq!(App::key_intent(k(KeyCode::End, c), false), KeyIntent::ScrollBottom);
+
+        // shift+PageUp/Down → 半页（先于无 guard 全页）；无修饰仍全页
+        assert_eq!(
+            App::key_intent(k(KeyCode::PageUp, s), false),
+            KeyIntent::ScrollHalfPage(-1)
+        );
+        assert_eq!(
+            App::key_intent(k(KeyCode::PageDown, s), false),
+            KeyIntent::ScrollHalfPage(1)
+        );
+        assert_eq!(App::key_intent(k(KeyCode::PageUp, none), false), KeyIntent::ScrollPage(-1));
+
+        // alt+↑ 仍 Dequeue（alt 分支优先）；裸 ↑仍 Edit（族序不变）
+        assert_eq!(App::key_intent(k(KeyCode::Up, a), false), KeyIntent::Dequeue);
+        assert_eq!(App::key_intent(k(KeyCode::Up, none), false), KeyIntent::Edit);
+    }
+
+    /// 任务 2.2：跳转向量 + 分发（add-prompt-jump design D2/D5；spec 场景
+    /// 「上一条消息跳转」「下一条消息跳转与端点」「一键顶底」「半页滚动」
+    /// 「菜单与浮层下的键位语义」）。
+    #[test]
+    fn prompt_jump_target_vectors_and_half_page_dispatch() {
+        use crate::app::scroll::prompt_jump_target;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        // ── 纯函数向量（design D2：严格不等式 + 端点）──
+        let starts = [0usize, 50, 100];
+        assert_eq!(prompt_jump_target(&starts, 60, 150, -1), 50, "prev=严格更小");
+        assert_eq!(prompt_jump_target(&starts, 60, 150, 1), 100, "next=严格更大");
+        assert_eq!(prompt_jump_target(&starts, 50, 150, -1), 0, "top 恰在 start → prev 去更前");
+        assert_eq!(prompt_jump_target(&starts, 50, 150, 1), 100, "top 恰在 start → next 去下一条");
+        assert_eq!(prompt_jump_target(&starts, 0, 150, -1), 0, "顶再 prev 幂等");
+        assert_eq!(prompt_jump_target(&starts, 120, 150, 1), 150, "过最末 → 贴底");
+        assert_eq!(prompt_jump_target(&starts, 100, 150, 1), 150, "最末 start 再 next → 贴底");
+        assert_eq!(prompt_jump_target(&[], 30, 150, -1), 0, "空表 prev → 顶");
+        assert_eq!(prompt_jump_target(&[], 30, 150, 1), 150, "空表 next → 贴底");
+
+        // ── 分发（handle_key 前序块：菜单/浮层规则天然继承）──
+        let (client, _dir, _log) =
+            recording_commander("pjump", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+        app.scroll.content_len = 200;
+        app.scroll.viewport = 20;
+        app.scroll.top = 60;
+        app.scroll.following = false;
+        app.card_hits = vec![
+            wrap::Hit { start: 0, end: 1, kind: wrap::HitKind::MessageStart(0) },
+            wrap::Hit { start: 50, end: 51, kind: wrap::HitKind::MessageStart(1) },
+            wrap::Hit { start: 100, end: 101, kind: wrap::HitKind::MessageStart(2) },
+        ];
+        let ctrl_up = KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL);
+
+        // ctrl+↑ 跳到上一条消息起点，跳转视为滚动移动（点亮滚动条）
+        app.handle_key(ctrl_up, &commander, &tx);
+        assert_eq!(app.scroll.top, 50, "跳到上一条消息起点");
+        assert!(app.scrollbar_visible, "跳转点亮滚动条");
+
+        // 已在最早消息：top 不变不 mark
+        app.scroll.top = 0;
+        app.scrollbar_visible = false;
+        app.scrollbar_activity = None;
+        app.handle_key(ctrl_up, &commander, &tx);
+        assert_eq!(app.scroll.top, 0, "顶上再 prev 幂等");
+        assert!(!app.scrollbar_visible, "top 未变不点亮");
+
+        // ctrl+end → 贴底恢复跟随；ctrl+home → 顶钉住
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL), &commander, &tx);
+        assert_eq!(app.scroll.top, 180, "ctrl+end → max_top");
+        assert!(app.scroll.following, "底部恢复跟随");
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL), &commander, &tx);
+        assert_eq!(app.scroll.top, 0, "ctrl+home → 顶");
+        assert!(!app.scroll.following, "顶部钉住");
+
+        // 半页：page = 20−4 = 16 → half = 8
+        app.scroll.top = 60;
+        app.scrollbar_visible = false;
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT), &commander, &tx);
+        assert_eq!(app.scroll.top, 52, "shift+PageUp 半页 = page/2 = 8 行");
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::SHIFT), &commander, &tx);
+        assert_eq!(app.scroll.top, 60, "shift+PageDown 半页回移");
+
+        // 菜单语义（spec 场景）：菜单消费 shift+PageUp（消息区不动）、
+        // 放行 ctrl+↑（照常跳转）
+        app.completion.open = true;
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT), &commander, &tx);
+        assert_eq!(app.scroll.top, 60, "菜单打开时 shift+PageUp 被菜单消费");
+        app.handle_key(ctrl_up, &commander, &tx);
+        assert_eq!(app.scroll.top, 50, "菜单不消费 ctrl+↑（照常跳转）");
+        app.completion.close();
+
+        // 浮层语义（spec 场景）：loading 浮层对非 Esc 键一律吞
+        app.overlay = Some(Overlay::Tree {
+            tree: Vec::new(),
+            leaf_id: None,
+            rows: Vec::new(),
+            cursor: 0,
+            folded: std::collections::HashSet::new(),
+            filter: crate::app::tree::FilterMode::Default,
+            search: String::new(),
+            loading: true,
+            seq: 0,
+        });
+        app.scroll.top = 60;
+        app.handle_key(ctrl_up, &commander, &tx);
+        assert_eq!(app.scroll.top, 60, "浮层打开时跳转被吞");
     }
 
     #[test]

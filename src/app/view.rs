@@ -659,14 +659,21 @@ mod render_tests {
             .unwrap();
         let (_scroll, hits, _area) = fb.take();
 
-        assert_eq!(hits.len(), 1, "应恰一个卡片命中: {hits:?}");
+        // 只看工具类命中（用户/assistant 首行的 MessageStart 也在表中，
+        // design D1 多标记）
+        let tool_hits: Vec<_> = hits
+            .iter()
+            .filter(|h| matches!(h.kind, crate::app::wrap::HitKind::Tool(_)))
+            .collect();
+        assert_eq!(tool_hits.len(), 1, "应恰一个工具卡命中: {hits:?}");
+        let hit = tool_hits[0];
         assert_eq!(
-            hits[0].kind,
+            hit.kind,
             crate::app::wrap::HitKind::Tool("c1".into()),
             "命中含已知卡片 kind"
         );
-        assert_eq!(hits[0].start, 1, "用户行占行 0，卡片从行 1 起");
-        assert!(hits[0].end > hits[0].start, "区间跨多行: {:?}", hits[0]);
+        assert_eq!(hit.start, 1, "用户行占行 0，卡片从行 1 起");
+        assert!(hit.end > hit.start, "区间跨多行: {:?}", hit);
     }
 
     /// 任务 4.1 补充（端到端渲染段）：`ViewUi.tool_expanded` 覆盖表进入

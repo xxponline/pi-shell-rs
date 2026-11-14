@@ -208,9 +208,12 @@ model/session/tree/thinking 选择器，extension_ui 9 种 method，write/grep/f
   /session 信息面板、切换后状态重建（get_messages）
 - **待办（已挂账）：滚动增强剩余项**——消息区整页回看
   （`add-message-scrollback`）、鼠标滚轮（`add-mouse-wheel-scroll`）、
-  滚动条（`add-message-scrollbar`：瞬态显隐/悬停/拖拽 scrub 全量）均已落地。
-  剩余：alt-screen 搜索（ctrl+shift+f）、prompt 跳转（OSC133）、
-  行级/半页滚动键；宽度变化重换行的 offset 漂移接受（pi 同样漂移）。
+  滚动条（`add-message-scrollbar`：瞬态显隐/悬停/拖拽 scrub 全量）、
+  prompt 跳转 + 顶/底 + 半页（`add-prompt-jump-scroll-keys`：ctrl+↑/↓、
+  ctrl+home/end、shift+PageUp/Down）均已落地。剩余：alt-screen 搜索
+  （ctrl+shift+f）；行级滚动销账（pi `lineUp/lineDown` 默认键即为空 +
+  我们无键位配置系统 → 已对齐）；宽度变化重换行的 offset 漂移接受
+  （pi 同样漂移）。
 - **待办（已挂账）：工具卡片对齐 change 的移出项**——后续工具卡片对齐（运行中
   流式输出/计时器/背景面板/头行/截断警告）明确不含以下四项，原因各异：
   ① edit 执行中预计算 diff：渲染层需在 args 到齐后异步读文件出 preview，

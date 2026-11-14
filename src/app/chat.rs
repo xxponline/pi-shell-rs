@@ -25,21 +25,27 @@ pub struct RenderFlags {
 ///       overrides — 单卡工具展开覆盖表（toolCallId → 是否展开，
 ///       无覆盖的卡跟随 flags.expand_tools，design D1）
 /// 输出: `(行序列, 逐行命中 meta)`——meta 与 lines 等长，仅**已有最终结果**
-///       的工具卡行记 Some(Tool(id))、非空 thinking 块整段记
-///       Some(Thinking(seq))（design D1/D2）；其余（用户行/markdown/
-///       notice/`!` bash）为 None；thinking_overrides — 单块展开覆盖
-///       （seq → 是否展开，无覆盖跟随 flags.show_thinking，design D3）
+///       的工具卡行追加 Tool(id)、非空 thinking 块整段追加
+///       Thinking(seq)（design D1/D2）、用户/assistant 条目首逻辑行追加
+///       MessageStart(msg_seq)（add-prompt-jump design D1/D3——每行
+///       Vec 多标记共存，不覆盖内容标记）；其余（通知/`!` bash 等）
+///       为空 Vec；thinking_overrides — 单块展开覆盖（seq → 是否展开，
+///       无覆盖跟随 flags.show_thinking，design D3）
 pub fn chat_lines(
     state: &SessionState,
     flags: RenderFlags,
     overrides: &std::collections::HashMap<String, bool>,
     thinking_overrides: &std::collections::HashMap<usize, bool>,
-) -> (Vec<Line<'static>>, Vec<Option<HitKind>>) {
+) -> (Vec<Line<'static>>, Vec<Vec<HitKind>>) {
     let mut lines = Vec::new();
-    let mut meta: Vec<Option<HitKind>> = Vec::new();
+    let mut meta: Vec<Vec<HitKind>> = Vec::new();
     // thinking 全局渲染序号（design D2：无条件计数，跨流式/落盘稳定）。
     let mut thinking_seq = 0usize;
+    // 语义消息序号（add-prompt-jump design D3：仅用户/assistant 消耗）。
+    let mut msg_seq = 0usize;
     for entry in state.entries() {
+        let logical_start = lines.len();
+        let is_message = matches!(entry, Entry::User { .. } | Entry::Assistant { .. });
         match entry {
             Entry::User { text } => {
                 lines.push(prefixed("You", text, Color::Cyan, true));
@@ -78,8 +84,15 @@ pub fn chat_lines(
                 false,
             ),
         }
-        // 非卡片路径补齐 None（与行等长；append_blocks 已自同步）。
-        meta.resize(lines.len(), None);
+        // 非卡片路径补齐空标记组（与行等长；append_blocks 已自同步）。
+        meta.resize(lines.len(), Vec::new());
+        // 语义消息起点回填首逻辑行（design D3/D1）：push 与内容标记
+        // 共存不覆盖；通知/`!`bash 不标不耗 seq；空条目（无行）不标；
+        // seq 仅标记时递增（transcript append-only → 序号稳定）。
+        if is_message && lines.len() > logical_start {
+            meta[logical_start].push(HitKind::MessageStart(msg_seq));
+            msg_seq += 1;
+        }
     }
     // 流式中尚未落盘的内容。
     if state.is_in_flight() {
@@ -100,7 +113,7 @@ pub fn chat_lines(
         let output = state.bash_output.clone();
         append_bash(&mut lines, &command, &output, None, false, false, None, excluded, true);
     }
-    meta.resize(lines.len(), None);
+    meta.resize(lines.len(), Vec::new());
     debug_assert_eq!(lines.len(), meta.len(), "meta 必须与行等长");
     (lines, meta)
 }
@@ -212,7 +225,7 @@ fn notice_line(kind: &str, text: &str) -> Line<'static> {
 /// 输出: 无返回值；副作用为向 out/meta 追加
 fn append_blocks(
     out: &mut Vec<Line<'static>>,
-    meta: &mut Vec<Option<HitKind>>,
+    meta: &mut Vec<Vec<HitKind>>,
     blocks: &[Block],
     flags: RenderFlags,
     overrides: &std::collections::HashMap<String, bool>,
@@ -277,12 +290,12 @@ fn append_blocks(
                 }
             }
         }
-        // 逐块同步 meta（design D1/D2）：命中块的全部行整段打标（门控前移
-        // 到建表，分发无需回查 state）。
-        meta.resize(out.len(), None);
+        // 逐块同步 meta（design D1/D2）：命中块的全部行整段 push 内容
+        // 标记（门控前移到建表，分发无需回查 state）。
+        meta.resize(out.len(), Vec::new());
         if let Some(kind) = mark {
             for m in &mut meta[start..] {
-                *m = Some(kind.clone());
+                m.push(kind.clone());
             }
         }
     }
@@ -569,17 +582,96 @@ mod tests {
         let empty_t: std::collections::HashMap<usize, bool> = std::collections::HashMap::new();
         let (lines, meta) = chat_lines(&s, RenderFlags::default(), &empty, &empty_t);
         assert_eq!(lines.len(), meta.len(), "meta 必须与行等长");
-        let marks: Vec<HitKind> = meta.iter().flatten().cloned().collect();
+        // 只看内容标记（首行同时携带 MessageStart——多标记共存，design D1）
+        let marks: Vec<HitKind> = meta
+            .iter()
+            .flatten()
+            .filter(|&k| matches!(k, HitKind::Thinking(_)))
+            .cloned()
+            .collect();
         assert_eq!(
             marks,
             vec![HitKind::Thinking(1), HitKind::Thinking(2)],
             "空块（序号 0）不打标、非空块整段打标"
+        );
+        // assistant 首个 thinking 行与 MessageStart 共存（不覆盖）
+        let first_thinking = meta
+            .iter()
+            .find(|v| v.contains(&HitKind::Thinking(1)))
+            .expect("Thinking(1) 行存在");
+        assert!(
+            first_thinking
+                .iter()
+                .any(|k| matches!(k, HitKind::MessageStart(_))),
+            "首行多标记共存: {first_thinking:?}"
         );
 
         // 两次渲染产出完全一致（序号稳定，design D2）
         let (lines2, meta2) = chat_lines(&s, RenderFlags::default(), &empty, &empty_t);
         assert_eq!(lines, lines2, "行产出确定性");
         assert_eq!(meta, meta2, "meta 产出确定性");
+    }
+
+    /// 任务 1.1：语义消息起点打标（add-prompt-jump design D3）——用户/
+    /// assistant 首逻辑行标 MessageStart(seq) 且 seq 递增；通知/`!`bash
+    /// 不标不耗 seq；meta 与行等长。
+    #[test]
+    fn message_starts_marked_on_user_and_assistant_only() {
+        let mut s = SessionState::new();
+        s.transcript.push(Entry::User { text: "q1".into() });
+        s.transcript.push(Entry::Assistant {
+            turn: 1,
+            blocks: vec![Block::Text { text: "a1".into() }],
+            usage: None,
+        });
+        s.transcript.push(Entry::Notice {
+            kind: "info".into(),
+            text: "n-note".into(),
+        });
+        s.transcript.push(Entry::Assistant {
+            turn: 2,
+            blocks: vec![Block::Text { text: "a2".into() }],
+            usage: None,
+        });
+        s.transcript.push(Entry::Bash {
+            command: "!ls".into(),
+            output: String::new(),
+            exit_code: Some(0),
+            cancelled: false,
+            truncated: false,
+            full_output_path: None,
+            excluded: false,
+        });
+
+        let empty = std::collections::HashMap::new();
+        let empty_t = std::collections::HashMap::new();
+        let (lines, meta) = chat_lines(&s, RenderFlags::default(), &empty, &empty_t);
+        assert_eq!(lines.len(), meta.len(), "meta 必须与行等长");
+
+        let marks: Vec<(usize, HitKind)> = meta
+            .iter()
+            .enumerate()
+            .flat_map(|(i, v)| v.iter().map(move |k| (i, k.clone())))
+            .collect();
+        assert_eq!(marks.len(), 3, "恰三个消息起点（通知/bash 不标）: {marks:?}");
+        assert_eq!(marks[0], (0, HitKind::MessageStart(0)), "用户首行 seq0");
+        assert!(matches!(marks[1].1, HitKind::MessageStart(1)), "a1 seq1");
+        assert!(matches!(marks[2].1, HitKind::MessageStart(2)), "a2 seq2");
+
+        // 打标行确实落在对应条目内容上
+        let text_of = |i: usize| -> String {
+            lines[i].spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+        assert!(text_of(marks[0].0).contains("q1"), "seq0 在用户行");
+        assert!(text_of(marks[1].0).contains("a1"), "seq1 在 a1 行");
+        assert!(text_of(marks[2].0).contains("a2"), "seq2 在 a2 行");
+
+        // 通知行 None
+        let notice_row = lines
+            .iter()
+            .position(|l| l.spans.iter().any(|s| s.content.as_ref().contains("n-note")))
+            .expect("通知行存在");
+        assert!(meta[notice_row].is_empty(), "通知行不打标");
     }
 
     /// 任务 2.1：命中 meta 门控——仅已有最终结果的工具卡入表，
@@ -634,21 +726,30 @@ mod tests {
         let (lines, meta) = chat_lines(&s, RenderFlags::default(), &no, &std::collections::HashMap::new());
         assert_eq!(lines.len(), meta.len(), "meta 必须与行等长");
 
-        let marked: Vec<HitKind> = meta.iter().flatten().cloned().collect();
+        // 只看工具类标记（用户/assistant 首行可携带 MessageStart，design D1）
+        let marked: Vec<HitKind> = meta
+            .iter()
+            .flatten()
+            .filter(|&k| matches!(k, HitKind::Tool(_)))
+            .cloned()
+            .collect();
         assert!(!marked.is_empty(), "结果卡 c1 应入表");
         assert!(
             marked.iter().all(|m| *m == HitKind::Tool("c1".into())),
-            "只标 c1——运行中 c2 与普通行不入表: {marked:?}"
+            "只标 c1——运行中 c2 与普通行不入工具表: {marked:?}"
         );
 
-        // `!` bash 行明确为 None
+        // `!` bash 行明确无标记
         let bash_idx = lines
             .iter()
             .position(|l| l.spans.iter().any(|sp| sp.content.as_ref().contains("echo hi")))
             .expect("bash 行应存在");
-        assert!(meta[bash_idx].is_none(), "`!` bash 行不入表");
-        // 用户行同样 None
-        assert!(meta[0].is_none(), "用户行不入表");
+        assert!(meta[bash_idx].is_empty(), "`!` bash 行不入表");
+        // 用户行不入工具表（可携带 MessageStart，design D1）
+        assert!(
+            !meta[0].iter().any(|k| matches!(k, HitKind::Tool(_))),
+            "用户行不入工具表"
+        );
     }
 
     #[test]

@@ -128,6 +128,31 @@ impl ChatScroll {
     }
 }
 
+/// 计算 prompt 跳转目标视口首行（add-prompt-jump design D2）。
+///
+/// 输入: starts — 各消息起始绝对行（升序——hits 按行序产出；可空）；
+///       top — 当前视口首行；max_top — 最大可滚距离（content − viewport）；
+///       dir — -1 上一条 / +1 下一条
+/// 输出: 目标 top——prev = 严格小于 top 的最后一个 start，无则 0；
+///       next = 严格大于 top 的第一个 start，无则 max_top（贴底）；
+///       不在此处 clamp（set_top_abs 统一收敛，端点由它恢复跟随）
+pub fn prompt_jump_target(starts: &[usize], top: usize, max_top: usize, dir: i8) -> usize {
+    if dir < 0 {
+        starts
+            .iter()
+            .rev()
+            .find(|&&s| s < top)
+            .copied()
+            .unwrap_or(0)
+    } else {
+        starts
+            .iter()
+            .find(|&&s| s > top)
+            .copied()
+            .unwrap_or(max_top)
+    }
+}
+
 /// 滚动条瞬态隐藏延迟（对齐 pi `scrollbarHideDelayMs` 默认 1000ms；判定经
 /// 事件循环 200ms tick，实际隐延迟 1.0–1.2s，design D3 记录接受）。
 pub const SCROLLBAR_HIDE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
