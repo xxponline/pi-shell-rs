@@ -20,6 +20,7 @@ mod settings_io;
 mod tree;
 mod terminal;
 pub mod embed;
+pub mod theme;
 pub mod virtual_terminal;
 mod tools;
 mod view;

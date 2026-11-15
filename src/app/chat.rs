@@ -8,6 +8,7 @@ use ratatui::text::{Line, Span};
 
 use pi_shell_rs::session::{Block, Entry, SessionState, ToolExecution, ToolStatus};
 
+use crate::app::theme::TuiTheme;
 use crate::app::wrap::HitKind;
 
 /// 渲染偏好标志（App 级 UI 状态，经键位切换）。
@@ -31,11 +32,31 @@ pub struct RenderFlags {
 ///       Vec 多标记共存，不覆盖内容标记）；其余（通知/`!` bash 等）
 ///       为空 Vec；thinking_overrides — 单块展开覆盖（seq → 是否展开，
 ///       无覆盖跟随 flags.show_thinking，design D3）
+///
+/// 默认配色薄包装（design D1 方案 A）：转发 [`chat_lines_themed`] 传
+/// [`TuiTheme::default()`]——存量 28 处调用点（含测试）签名零改动。
+/// 渲染主路径（view）应走 themed 入口。
 pub fn chat_lines(
     state: &SessionState,
     flags: RenderFlags,
     overrides: &std::collections::HashMap<String, bool>,
     thinking_overrides: &std::collections::HashMap<usize, bool>,
+) -> (Vec<Line<'static>>, Vec<Vec<HitKind>>) {
+    chat_lines_themed(state, flags, overrides, thinking_overrides, &TuiTheme::default())
+}
+
+/// 构建全部聊天行（带注入配色，[`chat_lines`] 的 themed 实现体）。
+///
+/// 输入: state/flags/overrides/thinking_overrides — 同 [`chat_lines`]；
+///       theme — 注入配色（工具卡三态面板色等，宿主配色注入 design D1）
+/// 输出: 同 [`chat_lines`]；相同状态 + 相同 flags + 相同 theme 产出相同
+///       内容（纯函数，可离线单测）
+pub fn chat_lines_themed(
+    state: &SessionState,
+    flags: RenderFlags,
+    overrides: &std::collections::HashMap<String, bool>,
+    thinking_overrides: &std::collections::HashMap<usize, bool>,
+    theme: &TuiTheme,
 ) -> (Vec<Line<'static>>, Vec<Vec<HitKind>>) {
     let mut lines = Vec::new();
     let mut meta: Vec<Vec<HitKind>> = Vec::new();
@@ -59,6 +80,7 @@ pub fn chat_lines(
                     overrides,
                     thinking_overrides,
                     &mut thinking_seq,
+                    theme,
                 );
             }
             Entry::Notice { kind, text } => {
@@ -104,6 +126,7 @@ pub fn chat_lines(
             overrides,
             thinking_overrides,
             &mut thinking_seq,
+            theme,
         );
     }
     // 运行中的用户 bash（分片实时增长）。
@@ -223,6 +246,7 @@ fn notice_line(kind: &str, text: &str) -> Line<'static> {
 ///       thinking 单块覆盖；thinking_seq — 全局 thinking 序号游标
 ///       （无条件递增、跨调用穿透，design D2）
 /// 输出: 无返回值；副作用为向 out/meta 追加
+#[allow(clippy::too_many_arguments)]
 fn append_blocks(
     out: &mut Vec<Line<'static>>,
     meta: &mut Vec<Vec<HitKind>>,
@@ -231,6 +255,7 @@ fn append_blocks(
     overrides: &std::collections::HashMap<String, bool>,
     thinking_overrides: &std::collections::HashMap<usize, bool>,
     thinking_seq: &mut usize,
+    theme: &TuiTheme,
 ) {
     for block in blocks {
         let start = out.len();
@@ -279,7 +304,7 @@ fn append_blocks(
                 // 跟随全局 flags.expand_tools，design D1）；背景面板按状态
                 // 着色（design D5），状态文字/圆点保留（spec #16）。
                 let expanded = *overrides.get(id).unwrap_or(&flags.expand_tools);
-                let bg = tool_panel_bg(tool);
+                let bg = tool_panel_bg(tool, theme);
                 for mut line in crate::app::tools::tool_lines(name, args_json, tool, expanded) {
                     line.style = Style::default().bg(bg);
                     out.push(line);
@@ -304,15 +329,16 @@ fn append_blocks(
 /// 工具卡片背景面板色（design D5）：由 pi dark.json 的 okhsl 转 RGB——
 /// `toolPendingBg` okhsl(229 5% 24%) 运行灰、`toolSuccessBg` okhsl(158 46% 25%)
 /// 成功墨绿、`toolErrorBg` okhsl(19 54% 25%) 失败暗红（转换经 pi oklab.ts
-/// 权威算法核算）。
+/// 权威算法核算）；宿主注入配色时以注入值为准（宿主配色注入 design D1）。
 ///
-/// 输入: tool — 执行状态（读 status/is_error）
+/// 输入: tool — 执行状态（读 status/is_error）；theme — 注入配色
+///       （默认深色调为上述三色）
 /// 输出: 面板背景色（spec #16：背景叠加、不替代状态文字）
-fn tool_panel_bg(tool: &ToolExecution) -> Color {
+fn tool_panel_bg(tool: &ToolExecution, theme: &TuiTheme) -> Color {
     match tool.status {
-        ToolStatus::Pending | ToolStatus::Running => Color::Rgb(52, 56, 58),
-        ToolStatus::Ended if tool.is_error => Color::Rgb(91, 40, 42),
-        ToolStatus::Ended => Color::Rgb(37, 65, 49),
+        ToolStatus::Pending | ToolStatus::Running => theme.tool_running_bg,
+        ToolStatus::Ended if tool.is_error => theme.tool_error_bg,
+        ToolStatus::Ended => theme.tool_success_bg,
     }
 }
 
@@ -943,5 +969,106 @@ mod tests {
             lines2.iter().all(|l| l.style.bg.is_none()),
             "非卡片行不应有背景"
         );
+    }
+
+    /// 宿主配色注入：`chat_lines_themed` 传非默认 `TuiTheme` 时三态面板
+    /// 背景等于注入值、状态文字仍可见；传默认时等于现值（design D1）。
+    ///
+    /// 输入: 无（构造三态工具卡会话）
+    /// 输出: 断言通过；注入值/默认值分别与面板 bg 比对
+    #[test]
+    fn chat_lines_themed_uses_injected_panel_colors() {
+        let mk = |status: ToolStatus, is_error: bool| Block::ToolCall {
+            id: "c1".into(),
+            name: "bash".into(),
+            args_json: r#"{"command":"ls"}"#.into(),
+            tool: ToolExecution {
+                status,
+                is_error,
+                result: Some(serde_json::json!({"content":[{"type":"text","text":"out"}]})),
+                ..Default::default()
+            },
+        };
+        let mut s = SessionState::new();
+        s.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+        s.transcript.push(Entry::Assistant {
+            turn: 1,
+            blocks: vec![
+                mk(ToolStatus::Running, false),
+                mk(ToolStatus::Ended, false),
+                mk(ToolStatus::Ended, true),
+            ],
+            usage: None,
+        });
+
+        // 注入非默认配色：三态面板 bg 必须等于注入值
+        let injected = TuiTheme {
+            tool_running_bg: Color::Rgb(1, 2, 3),
+            tool_success_bg: Color::Rgb(4, 5, 6),
+            tool_error_bg: Color::Rgb(7, 8, 9),
+            ..TuiTheme::default()
+        };
+        let expect = [
+            injected.tool_running_bg,
+            injected.tool_success_bg,
+            injected.tool_error_bg,
+        ];
+        let status_texts = ["running", "done", "error"];
+        let (lines, _) = chat_lines_themed(
+            &s,
+            RenderFlags::default(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &injected,
+        );
+        for (i, (&bg, status)) in expect.iter().zip(status_texts.iter()).enumerate() {
+            let start = lines
+                .iter()
+                .position(|l| {
+                    l.spans.iter().any(|sp| sp.content.as_ref() == "bash")
+                        && l.spans.iter().any(|sp| sp.content.as_ref().contains(status))
+                })
+                .unwrap_or_else(|| panic!("卡 {i} 头行未找到"));
+            assert_eq!(
+                lines[start].style.bg,
+                Some(bg),
+                "卡 {i} 应取注入面板色"
+            );
+            // 状态文字仍可见（背景不替代文字）
+            let head_text: String = lines[start]
+                .spans
+                .iter()
+                .map(|sp| sp.content.as_ref())
+                .collect();
+            assert!(head_text.contains(status), "状态文字保留: {head_text}");
+        }
+
+        // 传默认 theme = 现值（与存量精确 RGB 断言一致）
+        let (default_lines, _) = chat_lines_themed(
+            &s,
+            RenderFlags::default(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &TuiTheme::default(),
+        );
+        let default_expect = [
+            Color::Rgb(52, 56, 58),
+            Color::Rgb(37, 65, 49),
+            Color::Rgb(91, 40, 42),
+        ];
+        for (i, (&bg, status)) in default_expect.iter().zip(status_texts.iter()).enumerate() {
+            let start = default_lines
+                .iter()
+                .position(|l| {
+                    l.spans.iter().any(|sp| sp.content.as_ref() == "bash")
+                        && l.spans.iter().any(|sp| sp.content.as_ref().contains(status))
+                })
+                .unwrap_or_else(|| panic!("卡 {i} 头行未找到"));
+            assert_eq!(
+                default_lines[start].style.bg,
+                Some(bg),
+                "默认 theme 应等于现值"
+            );
+        }
     }
 }
