@@ -808,6 +808,9 @@ impl App {
             &ChatScroll::default(),
             &meta,
             None,
+            // 选区文档只做文字提取、不回绘，滚动条不画（design D4）；传
+            // 默认配色即可，主题不进提取语义。
+            &crate::app::theme::TuiTheme::default(),
         );
         let len = wrapped.len();
         self.selection_doc = Some((wrapped, len));
@@ -3992,6 +3995,9 @@ impl App {
             } else {
                 None
             },
+            // 宿主配色注入（design D5）：App 持值 → ViewUi 下传；当前为
+            // 默认（任务 4.2 接 UiEvent::Theme 后改读 self.theme）。
+            theme: crate::app::theme::TuiTheme::default(),
         };
         // 渲染回写（design D2）：ratatui 闭包返回 ()，经 Cell 带出
         // (滚动状态, 卡片命中区间)，闭包结束后存回。

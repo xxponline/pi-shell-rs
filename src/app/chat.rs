@@ -265,7 +265,7 @@ fn append_blocks(
             Block::Text { text } => {
                 if !text.is_empty() {
                     // assistant 文本按 markdown 渲染（流式未闭合语法安全降级）。
-                    out.extend(crate::app::markdown::render_markdown(text));
+                    out.extend(crate::app::markdown::render_markdown_themed(text, theme));
                 }
             }
             Block::Thinking { text } => {
@@ -305,7 +305,9 @@ fn append_blocks(
                 // 着色（design D5），状态文字/圆点保留（spec #16）。
                 let expanded = *overrides.get(id).unwrap_or(&flags.expand_tools);
                 let bg = tool_panel_bg(tool, theme);
-                for mut line in crate::app::tools::tool_lines(name, args_json, tool, expanded) {
+                for mut line in
+                    crate::app::tools::tool_lines_themed(name, args_json, tool, expanded, theme)
+                {
                     line.style = Style::default().bg(bg);
                     out.push(line);
                 }

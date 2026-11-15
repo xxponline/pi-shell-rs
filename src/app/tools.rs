@@ -14,20 +14,40 @@ use pi_shell_rs::session::{ToolExecution, ToolStatus};
 /// 输入: name — 工具名；args_json — 调用参数（可能为流式不完整 JSON）；
 ///       tool — 执行状态/结果；expanded — 是否展开完整输出（ctrl+o）
 /// 输出: 卡片行序列（首行为头行，后续为结果体）
+/// 工具卡片行渲染（默认配色薄包装，design D1 方案 A）：转发
+/// [`tool_lines_themed`] 传默认配色，存量调用点（含测试）签名零改动。
+/// 渲染主路径（chat append_blocks）走 themed 入口。
+#[allow(dead_code)]
 pub fn tool_lines(
     name: &str,
     args_json: &str,
     tool: &ToolExecution,
     expanded: bool,
 ) -> Vec<Line<'static>> {
+    tool_lines_themed(name, args_json, tool, expanded, &crate::app::theme::TuiTheme::default())
+}
+
+/// 工具卡片行渲染（带注入配色；[`tool_lines`] 的 themed 实现体）。
+///
+/// 输入: name — 工具名；args_json — 原始参数串；tool — 执行状态；
+///       expanded — 展开态；theme — 注入配色（read/write 卡语法高亮
+///       取 `syntax_theme`，其余卡不受影响）
+/// 输出: 卡片行序列（头行 + 折叠/展开体 + 受保护尾部）
+pub fn tool_lines_themed(
+    name: &str,
+    args_json: &str,
+    tool: &ToolExecution,
+    expanded: bool,
+    theme: &crate::app::theme::TuiTheme,
+) -> Vec<Line<'static>> {
     let args = serde_json::from_str::<Value>(args_json).unwrap_or(Value::Null);
     let mut out = vec![head_line(name, &args, tool, expanded)];
 
     let body = match name {
-        "read" => read_body(&args, tool),
+        "read" => read_body(&args, tool, theme),
         "bash" | "powershell" => bash_output(&args, tool),
         "edit" => edit_body(&args, tool),
-        "write" => write_body(&args, tool),
+        "write" => write_body(&args, tool, theme),
         "grep" | "find" | "ls" => text_result_body(tool),
         _ => generic_body(&args, tool, expanded),
     };
@@ -396,7 +416,7 @@ fn text_lines(text: &str) -> Vec<Line<'static>> {
 ///
 /// 输入: args — 调用参数（取 path/file_path 定语言）；tool — 执行状态
 /// 输出: 结果体行序列（高亮或现状纯文本）
-fn read_body(args: &Value, tool: &ToolExecution) -> Vec<Line<'static>> {
+fn read_body(args: &Value, tool: &ToolExecution, theme: &crate::app::theme::TuiTheme) -> Vec<Line<'static>> {
     let result = tool.result.as_ref();
     // owned 兑底：structuredContent 缺失时 result_text 的 String 需活过借用。
     let fallback = result_text(tool);
@@ -414,7 +434,7 @@ fn read_body(args: &Value, tool: &ToolExecution) -> Vec<Line<'static>> {
         .or_else(|| args.get("file_path"))
         .and_then(|p| p.as_str())
         .unwrap_or("");
-    crate::app::markdown::highlight_by_path(path, content)
+    crate::app::markdown::highlight_by_path_themed(path, content, theme)
         .unwrap_or_else(|| text_lines(content))
 }
 
@@ -718,7 +738,7 @@ fn line_diff(old: &str, new: &str) -> Vec<Line<'static>> {
 /// write：优先 args.content 预览（写入内容），退回结果文本；按扩展名
 /// 语法高亮（add-tool-card-syntax-highlighting design D4——与 read 同
 /// 入口，path/filePath 双键；None 走现状纯文本逐字节等价）。
-fn write_body(args: &Value, tool: &ToolExecution) -> Vec<Line<'static>> {
+fn write_body(args: &Value, tool: &ToolExecution, theme: &crate::app::theme::TuiTheme) -> Vec<Line<'static>> {
     // owned 兑底：result_text 的 String 需活过借用。
     let fallback = result_text(tool);
     let content: Option<&str> = if let Some(c) = args.get("content").and_then(|c| c.as_str())
@@ -736,7 +756,8 @@ fn write_body(args: &Value, tool: &ToolExecution) -> Vec<Line<'static>> {
         .or_else(|| args.get("filePath"))
         .and_then(|p| p.as_str())
         .unwrap_or("");
-    crate::app::markdown::highlight_by_path(path, content).unwrap_or_else(|| text_lines(content))
+    crate::app::markdown::highlight_by_path_themed(path, content, theme)
+        .unwrap_or_else(|| text_lines(content))
 }
 
 /// grep/find/ls 共用：结果文本行 + details 截断提示。

@@ -29,20 +29,43 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
-/// syntect 语法集/主题（进程内只加载一次）。
+/// syntect 语法集/主题集（进程内只加载一次）。
 fn syntax_set() -> &'static syntect::parsing::SyntaxSet {
     static SS: OnceLock<syntect::parsing::SyntaxSet> = OnceLock::new();
     SS.get_or_init(syntect::parsing::SyntaxSet::load_defaults_newlines)
 }
 
-fn theme() -> &'static syntect::highlighting::Theme {
-    static T: OnceLock<syntect::highlighting::Theme> = OnceLock::new();
-    T.get_or_init(|| {
-        syntect::highlighting::ThemeSet::load_defaults()
-            .themes
-            .remove("base16-ocean.dark")
-            .expect("bundled theme base16-ocean.dark")
-    })
+/// 内置语法高亮主题集（进程内只加载一次；按名查表，宿主配色注入
+/// design D3）。
+fn theme_set() -> &'static syntect::highlighting::ThemeSet {
+    static TS: OnceLock<syntect::highlighting::ThemeSet> = OnceLock::new();
+    TS.get_or_init(syntect::highlighting::ThemeSet::load_defaults)
+}
+
+/// 默认语法高亮主题名（与 `TuiTheme::default().syntax_theme` 一致）。
+pub(crate) const DEFAULT_SYNTAX_THEME: &str = "base16-ocean.dark";
+
+/// 校验语法高亮主题名是否有效（内置主题集中存在）。
+///
+/// 输入: name — 宿主注入的主题名（任意字符串）
+/// 输出: true = 有效；false = 无效（调用方回退默认并让宿主感知，不 panic）
+///
+/// 消费方：embed 启动注入与 `set_theme` 的主题名校验（组 4 接线）。
+#[allow(dead_code)] // 组 4（set_theme/embed 校验）接线前由测试消费
+pub(crate) fn is_valid_syntax_theme(name: &str) -> bool {
+    theme_set().themes.contains_key(name)
+}
+
+/// 按名取语法高亮主题；无效名回退默认主题（绝不 panic，design D3）。
+///
+/// 输入: name — 主题名（无效/空均回退）
+/// 输出: `&'static Theme`——有效名取对应主题，否则取默认主题
+fn theme_by_name(name: &str) -> &'static syntect::highlighting::Theme {
+    let themes = &theme_set().themes;
+    themes
+        .get(name)
+        .or_else(|| themes.get(DEFAULT_SYNTAX_THEME))
+        .expect("bundled theme base16-ocean.dark")
 }
 
 /// FNV-1a 64 位内容哈希（缓存键，不需要密码学强度）。
@@ -62,12 +85,32 @@ fn fnv1a(text: &str) -> u64 {
 ///
 /// 输入: text — assistant/user 的 markdown 源文本（任意，含畸形输入）
 /// 输出: Vec<Line<'static>>；相同内容返回相同结果，绝不 panic
+///
+/// 默认配色薄包装（design D1 方案 A）：转发 [`render_markdown_themed`]
+/// 传默认配色，存量调用点签名零改动。
+///
+/// 分工：渲染主路径（view/chat）走 themed 入口；本包装服务存量测试与
+/// 非渲染路径（默认外观调用方）。
+#[allow(dead_code)]
 pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
+    render_markdown_themed(text, &crate::app::theme::TuiTheme::default())
+}
+
+/// 带注入配色的 markdown 渲染（[`render_markdown`] 的 themed 实现体）。
+///
+/// 输入: text — markdown 源文本；theme — 注入配色（只用 `syntax_theme`，
+///       面板/滚动条色不进 markdown 输出）
+/// 输出: Vec<Line<'static>>；内容+主题相同则结果相同（缓存仅性能优化，
+///       切主题须经 [`clear_render_caches`] 清空，design D4），绝不 panic
+pub fn render_markdown_themed(
+    text: &str,
+    theme: &crate::app::theme::TuiTheme,
+) -> Vec<Line<'static>> {
     let hash = fnv1a(text);
     if let Some(hit) = MD_CACHE.with(|c| c.borrow().get(&hash).cloned()) {
         return hit;
     }
-    let lines = parse_to_lines(text);
+    let lines = parse_to_lines(text, theme);
     MD_CACHE.with(|c| {
         let mut cache = c.borrow_mut();
         if cache.len() >= MD_CACHE_CAP {
@@ -78,11 +121,25 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
     lines
 }
 
+/// 清空渲染双缓存（MD_CACHE + HL_CACHE；两者都烧入主题色，切主题时
+/// 同清，design D4）。
+///
+/// 输入: 无
+/// 输出: 无返回值；副作用为清空本线程（渲染线程）两个缓存——
+///       `set_theme` 在 event loop 线程调用，与绘制同线程
+///
+/// 消费方：`UiEvent::Theme` 应用 arm（组 4 接线）。
+#[allow(dead_code)] // 组 4（set_theme arm）接线前由测试消费
+pub fn clear_render_caches() {
+    MD_CACHE.with(|c| c.borrow_mut().clear());
+    HL_CACHE.with(|c| c.borrow_mut().clear());
+}
+
 /// 解析入口（无缓存的实现，供测试直接调用）。
 ///
-/// 输入: text — markdown 源文本
+/// 输入: text — markdown 源文本；theme — 注入配色（下传代码块高亮）
 /// 输出: 渲染后的行序列
-fn parse_to_lines(text: &str) -> Vec<Line<'static>> {
+fn parse_to_lines(text: &str, theme: &crate::app::theme::TuiTheme) -> Vec<Line<'static>> {
     let opts = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     let parser = Parser::new_ext(text, opts);
 
@@ -208,7 +265,7 @@ fn parse_to_lines(text: &str) -> Vec<Line<'static>> {
                 }
                 TagEnd::CodeBlock => {
                     if let Some((lang, body)) = code.take() {
-                        push_code_block(&mut out, &lang, &body);
+                        push_code_block(&mut out, &lang, &body, theme);
                         blank_line!();
                     }
                 }
@@ -308,7 +365,7 @@ fn parse_to_lines(text: &str) -> Vec<Line<'static>> {
     // 尾部冲刷（未闭合段落/代码块）。
     flush_line!();
     if let Some((lang, body)) = code.take() {
-        push_code_block(&mut out, &lang, &body);
+        push_code_block(&mut out, &lang, &body, theme);
     }
     out
 }
@@ -326,15 +383,21 @@ fn heading_color(level: HeadingLevel) -> Color {
 
 /// 渲染一个代码块（顶栏语言标签 + 高亮正文 + 底栏）。
 ///
-/// 输入: out — 结果收集器；lang — 语言标签（可空）；body — 代码原文
+/// 输入: out — 结果收集器；lang — 语言标签（可空）；body — 代码原文；
+///       theme — 注入配色（取 `syntax_theme` 选 syntect 主题）
 /// 输出: 无返回值；副作用为向 out 追加代码块行
-fn push_code_block(out: &mut Vec<Line<'static>>, lang: &str, body: &str) {
+fn push_code_block(
+    out: &mut Vec<Line<'static>>,
+    lang: &str,
+    body: &str,
+    theme: &crate::app::theme::TuiTheme,
+) {
     let label = if lang.is_empty() { "code" } else { lang };
     out.push(Line::from(Span::styled(
         format!("┌─ {label} "),
         Style::default().fg(Color::DarkGray),
     )));
-    for line in highlight_cached(lang, body) {
+    for line in highlight_cached(lang, body, theme) {
         out.push(line);
     }
     out.push(Line::from(Span::styled(
@@ -345,14 +408,16 @@ fn push_code_block(out: &mut Vec<Line<'static>>, lang: &str, body: &str) {
 
 /// 按语言对代码做语法高亮（带缓存；未知语言/失败降级为纯文本行）。
 ///
-/// 输入: lang — 语言标签；body — 代码原文
+/// 输入: lang — 语言标签；body — 代码原文；theme — 注入配色
+///       （只在缓存 miss 时用于选主题；切主题经 `clear_render_caches`
+///       同清，design D4——键不入主题）
 /// 输出: 高亮后的行序列（每源行一行，tab 已展开为 4 空格）
-fn highlight_cached(lang: &str, body: &str) -> Vec<Line<'static>> {
+fn highlight_cached(lang: &str, body: &str, theme: &crate::app::theme::TuiTheme) -> Vec<Line<'static>> {
     let key = (lang.to_string(), body.to_string());
     if let Some(hit) = HL_CACHE.with(|c| c.borrow().get(&key).cloned()) {
         return hit;
     }
-    let lines = highlight_uncached(lang, body);
+    let lines = highlight_uncached(lang, body, theme);
     HL_CACHE.with(|c| {
         let mut cache = c.borrow_mut();
         if cache.len() >= HL_CACHE_CAP {
@@ -365,9 +430,14 @@ fn highlight_cached(lang: &str, body: &str) -> Vec<Line<'static>> {
 
 /// 高亮实现（无缓存）：syntect 找语法 → 逐行着色；任何失败降级纯文本。
 ///
-/// 输入: lang — 语言标签；body — 代码原文
+/// 输入: lang — 语言标签；body — 代码原文；theme — 注入配色
+///       （按 `syntax_theme` 名取主题，无效名回退默认，design D3）
 /// 输出: 高亮或降级后的行序列
-fn highlight_uncached(lang: &str, body: &str) -> Vec<Line<'static>> {
+fn highlight_uncached(
+    lang: &str,
+    body: &str,
+    theme: &crate::app::theme::TuiTheme,
+) -> Vec<Line<'static>> {
     let normalized = body.replace('\t', "    ");
     let ss = syntax_set();
     let syntax = ss
@@ -383,7 +453,10 @@ fn highlight_uncached(lang: &str, body: &str) -> Vec<Line<'static>> {
             .collect();
     };
 
-    let mut highlighter = syntect::easy::HighlightLines::new(syntax, theme());
+    let mut highlighter = syntect::easy::HighlightLines::new(
+        syntax,
+        theme_by_name(&theme.syntax_theme),
+    );
     let mut out = Vec::new();
     for line in syntect::util::LinesWithEndings::from(&normalized) {
         let spans = match highlighter.highlight_line(line, ss) {
@@ -418,19 +491,34 @@ fn highlight_uncached(lang: &str, body: &str) -> Vec<Line<'static>> {
 ///
 /// 输入: path — 文件路径（取最后一段扩展名，大小写归一；无扩展名 →
 ///       None）；body — 内容
+/// 输出: Some(高亮行)——转发 [`highlight_by_path_themed`] 传默认配色
+///       （存量调用点签名零改动；渲染主路径走 themed 入口）
+#[allow(dead_code)]
+pub(crate) fn highlight_by_path(path: &str, body: &str) -> Option<Vec<Line<'static>>> {
+    highlight_by_path_themed(path, body, &crate::app::theme::TuiTheme::default())
+}
+
+/// 按文件扩展名做语法高亮（带注入配色；[`highlight_by_path`] 的
+/// themed 实现体）。
+///
+/// 输入: path/body — 同上；theme — 注入配色（只用 `syntax_theme`）
 /// 输出: Some(高亮行)——复用 `highlight_cached` 链（tab 归一、哈希缓存、
-///       theme 单例全部继承；其 Style 转换仅取 fg、不携带主题 bg，
+///       主题按名回退全部继承；其 Style 转换仅取 fg、不携带主题 bg，
 ///       design D3 保工具卡面板底色）；None = 扩展名缺失或无对应语法 →
 ///       **调用方走现状纯文本路径**（降级逐字节等价，design D1——不在此
 ///       处内部降级）
-pub(crate) fn highlight_by_path(path: &str, body: &str) -> Option<Vec<Line<'static>>> {
+pub(crate) fn highlight_by_path_themed(
+    path: &str,
+    body: &str,
+    theme: &crate::app::theme::TuiTheme,
+) -> Option<Vec<Line<'static>>> {
     let ext = std::path::Path::new(path).extension()?.to_str()?.to_lowercase();
     if ext.is_empty() {
         return None;
     }
     // 语法存在性门控：miss → None（交调用方原路径，design D1）。
     syntax_set().find_syntax_by_extension(&ext)?;
-    Some(highlight_cached(&ext, body))
+    Some(highlight_cached(&ext, body, theme))
 }
 
 #[cfg(test)]
@@ -632,5 +720,89 @@ mod tests {
         }
         let elapsed = start.elapsed();
         assert!(elapsed < std::time::Duration::from_secs(2), "took {elapsed:?}");
+    }
+
+    /// 收集代码块渲染中出现的全部前景色（去重）。
+    fn code_fg_colors(lines: &[Line<'static>]) -> std::collections::HashSet<Color> {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter_map(|s| s.style.fg)
+            .collect()
+    }
+
+    /// 宿主配色注入（design D3，spec「无效主题名回退默认」）：无效主题名
+    /// 不 panic、渲染回退默认主题色，且 `is_valid_syntax_theme` 让调用方
+    /// 可感知注入未生效。
+    ///
+    /// 输入: 无（构造无效主题名的 TuiTheme）
+    /// 输出: 断言通过；无效名渲染色 = 默认主题色
+    #[test]
+    fn invalid_syntax_theme_falls_back_to_default() {
+        assert!(
+            is_valid_syntax_theme(DEFAULT_SYNTAX_THEME),
+            "默认主题名应有效"
+        );
+        assert!(
+            !is_valid_syntax_theme("no-such-theme"),
+            "无效名应可被调用方检出"
+        );
+
+        let md = "```rust\nfn main() { let x = 42; }\n```";
+        let bad = crate::app::theme::TuiTheme {
+            syntax_theme: "no-such-theme".to_string(),
+            ..Default::default()
+        };
+        clear_render_caches();
+        let bad_lines = render_markdown_themed(md, &bad);
+        clear_render_caches();
+        let default_lines = render_markdown_themed(md, &Default::default());
+        assert_eq!(
+            code_fg_colors(&bad_lines),
+            code_fg_colors(&default_lines),
+            "无效主题名应回退默认主题色"
+        );
+        assert!(code_fg_colors(&bad_lines).len() > 1, "应有高亮色");
+    }
+
+    /// 宿主配色注入（design D4，spec「切换后缓存不漏旧色」）：双缓存都
+    /// 烧入主题色——切主题（经 clear_render_caches，set_theme 同路径）后
+    /// 重绘全部为新主题色，无旧色残留。
+    ///
+    /// 输入: 无（两个不同 syntect 主题交替渲染）
+    /// 输出: 断言通过；切后色集 = 新主题干净渲染色集，且与旧主题不同
+    #[test]
+    fn theme_switch_clears_caches_and_leaks_no_old_colors() {
+        let md = "```rust\nfn main() { let x = 42; }\n```";
+        let theme_a = crate::app::theme::TuiTheme {
+            syntax_theme: "base16-ocean.dark".to_string(),
+            ..Default::default()
+        };
+        let theme_b = crate::app::theme::TuiTheme {
+            syntax_theme: "base16-ocean.light".to_string(),
+            ..Default::default()
+        };
+        assert!(
+            is_valid_syntax_theme("base16-ocean.light"),
+            "syntect 应内置 base16-ocean.light"
+        );
+
+        // 主题 A 渲染（填充 MD_CACHE + HL_CACHE）
+        clear_render_caches();
+        let colors_a = code_fg_colors(&render_markdown_themed(md, &theme_a));
+
+        // 切主题 B（set_theme 路径：清双缓存）→ 重绘不得残留 A 色
+        clear_render_caches();
+        let colors_b = code_fg_colors(&render_markdown_themed(md, &theme_b));
+        assert_ne!(colors_a, colors_b, "两主题高亮色应不同");
+        assert!(colors_b.len() > 1, "B 主题应有高亮色");
+
+        // B 干净渲染（新线程缓存语义等价：先清后渲）应与切后一致
+        clear_render_caches();
+        let colors_b_fresh = code_fg_colors(&render_markdown_themed(md, &theme_b));
+        assert_eq!(
+            colors_b, colors_b_fresh,
+            "切主题后重绘 = 新主题干净渲染，无旧色残留"
+        );
     }
 }

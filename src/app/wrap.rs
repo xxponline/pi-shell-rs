@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::scroll::ChatScroll;
+use crate::app::theme::TuiTheme;
 
 /// 点击命中的对象类型（design D1：一表强类型分发，拒字符串键约定）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +158,7 @@ pub fn wrap_for_viewport(
     scroll: &ChatScroll,
     meta: &[Vec<HitKind>],
     scrollbar: Option<ScrollbarOverlay>,
+    theme: &TuiTheme,
 ) -> (Vec<Line<'static>>, ChatScroll, Vec<Hit>) {
     let width = width.max(1) as usize;
     let height = height.max(1) as usize;
@@ -227,9 +229,9 @@ pub fn wrap_for_viewport(
                 (false, _) => "│",
             };
             let color = if thumb {
-                SCROLLBAR_THUMB_COLOR
+                theme.scrollbar_thumb
             } else {
-                SCROLLBAR_TRACK_COLOR
+                theme.scrollbar_track
             };
             let target = width - 1;
             truncate_line_width(line, target);
@@ -457,7 +459,7 @@ mod tests {
     fn content_fitting_viewport_is_unchanged() {
         let lines = vec![plain("hello"), plain("world")];
         let out = wrap_for_viewport(&lines, 40, 10, &ChatScroll::default(), &[],
-        None).0;
+        None, &TuiTheme::default()).0;
         assert_eq!(render(&out), "hello\nworld");
     }
 
@@ -465,7 +467,7 @@ mod tests {
     fn long_line_wraps_at_word_boundary() {
         let lines = vec![plain(&"word ".repeat(50))];
         let out = wrap_for_viewport(&lines, 20, 100, &ChatScroll::default(), &[],
-        None).0;
+        None, &TuiTheme::default()).0;
         assert!(out.len() > 1, "should wrap");
         for l in &out {
             let w: usize = l.spans.iter().map(|s| s.content.as_ref().width()).sum();
@@ -477,7 +479,7 @@ mod tests {
     fn over_height_keeps_tail_not_head() {
         let lines = vec![plain(&format!("{}TAIL", "word ".repeat(500)))];
         let out = wrap_for_viewport(&lines, 20, 10, &ChatScroll::default(), &[],
-        None).0;
+        None, &TuiTheme::default()).0;
         assert_eq!(out.len(), 10);
         let text = render(&out);
         assert!(text.trim_end().ends_with("TAIL"), "tail should be newest content: {text:?}");
@@ -489,7 +491,7 @@ mod tests {
     fn embedded_newline_creates_lines() {
         let lines = vec![plain("line1\nline2\nline3")];
         let out = wrap_for_viewport(&lines, 40, 10, &ChatScroll::default(), &[],
-        None).0;
+        None, &TuiTheme::default()).0;
         assert_eq!(render(&out), "line1\nline2\nline3");
     }
 
@@ -497,7 +499,7 @@ mod tests {
     fn empty_logical_line_preserved() {
         let lines = vec![plain("a"), plain(""), plain("b")];
         let out = wrap_for_viewport(&lines, 40, 10, &ChatScroll::default(), &[],
-        None).0;
+        None, &TuiTheme::default()).0;
         assert_eq!(render(&out), "a\n\nb");
     }
 
@@ -506,7 +508,7 @@ mod tests {
         // 10 个中文字 = 20 宽，宽度 10 → 每行 5 个
         let lines = vec![plain(&"中".repeat(10))];
         let out = wrap_for_viewport(&lines, 10, 100, &ChatScroll::default(), &[],
-        None).0;
+        None, &TuiTheme::default()).0;
         assert_eq!(out.len(), 2);
         assert_eq!(render(&out), "中中中中中\n中中中中中");
     }
@@ -515,7 +517,7 @@ mod tests {
     fn unbroken_long_token_hard_splits() {
         let lines = vec![plain(&"x".repeat(45))];
         let out = wrap_for_viewport(&lines, 10, 100, &ChatScroll::default(), &[],
-        None).0;
+        None, &TuiTheme::default()).0;
         assert_eq!(out.len(), 5); // 45 chars / 10 wide
         assert_eq!(render(&out).replace('\n', ""), "x".repeat(45));
     }
@@ -528,7 +530,7 @@ mod tests {
             Span::raw("bb cc dd ee ff gg hh ii jj"),
         ])];
         let out = wrap_for_viewport(&lines, 10, 100, &ChatScroll::default(), &[],
-        None).0;
+        None, &TuiTheme::default()).0;
         assert!(out.len() >= 2);
         // 首个 span 的样式保留
         let first = out[0]
@@ -551,7 +553,7 @@ mod tests {
         ])
         .style(bg)];
         let out = wrap_for_viewport(&lines, 20, 100, &ChatScroll::default(), &[],
-        None).0;
+        None, &TuiTheme::default()).0;
         assert!(out.len() > 1, "应拆行: {}", out.len());
         for l in &out {
             assert_eq!(l.style.bg, Some(ratatui::style::Color::Rgb(40, 44, 52)), "子行保留 bg");
@@ -563,7 +565,7 @@ mod tests {
         // 硬切路径：超宽单 token
         let lines = vec![Line::from(Span::styled("x".repeat(45), bg)).style(bg)];
         let out = wrap_for_viewport(&lines, 10, 100, &ChatScroll::default(), &[],
-        None).0;
+        None, &TuiTheme::default()).0;
         assert_eq!(out.len(), 5);
         for l in &out {
             assert_eq!(l.style.bg, Some(ratatui::style::Color::Rgb(40, 44, 52)), "硬切子行保留 bg");
@@ -574,7 +576,7 @@ mod tests {
         // 无 bg 的行不补 pad（不改变既有行为）
         let lines = vec![plain("hi")];
         let out = wrap_for_viewport(&lines, 20, 10, &ChatScroll::default(), &[],
-        None).0;
+        None, &TuiTheme::default()).0;
         assert_eq!(render(&out), "hi");
     }
 
@@ -589,7 +591,7 @@ mod tests {
             viewport: 0,
         };
         let (out, next, _) = wrap_for_viewport(&lines, 20, 5, &scroll, &[],
-        None);
+        None, &TuiTheme::default());
         assert_eq!(render(&out), "L10\nL11\nL12\nL13\nL14", "窗口应从 top 起");
         assert_eq!(next.top, 10, "中段 top 原样回写");
         assert!(!next.following, "中段维持钉住");
@@ -604,7 +606,7 @@ mod tests {
 
         // following：取末尾，与原行为逐字节一致
         let (out, next, _) = wrap_for_viewport(&lines, 20, 5, &ChatScroll::default(), &[],
-        None);
+        None, &TuiTheme::default());
         assert_eq!(render(&out), "L45\nL46\nL47\nL48\nL49");
         assert!(next.following);
         assert_eq!(next.top, 45);
@@ -617,7 +619,7 @@ mod tests {
             viewport: 0,
         };
         let (out, next, _) = wrap_for_viewport(&lines, 20, 5, &stale, &[],
-        None);
+        None, &TuiTheme::default());
         assert_eq!(render(&out), "L45\nL46\nL47\nL48\nL49", "越界应 clamp 到底");
         assert!(next.following, "clamp 到底应恢复跟随");
         assert_eq!(next.top, 45);
@@ -629,7 +631,7 @@ mod tests {
     fn content_len_updated_each_wrap() {
         let lines: Vec<Line> = (0..50).map(|i| plain(&format!("L{i:02}"))).collect();
         let (_out, next, _) = wrap_for_viewport(&lines, 20, 10, &ChatScroll::default(), &[],
-        None);
+        None, &TuiTheme::default());
         assert_eq!(next.content_len, 50, "总行数 = drain 前全量");
         assert_eq!(next.top, 40, "following 取末尾");
 
@@ -640,7 +642,7 @@ mod tests {
             content_len: 0,
         };
         let (_out2, next2, _) = wrap_for_viewport(&lines, 20, 5, &pinned, &[],
-        None);
+        None, &TuiTheme::default());
         assert_eq!(next2.content_len, 50, "钉住态也回写总行数");
         assert_eq!(next2.top, 10, "钉住 top 不变");
     }
@@ -657,8 +659,7 @@ mod tests {
             10,
             &ChatScroll::default(),
             &[],
-            Some(ScrollbarOverlay { hovered: false }),
-        );
+            Some(ScrollbarOverlay { hovered: false }), &TuiTheme::default());
         assert_eq!(out.len(), 10, "窗口满高");
         for (i, l) in out.iter().enumerate() {
             let last = l.spans.last().unwrap().content.as_ref();
@@ -679,8 +680,7 @@ mod tests {
             10,
             &ChatScroll::default(),
             &[],
-            Some(ScrollbarOverlay { hovered: true }),
-        );
+            Some(ScrollbarOverlay { hovered: true }), &TuiTheme::default());
         assert!(
             hover[9].spans.last().unwrap().content.as_ref().ends_with('█'),
             "悬停 thumb 加粗"
@@ -700,8 +700,7 @@ mod tests {
             10,
             &ChatScroll::default(),
             &[],
-            Some(ScrollbarOverlay { hovered: false }),
-        );
+            Some(ScrollbarOverlay { hovered: false }), &TuiTheme::default());
         let cjk_row = cjk_out
             .iter()
             .find(|l| l.spans.iter().any(|s| s.content.as_ref().contains('中')))
@@ -730,8 +729,7 @@ mod tests {
             10,
             &ChatScroll::default(),
             &[],
-            Some(ScrollbarOverlay { hovered: false }),
-        );
+            Some(ScrollbarOverlay { hovered: false }), &TuiTheme::default());
         let l0 = &bg_out[0];
         assert!(
             l0.spans.first().unwrap().style.bg.is_some(),
@@ -751,10 +749,71 @@ mod tests {
             10,
             &ChatScroll::default(),
             &[],
-            Some(ScrollbarOverlay { hovered: false }),
-        );
+            Some(ScrollbarOverlay { hovered: false }), &TuiTheme::default());
         let st: String = s_out[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(st, "only", "内容不足不画");
+    }
+
+    /// 宿主配色注入（design D1/D2）：非默认 `TuiTheme` 下滚动条 track/thumb
+    /// 格子的 fg 等于注入值，默认 theme 等于现有 const 现值。
+    ///
+    /// 输入: 无（50 行内容 + 贴底滚动状态 + 悬停/常态 overlay）
+    /// 输出: 断言通过；末列字形 fg 与注入/默认值比对
+    #[test]
+    fn scrollbar_colors_follow_injected_theme() {
+        let lines: Vec<Line> = (0..50).map(|i| plain(&format!("L{i:02}"))).collect();
+        let injected = TuiTheme {
+            scrollbar_track: ratatui::style::Color::Rgb(10, 20, 30),
+            scrollbar_thumb: ratatui::style::Color::Rgb(40, 50, 60),
+            ..TuiTheme::default()
+        };
+        let (out, _next, _) = wrap_for_viewport(
+            &lines,
+            10,
+            10,
+            &ChatScroll::default(),
+            &[],
+            Some(ScrollbarOverlay { hovered: false }),
+            &injected,
+        );
+        // 贴底（top=40）→ thumb 占末两行（geo thumbTop=8）；其余为轨道
+        for (i, l) in out.iter().enumerate() {
+            let last = l.spans.last().unwrap();
+            let expect = if i >= 8 {
+                injected.scrollbar_thumb
+            } else {
+                injected.scrollbar_track
+            };
+            assert_eq!(
+                last.style.fg,
+                Some(expect),
+                "行 {i} 应取注入滚动条色"
+            );
+        }
+
+        // 默认 theme = 现有 const（与 view.rs 断言同源）
+        let (d_out, _next, _) = wrap_for_viewport(
+            &lines,
+            10,
+            10,
+            &ChatScroll::default(),
+            &[],
+            Some(ScrollbarOverlay { hovered: false }),
+            &TuiTheme::default(),
+        );
+        for (i, l) in d_out.iter().enumerate() {
+            let last = l.spans.last().unwrap();
+            let expect = if i >= 8 {
+                SCROLLBAR_THUMB_COLOR
+            } else {
+                SCROLLBAR_TRACK_COLOR
+            };
+            assert_eq!(
+                last.style.fg,
+                Some(expect),
+                "默认 theme 应等于现有 const（行 {i}）"
+            );
+        }
     }
 
     /// 任务 1.2：MessageStart 分组（add-prompt-jump design D1）——首行
@@ -780,8 +839,7 @@ mod tests {
             100,
             &ChatScroll::default(),
             &meta,
-            None,
-        );
+            None, &TuiTheme::default());
         assert!(out.len() > 4, "首行应换行成多屏行: {}", out.len());
         assert_eq!(hits.len(), 2, "两个起点各成一段: {hits:?}");
         assert_eq!(hits[0].kind, HitKind::MessageStart(0));
@@ -797,7 +855,7 @@ mod tests {
             viewport: 0,
             content_len: 0,
         };
-        let (_o2, _n2, hits2) = wrap_for_viewport(&lines, 20, 5, &scroll, &meta, None);
+        let (_o2, _n2, hits2) = wrap_for_viewport(&lines, 20, 5, &scroll, &meta, None, &TuiTheme::default());
         assert_eq!(
             (hits2[0].start, hits2[0].end),
             (hits[0].start, hits[0].end),
@@ -851,7 +909,7 @@ mod tests {
             viewport: 0,
         };
         let (out, next, _) = wrap_for_viewport(&lines, 20, 10, &scroll, &[],
-        None);
+        None, &TuiTheme::default());
         assert_eq!(render(&out), "a\nb");
         assert!(next.following, "内容不足一屏即视为贴底");
         assert_eq!(next.top, 0);
@@ -870,7 +928,7 @@ mod tests {
         let meta = vec![vec![], vec![HitKind::Tool("c1".into())], vec![]];
         let (out, _next, hits) =
             wrap_for_viewport(&lines, 20, 100, &ChatScroll::default(), &meta,
-        None);
+        None, &TuiTheme::default());
         assert_eq!(hits.len(), 1, "应恰一个命中区间: {hits:?}");
         let h = &hits[0];
         assert_eq!(h.kind, HitKind::Tool("c1".into()), "强类型 kind 断言");
@@ -902,7 +960,7 @@ mod tests {
             viewport: 0,
         };
         let (out, _next, hits) = wrap_for_viewport(&lines, 20, 10, &scroll, &meta,
-        None);
+        None, &TuiTheme::default());
         assert_eq!(out.len(), 10);
         assert_eq!(out[0].spans[0].content.as_ref(), "L050", "窗口从 top 起");
         assert_eq!(hits.len(), 2, "不同 kind 各成一段: {hits:?}");

@@ -8,7 +8,7 @@ use ratatui::Frame;
 
 use pi_shell_rs::session::{Phase, SessionState, Usage};
 
-use crate::app::chat::{chat_lines, RenderFlags};
+use crate::app::chat::{chat_lines_themed, RenderFlags};
 use crate::app::scroll::ChatScroll;
 use crate::app::wrap::wrap_for_viewport;
 use unicode_width::UnicodeWidthChar;
@@ -47,6 +47,8 @@ pub struct ViewUi<'a> {
     pub thinking_overrides: Option<&'a std::collections::HashMap<usize, bool>>,
     /// 滚动条绘制覆盖（None=本帧不画，design D2）。
     pub scrollbar: Option<crate::app::wrap::ScrollbarOverlay>,
+    /// 注入配色（宿主配色注入 design D1；默认 = 深底现值）。
+    pub theme: crate::app::theme::TuiTheme,
 }
 
 
@@ -96,6 +98,7 @@ pub fn render(
         ui.tool_expanded,
         ui.thinking_overrides,
         ui.scrollbar,
+        &ui.theme,
     );
     if queue_h > 0 {
         frame.render_widget(
@@ -139,6 +142,7 @@ pub fn render(
             tool_expanded: ui.tool_expanded,
             thinking_overrides: ui.thinking_overrides,
             scrollbar: ui.scrollbar,
+            theme: ui.theme.clone(),
         }
     };
     render_editor(frame, chunks[4], &editor_ui, state.phase);
@@ -359,16 +363,24 @@ fn render_chat(
     tool_expanded: Option<&std::collections::HashMap<String, bool>>,
     thinking_overrides: Option<&std::collections::HashMap<usize, bool>>,
     scrollbar: Option<crate::app::wrap::ScrollbarOverlay>,
+    theme: &crate::app::theme::TuiTheme,
 ) -> (ChatScroll, Vec<crate::app::wrap::Hit>) {
     let empty = std::collections::HashMap::new();
     let overrides = tool_expanded.unwrap_or(&empty);
     let empty_t = std::collections::HashMap::new();
     let thinking = thinking_overrides.unwrap_or(&empty_t);
-    let (lines, meta) = chat_lines(state, flags, overrides, thinking);
+    let (lines, meta) = chat_lines_themed(state, flags, overrides, thinking, theme);
     // 自行换行后按滚动状态开窗口：ratatui 的 Wrap+scroll 偏移按换行后行数
     // 计，我们无法精确预知，会导致最新内容被挤出视口（见 wrap 模块说明）。
-    let (wrapped, next, hits) =
-        wrap_for_viewport(&lines, area.width, area.height, &scroll, &meta, scrollbar);
+    let (wrapped, next, hits) = wrap_for_viewport(
+        &lines,
+        area.width,
+        area.height,
+        &scroll,
+        &meta,
+        scrollbar,
+        theme,
+    );
     let paragraph = Paragraph::new(wrapped);
     frame.render_widget(paragraph.block(Block::default().borders(Borders::NONE)), area);
     (next, hits)

@@ -11,18 +11,18 @@
       `TuiTheme::default()`；`append_blocks`/`tool_panel_bg` 吃 theme——验证：
       `rg "chat_lines\(" src/` 确认存量 28 处调用点一行未改，
       `cargo test` 全绿
-- [ ] 1.3 为注入路径补单测：`chat_lines_themed` 传非默认 `TuiTheme` 后三态
+- [x] 1.3 为注入路径补单测：`chat_lines_themed` 传非默认 `TuiTheme` 后三态
       面板色等于注入值、传默认等于现值——验证：新测试通过且现有测试零改动
-- [ ] 1.4 第一次 commit（`cargo test` 全绿 + `cargo clippy --all-targets`
+- [x] 1.4 第一次 commit（`cargo test` 全绿 + `cargo clippy --all-targets`
       零告警后提交）
 
 ## 2. 滚动条色参数化
 
-- [ ] 2.1 `wrap_for_viewport` 加 `theme` 参数，滚动条 track/thumb 从
+- [x] 2.1 `wrap_for_viewport` 加 `theme` 参数，滚动条 track/thumb 从
       `TuiTheme` 取值；`const` 保留为默认值定义（`view.rs` 测试引用点不改）；
       `refresh_selection_doc` 路径传 Default——验证：`cargo test` 全绿、
       `view.rs` 滚动条断言零改动通过
-- [ ] 2.2 补滚动条注入测试：非默认 theme 下 track/thumb 格子 fg 等于注入值
+- [x] 2.2 补滚动条注入测试：非默认 theme 下 track/thumb 格子 fg 等于注入值
       ——验证：新测试通过
 
 ## 3. markdown 主题可切换与双缓存清理
