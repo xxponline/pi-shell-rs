@@ -71,6 +71,10 @@ ratatui 的 diff 比较含 style: 主题变 → 全部带色格子变 → 全屏
 `HL_CACHE` (`src/app/markdown.rs:28`) 键是 `(lang, body)`, **不含主题** —
 切主题后旧色行会从缓存漏出。要求: 键加主题标识, 或 `set_theme` 时清空缓存。
 
+> **实现注记 (2026-11-15)**: 实探发现 `MD_CACHE` (键=内容哈希) 同样烧入
+> 主题色——只清 HL_CACHE 不够。最终方案: `set_theme` 时同清两缓存
+> (`markdown::clear_render_caches`), 不改键 (design D4)。
+
 ### R6 — `theme()` 可切换
 
 现在是 `OnceLock` 静态单例 (`src/app/markdown.rs:38`), 唯一消费点
@@ -98,11 +102,23 @@ ratatui 的 diff 比较含 style: 主题变 → 全部带色格子变 → 全屏
 
 ## 验收
 
-1. 默认路径: 现有测试全绿 + 输出与改动前逐字节一致;
-2. 注入浅色 `TuiTheme` 后: 工具卡面板、滚动条、代码高亮按注入值出 ANSI;
-3. `set_theme` 后一帧内: 三个注入面全部按新值重发 (无头 `TestBackend` 断言);
-4. 切主题后高亮缓存不漏旧色 (R5);
-5. standalone `cargo run` 外观与今天无差别。
+> **销账 (2026-11-15, change `add-theme-injection`)**:
+>
+> 1. ✅ 默认路径: `cargo test` 全绿 (363 个), 现有精确 RGB/滚动条断言零改动;
+> 2. ✅ 注入浅色 `TuiTheme`: `chat_lines_themed_uses_injected_panel_colors` /
+>    `scrollbar_colors_follow_injected_theme` / 一帧测试 frame2 ANSI 断言;
+> 3. ✅ `set_theme` 一帧内重发: `set_theme_switches_three_injected_surfaces_in_one_frame`
+>    (真实 event loop + VirtualBackend ANSI; 原计划 TestBackend——其
+>    `Error=Infallible` 不满足 `App::draw` 约束, 改用 embed 同路径);
+> 4. ✅ 切主题后缓存不漏旧色: `theme_switch_clears_caches_and_leaks_no_old_colors`
+>    (**R5 扩为双缓存**: MD_CACHE + HL_CACHE 同清, 见上实现注记);
+> 5. ✅ standalone `cargo run` 外观与今天无差别 (默认值 = 现值, 手工确认)。
+>
+> **跨仓交付注记**: 本仓只注入 RGB 直通的 7 处; ~140 处命名 ANSI 色
+> (Cyan/DarkGray/Green/Red 等) 走 0-15 索引, 由宿主渲染调色板解释——
+> **宿主需保证其 ANSI 0-15 调色板在双主题下与注入面板色的对比度**
+> (如浅色面板上的 Green/Red 状态字、白底上的 DarkGray 提示), 这是
+> 宿主调色板职责, 本仓不动 ANSI 语义 (R8)。
 
 ## 已决设计点: 注入完整值
 

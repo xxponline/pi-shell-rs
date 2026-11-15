@@ -51,12 +51,12 @@
 
 ## 5. spec 验收与文档
 
-- [ ] 5.1 对照 `specs/tui-app/spec.md` delta 的 6 个 scenario 逐条核验
+- [x] 5.1 对照 `specs/tui-app/spec.md` delta 的 6 个 scenario 逐条核验
       （默认字节不变 / 注入生效 / 一帧切换 / 缓存不漏 / 非法名回退）——
       验证：`cargo test` 全绿覆盖前四条，非法名回退测试覆盖第五条
-- [ ] 5.2 `Docs/theme-injection-requirements.md` 验收项销账标注；交付说明
+- [x] 5.2 `Docs/theme-injection-requirements.md` 验收项销账标注；交付说明
       补一句宿主 ANSI 调色板对比度为宿主职责——验证：文档更新且与实现一致
-- [ ] 5.3 最终全量检查：`cargo test` + `cargo clippy --all-targets` 零告警；
+- [x] 5.3 最终全量检查：`cargo test` + `cargo clippy --all-targets` 零告警；
       `cargo run` 手工确认 standalone 外观与今天无差别——验证：命令输出干净
 
 ## Workflow follow-up
