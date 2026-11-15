@@ -202,15 +202,25 @@ pub fn spawn_event_sources(
 ///
 /// 输入: ev — 键盘线程 `poll`/`read` 得到的 crossterm 事件；
 ///       accel — 滚轮加速器（状态随事件源线程存活，读取点打时戳）
-/// 输出: Key → `UiEvent::Key`；Resize → `UiEvent::Resize`（触发重绘，
+/// 输出: Key（仅 Press/Repeat；**Release 丢弃**，见下）→ `UiEvent::Key`；
+///       Resize → `UiEvent::Resize`（触发重绘，
 ///       autoresize 在 draw 时取新尺寸）；滚轮 → `UiEvent::Wheel(行数)`
 ///       （负=上滚、正=下滚，已含加速与 Alt 倍率）；左键按下 →
 ///       `UiEvent::Click{x,y}`；左键抬起 → `UiEvent::PointerUp`；移动/
 ///       左键拖拽 → `UiEvent::PointerMove/PointerDrag{x,y}`（滚动条，
 ///       design D4）；右键/横向滚轮 → `None`
+///
+/// Release 丢弃的原因: Windows 控制台会为每次按键同时投递 key-down 与
+/// key-up 记录，crossterm 0.29 把 key-up 解析成 `KeyEventKind::Release`
+/// （unix tty 只有 Press），不丢就会一次按键触发两次动作（实测回归）。
 fn ui_event_from_crossterm(ev: ct_event::Event, accel: &mut WheelAccel) -> Option<UiEvent> {
     match ev {
-        ct_event::Event::Key(key) => Some(UiEvent::Key(key)),
+        ct_event::Event::Key(key) => {
+            if key.kind == ct_event::KeyEventKind::Release {
+                return None;
+            }
+            Some(UiEvent::Key(key))
+        }
         ct_event::Event::Resize(..) => Some(UiEvent::Resize),
         ct_event::Event::Mouse(m) => {
             // 任务 3.1（add-message-scrollbar design D4）：pointer 三件套
@@ -263,6 +273,42 @@ mod tests {
             ),
             Some(UiEvent::Key(_))
         ));
+    }
+
+    /// Windows 回归：key-up 解析出的 Release 必须丢弃，否则一次按键触发
+    /// 两次（crossterm 0.29 在 Windows 上 key-down/key-up 成对投递）。
+    /// 输入: kind=Release / Press 的 Key 事件；输出: None / Some(Key)
+    #[test]
+    fn key_release_event_is_dropped() {
+        use crossterm::event::KeyEventKind;
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        assert!(
+            ui_event_from_crossterm(
+                ct_event::Event::Key(release),
+                &mut WheelAccel::with_accelerate(false)
+            )
+            .is_none(),
+            "Release 必须丢弃"
+        );
+        let press = KeyEvent::new_with_kind(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        );
+        assert!(
+            matches!(
+                ui_event_from_crossterm(
+                    ct_event::Event::Key(press),
+                    &mut WheelAccel::with_accelerate(false)
+                ),
+                Some(UiEvent::Key(_))
+            ),
+            "Press 必须转发"
+        );
     }
 
     /// 终端 resize 必须转成 UiEvent::Resize（否则改尺寸后不重绘）。

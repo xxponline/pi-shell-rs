@@ -31,7 +31,7 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use pi_shell_rs::rpc::{CommandSender, ResponsePolicy, RpcClient};
 use pi_shell_rs::session::{Phase, SessionState};
 use ratatui::style::Color;
@@ -2273,6 +2273,18 @@ impl App {
         );
     }
 
+    /// 判断按键是否应触发动作：Release（键抬起）不触发。
+    ///
+    /// 功能: handle_key 的入口闸门（纯逻辑，无 TTY 可测）。
+    /// 为什么需要: Windows 控制台为每次按键同时投递 key-down/key-up 记录，
+    ///   crossterm 0.29 把 key-up 解析成 Release；放行则一次按键触发两次
+    ///   （事件翻译层已丢一次，这里是 embed 宿主注入路径的兜底）。
+    /// 输入: key — 待判定的按键
+    /// 输出: Press/Repeat → true（继续处理）；Release → false（直接忽略）
+    fn key_triggers_action(key: &KeyEvent) -> bool {
+        key.kind != KeyEventKind::Release
+    }
+
     /// 处理一个按键：先做纯意图映射，再应用状态，最后按需走命令通道。
     ///
     /// 输入: key — 原始按键；commander/report_tx — 发送 prompt/abort 所需
@@ -2283,6 +2295,9 @@ impl App {
         commander: &CommandSender,
         report_tx: &Sender<UiEvent>,
     ) {
+        if !Self::key_triggers_action(&key) {
+            return;
+        }
         // ctrl+c 全局优先（浮层之下也生效）：单击清空输入，500ms 内双击退出。
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.handle_ctrl_c();
@@ -4019,6 +4034,23 @@ mod input_tests {
         let intent = App::key_intent(key, streaming);
         let mut probe = App::new();
         probe.apply_intent(key, intent)
+    }
+
+    /// Windows 回归：Release（键抬起）不得触发动作，否则一次按键触发两次。
+    /// 输入: kind=Release / Press 的按键；输出: false / true
+    #[test]
+    fn release_key_is_not_actionable() {
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        assert!(
+            !App::key_triggers_action(&release),
+            "Release 必须被忽略"
+        );
+        let press = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(App::key_triggers_action(&press), "Press 必须触发动作");
     }
 
     #[test]
