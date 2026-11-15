@@ -218,7 +218,8 @@ model/session/tree/thinking 选择器，extension_ui 9 种 method，write/grep/f
   流式输出/计时器/背景面板/头行/截断警告）明确不含以下四项，原因各异：
   ① edit 执行中预计算 diff：渲染层需在 args 到齐后异步读文件出 preview，
      侵入渲染与执行的边界；
-  ② 语法高亮：read/write 内容与 edit diff 需引入 highlightCode 同等能力；
+  ② edit diff 行内**变更**高亮（pi `renderDiff`，diff.ts:82——非语法高亮；
+     read/write 语法高亮已由 `add-tool-card-syntax-highlighting` 落地）；
   ③ 结果图片块渲染：依赖 Kitty/iTerm2 图片协议整套实现；
   ④ args 流式分帧渲染（每帧仅渲染一次）：纯性能优化，无体感差异。
 
@@ -226,7 +227,8 @@ model/session/tree/thinking 选择器，extension_ui 9 种 method，write/grep/f
 [`pi-tui-interaction.md`](./pi-tui-interaction.md) 差异清单完成 #1/2/3/4/8/10——
 流式 steer、ctrl+c/ctrl+d/esc 语义、队列恢复、多行编辑器（光标/词行删除/
 kill-ring/yank/undo）。其余小项见差异表（#11 扩展快捷键——无扩展运行时、
-#12 选择器分页、#9 残差：选区复制/剪贴板文件列表粘贴）。
+#12 选择器分页、#9 残差：剪贴板文件列表粘贴；选区复制已由
+`add-select-to-copy` 落地）。
 
 ## 7. 既定技术决策记录
 

@@ -389,15 +389,33 @@ fn text_lines(text: &str) -> Vec<Line<'static>> {
 // ---------- 各工具结果体 ----------
 
 /// read：文件内容预览（structuredContent 优先——实测为文件原文字符串，
-/// 退回 content[].text）。
-fn read_body(_args: &Value, tool: &ToolExecution) -> Vec<Line<'static>> {
+/// 否则 result_text）。按扩展名语法高亮（add-tool-card-syntax-highlighting
+/// design D1/D2-A——pi formatReadResult 同序：先高亮全文，collapse 再切
+/// 前 10 行、提示计数取全文）；None（无扩展名/未知语法）走现状纯文本
+/// （降级逐字节等价）。
+///
+/// 输入: args — 调用参数（取 path/file_path 定语言）；tool — 执行状态
+/// 输出: 结果体行序列（高亮或现状纯文本）
+fn read_body(args: &Value, tool: &ToolExecution) -> Vec<Line<'static>> {
     let result = tool.result.as_ref();
-    if let Some(Value::String(content)) = result.and_then(|r| r.get("structuredContent")) {
-        return text_lines(content);
-    }
-    result_text(tool)
-        .map(|t| text_lines(&t))
-        .unwrap_or_default()
+    // owned 兑底：structuredContent 缺失时 result_text 的 String 需活过借用。
+    let fallback = result_text(tool);
+    let content: Option<&str> =
+        if let Some(Value::String(c)) = result.and_then(|r| r.get("structuredContent")) {
+            Some(c.as_str())
+        } else {
+            fallback.as_deref()
+        };
+    let Some(content) = content else {
+        return Vec::new();
+    };
+    let path = args
+        .get("path")
+        .or_else(|| args.get("file_path"))
+        .and_then(|p| p.as_str())
+        .unwrap_or("");
+    crate::app::markdown::highlight_by_path(path, content)
+        .unwrap_or_else(|| text_lines(content))
 }
 
 /// bash：命令输出（structuredContent.output 优先）。exit 状态行在**末尾**
@@ -697,16 +715,28 @@ fn line_diff(old: &str, new: &str) -> Vec<Line<'static>> {
     out
 }
 
-/// write：优先 args.content 预览（写入内容），退回结果文本。
+/// write：优先 args.content 预览（写入内容），退回结果文本；按扩展名
+/// 语法高亮（add-tool-card-syntax-highlighting design D4——与 read 同
+/// 入口，path/filePath 双键；None 走现状纯文本逐字节等价）。
 fn write_body(args: &Value, tool: &ToolExecution) -> Vec<Line<'static>> {
-    if let Some(content) = args.get("content").and_then(|c| c.as_str())
-        && !content.is_empty()
+    // owned 兑底：result_text 的 String 需活过借用。
+    let fallback = result_text(tool);
+    let content: Option<&str> = if let Some(c) = args.get("content").and_then(|c| c.as_str())
+        && !c.is_empty()
     {
-        return text_lines(content.trim_end());
-    }
-    result_text(tool)
-        .map(|t| text_lines(&t))
-        .unwrap_or_default()
+        Some(c.trim_end())
+    } else {
+        fallback.as_deref()
+    };
+    let Some(content) = content else {
+        return Vec::new();
+    };
+    let path = args
+        .get("path")
+        .or_else(|| args.get("filePath"))
+        .and_then(|p| p.as_str())
+        .unwrap_or("");
+    crate::app::markdown::highlight_by_path(path, content).unwrap_or_else(|| text_lines(content))
 }
 
 /// grep/find/ls 共用：结果文本行 + details 截断提示。
@@ -804,6 +834,20 @@ mod tests {
             .join("\n")
     }
 
+    /// 行文本（拼接 span）——定位高亮行用（syntect 会把词拆成多 span）。
+    fn line_text(l: &Line<'static>) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect::<Vec<_>>().join("")
+    }
+
+    /// 行内首个带前景色 span 的 fg（None = 该行无着色）。
+    fn body_fg_of(lines: &[Line<'static>], needle: &str) -> Option<Color> {
+        lines
+            .iter()
+            .find(|l| line_text(l).contains(needle))
+            .and_then(|l| l.spans.iter().find(|s| s.style.fg.is_some()).map(|s| s.style.fg))
+            .flatten()
+    }
+
     /// format_tool_duration 三档边界（spec：4.2s / 1m 30s / 2h 3m 4s）。
     #[test]
     fn format_tool_duration_three_tiers() {
@@ -890,6 +934,115 @@ mod tests {
             .find(|s| s.content.as_ref().contains("error"))
             .unwrap();
         assert_eq!(status_span.style.fg, Some(Color::Red));
+    }
+
+    /// 任务 1.2：未知扩展降级逐字节等价（add-tool-card-syntax-highlighting
+    /// design D1）——None 分支必须走现状纯文本路径：行文本与原文一致、
+    /// 原始 tab 保留（高亮链会把 tab 展开为 4 空格——保留即证明未走高亮
+    /// 链）、body span 无任何着色；为 2.1 的 None 回退钉住基线。
+    /// 任务 2.1：read 卡按扩展名高亮（add-tool-card-syntax-highlighting
+    /// design D2/D3）——折叠（前 10 行 + 提示行）与展开全文均有着色、
+    /// 同 token 两态 fg 一致；高亮 span 不携带 bg（面板底色保留前提）；
+    /// 提示行/行数不变（A 案：先高亮全文、collapse 再切，pi 同序）。
+    #[test]
+    fn read_card_highlights_collapsed_and_expanded_with_panel_bg() {
+        // 12 行 > 折叠上限 10 → 折叠态必现提示行
+        let content = concat!(
+            "import os\n",
+            "def main():\n",
+            "    print(\"hi\")\n",
+            "    if True:\n",
+            "        pass\n",
+            "# a comment\n",
+            "s = \"string here\"\n",
+            "for i in range(3):\n",
+            "    print(i)\n",
+            "x = os.getcwd()\n",
+            "end_one\n",
+            "end_two\n",
+        );
+        let tool = ToolExecution {
+            status: ToolStatus::Ended,
+            is_error: false,
+            result: Some(serde_json::json!({"content":[{"type":"text","text": content}]})),
+            duration_ms: Some(1),
+            ..Default::default()
+        };
+        let args = r#"{"path":"/tmp/demo.py"}"#;
+        let collapsed = tool_lines("read", args, &tool, false);
+        let expanded = tool_lines("read", args, &tool, true);
+
+        // 折叠：提示行保留（行数与折叠行为不变——A 案结构保证）
+        let collapsed_text = render(&collapsed);
+        assert!(
+            collapsed_text.contains("ctrl+o to expand"),
+            "提示行保留: {collapsed_text}"
+        );
+
+        // 正文行（以 import os 定位，避开头部样式行）两态均有前景色
+        // 按行文本定位（syntect 会把 "import os" 拆成多 span，单 span 不含整串）
+        let line_text = |l: &Line<'static>| -> String {
+            l.spans.iter().map(|s| s.content.as_ref()).collect::<Vec<_>>().join("")
+        };
+        let body_fg = |lines: &Vec<Line<'static>>| {
+            lines
+                .iter()
+                .find(|l| line_text(l).contains("import os"))
+                .and_then(|l| l.spans.iter().find(|s| s.style.fg.is_some()).map(|s| s.style.fg))
+                .flatten()
+        };
+        let cf = body_fg(&collapsed).expect("折叠正文应有着色");
+        let ef = body_fg(&expanded).expect("展开正文应有着色");
+        assert_eq!(cf, ef, "折叠/展开同 token 同色（着色一致）");
+
+        // 高亮 span 一律无 bg（叠加在 chat 层面板底色上不冲掉，design D3）
+        for lines in [&collapsed, &expanded] {
+            assert!(
+                lines
+                    .iter()
+                    .all(|l| l.spans.iter().all(|s| s.style.bg.is_none())),
+                "高亮 span 不携带 bg"
+            );
+        }
+
+        // 展开态无提示行（全文可见）
+        assert!(
+            !render(&expanded).contains("ctrl+o to expand"),
+            "展开无提示行"
+        );
+    }
+
+    #[test]
+    fn unknown_extension_falls_back_byte_identical() {
+        let content = "plain line one\n\ttabbed line\nlast line";
+        let tool = ToolExecution {
+            status: ToolStatus::Ended,
+            is_error: false,
+            result: Some(serde_json::json!({"content":[{"type":"text","text": content}]})),
+            duration_ms: Some(1),
+            ..Default::default()
+        };
+        let args = r#"{"path":"/tmp/x.xyzzy"}"#;
+        let lines = tool_lines("read", args, &tool, true);
+        let text = render(&lines);
+
+        // 行文本与原文逐行一致（含原始 tab）
+        assert!(text.contains("plain line one"), "{text}");
+        assert!(text.contains("\ttabbed line"), "原始 tab 保留: {text:?}");
+        assert!(text.contains("last line"), "{text}");
+
+        // body span 无着色（现状纯文本 = 降级路径）
+        let body_line = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.as_ref().contains("plain line one")))
+            .expect("正文行存在");
+        assert!(
+            body_line
+                .spans
+                .iter()
+                .all(|s| s.style.fg.is_none() && s.style.bg.is_none()),
+            "降级行无任何着色"
+        );
     }
 
     #[test]
@@ -1020,6 +1173,53 @@ mod tests {
         let text = render(&lines);
         assert!(text.contains("bash"));
         assert!(text.contains("running"));
+    }
+
+    /// 任务 2.2：write 卡按扩展名高亮（add-tool-card-syntax-highlighting
+    /// design D4）——path/filePath 双键均着色；未知扩展降级与现状一致
+    /// （纯文本无色）；高亮 span 不携带 bg。edit 卡 diff 行红绿青回归由
+    /// 既有 edit_card_from_fixture_shows_colored_diff 保持绿。
+    #[test]
+    fn write_card_highlights_by_extension() {
+        let rs = "fn main() {\n    println!(\"hi\");\n}\n";
+        let content_json = serde_json::to_string(rs).unwrap();
+        let tool = ToolExecution {
+            status: ToolStatus::Ended,
+            is_error: false,
+            result: Some(serde_json::json!({"content":[{"type":"text","text":"wrote ok"}]})),
+            duration_ms: Some(1),
+            ..Default::default()
+        };
+
+        // path 键：.rs 内容着色
+        let args = format!(r#"{{"path":"/tmp/demo.rs","content":{content_json}}}"#);
+        let lines = tool_lines("write", &args, &tool, true);
+        assert!(
+            body_fg_of(&lines, "fn main()").is_some(),
+            ".rs write 内容应着色: {}",
+            render(&lines)
+        );
+        assert!(
+            lines.iter().all(|l| l.spans.iter().all(|s| s.style.bg.is_none())),
+            "高亮 span 不携带 bg"
+        );
+
+        // filePath 键（与 head 同约定的 camel 变体）：同样着色
+        let args2 = format!(r#"{{"filePath":"/tmp/other.rs","content":{content_json}}}"#);
+        let lines2 = tool_lines("write", &args2, &tool, true);
+        assert!(
+            body_fg_of(&lines2, "fn main()").is_some(),
+            "filePath 键同样着色"
+        );
+
+        // 未知扩展：降级纯文本（行文本保留、无色——与现状一致）
+        let args3 = format!(r#"{{"path":"/tmp/x.xyzzy","content":{content_json}}}"#);
+        let lines3 = tool_lines("write", &args3, &tool, true);
+        assert!(render(&lines3).contains("fn main()"), "降级行文本保留");
+        assert!(
+            body_fg_of(&lines3, "fn main()").is_none(),
+            "降级无色（与现状一致）"
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ mod event;
 mod markdown;
 mod overlay;
 pub mod scroll; // 宿主（GUI）引 ALT_WHEEL_MULTIPLIER — terminal-pointer-and-scroll-input D1
+mod selection;
 mod sessions;
 mod settings_io;
 mod tree;
@@ -34,6 +35,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use pi_shell_rs::rpc::{CommandSender, ResponsePolicy, RpcClient};
 use pi_shell_rs::session::{Phase, SessionState};
 use ratatui::style::Color;
+use ratatui::text::Line;
 use std::collections::{HashMap, VecDeque};
 
 use crate::app::editor::EditorBuffer;
@@ -44,6 +46,10 @@ use crate::app::terminal::{TerminalGuard, TerminalSinks};
 /// 消息区滚动状态（design D1；view/wrap/App 共用）。
 pub use crate::app::scroll::ChatScroll;
 use crate::app::scroll::{prompt_jump_target, scrollbar_should_hide, ScrollbarDrag};
+use crate::app::selection::{
+    click_granularity, line_display_width, line_text, selection_exclusive_bounds,
+    slice_line_cols, word_range_at, LastClick, SelectionGranularity, SelectionState,
+};
 
 /// 按键意图（`key_intent` 的纯映射产物，便于单测）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +149,14 @@ pub struct App {
     scrollbar_drag: Option<ScrollbarDrag>,
     /// 消息区上帧布局（滚动条列命中判定用，design D5；同 card_hits 模式）。
     chat_area: ratatui::layout::Rect,
+    /// 进行中的鼠标选区（design D1；None=无。释放后保留显示，pi 同）。
+    selection: Option<SelectionState>,
+    /// 本次按下是否由背景起选（释放时才完成选区——pi pressActive 同义）。
+    selection_press_active: bool,
+    /// 连击记录（比选区寿命长——纯点击清选区后仍需计数，design D5）。
+    selection_last_click: Option<LastClick>,
+    /// 选区文档缓存（词/行粒度与提取共用；随选区清除，design D2）。
+    selection_doc: Option<(Vec<Line<'static>>, usize)>,
     /// 可点击内容（工具卡/thinking）绝对屏行命中表（上一帧渲染反馈，
     /// design D1/D2；点击分发用）。
     card_hits: Vec<wrap::Hit>,
@@ -226,6 +240,10 @@ impl App {
             scrollbar_hovered: false,
             scrollbar_drag: None,
             chat_area: ratatui::layout::Rect::default(),
+            selection: None,
+            selection_press_active: false,
+            selection_last_click: None,
+            selection_doc: None,
             card_hits: Vec::new(),
             editor: EditorBuffer::new(),
             notice: None,
@@ -400,8 +418,7 @@ impl App {
                     }
                     Ok(UiEvent::Click { x, y }) => {
                         self.log_event("key", &format!("click at {x},{y}"));
-                        // 滚动条列按下被消费（design D5）；否则既有点击。
-                        if self.handle_scrollbar_press(x, y) || self.handle_click(y) {
+                        if self.handle_pointer_down(x, y) {
                             need_draw = true;
                         }
                     }
@@ -529,6 +546,10 @@ impl App {
                         }
                         // 滚动条瞬态判隐（单沿：仅真实隐藏才重绘，design D3）。
                         if self.tick_scrollbar(std::time::Instant::now()) {
+                            need_draw = true;
+                        }
+                        // 选区边缘自动滚动（add-select-to-copy design D5）。
+                        if self.tick_selection_autoscroll() {
                             need_draw = true;
                         }
                     }
@@ -695,11 +716,15 @@ impl App {
     ///
     /// 输入: x/y — 0-based 屏幕坐标（x 不参与——scrub 只看行）
     /// 输出: true = top 变化（需重绘）；浮层/未起拖 → false
-    fn handle_pointer_drag(&mut self, _x: u16, y: u16) -> bool {
-        if self.overlay.is_some() || self.scrollbar_drag.is_none() {
+    fn handle_pointer_drag(&mut self, x: u16, y: u16) -> bool {
+        if self.overlay.is_some() {
             return false;
         }
-        self.scrollbar_scrub_to(y)
+        if self.scrollbar_drag.is_some() {
+            return self.scrollbar_scrub_to(y);
+        }
+        // 选区拖拽扩展（add-select-to-copy design D4/D5）；无选区 → false。
+        self.extend_selection(x, y)
     }
 
     /// 左键抬起：结束拖拽并刷新计时（design D5）；无拖拽 → false。
@@ -707,12 +732,274 @@ impl App {
     /// 输入: 无
     /// 输出: 恒 false（画面不变不重绘；状态清理供后续 Move 维护悬停）
     fn handle_pointer_up(&mut self) -> bool {
-        if self.scrollbar_drag.is_none() {
+        if self.scrollbar_drag.is_some() {
+            self.scrollbar_drag = None;
+            self.scrollbar_activity = Some(std::time::Instant::now());
+        }
+        // 选区完成（add-select-to-copy design D6）：仅本次按下起过选才走
+        // （pi pressActive 同义——否则滚动条/组件抬起会误复制旧选区）。
+        if !self.selection_press_active {
             return false;
         }
-        self.scrollbar_drag = None;
-        self.scrollbar_activity = Some(std::time::Instant::now());
-        false
+        self.selection_press_active = false;
+        if let Some(sel) = self.selection.as_mut() {
+            sel.auto_scroll = 0; // 停边缘自动滚
+        }
+        let bounds = self.selection.as_ref().and_then(selection_exclusive_bounds);
+        let Some((start, end)) = bounds else {
+            return false; // 空选区（纯点击）：无复制无提示
+        };
+        let Some(text) = self.extract_selection_text(start, end) else {
+            return false;
+        };
+        self.emit_clipboard(&text);
+        self.notice = Some(("Copied!".into(), Color::Green));
+        self.log_event("key", "selection copied");
+        true
+    }
+
+    /// 清除选区与文档缓存（组件按下/会话重建等，design D7）。
+    ///
+    /// 输入: 无
+    /// 输出: true = 原本有选区（需重绘去高亮）
+    fn clear_selection(&mut self) -> bool {
+        self.selection_doc = None;
+        self.selection.take().is_some()
+    }
+
+    /// 重建/复用选区文档（词/行粒度与提取用，design D2）：记录长度 =
+    /// 实际行数，与上帧 content_len 相等才复用（append-only 同长即同文；
+    /// 会话重建先清选区 → 缓存随之失效）。
+    ///
+    /// 输入: 无（读 state/flags/chat_area/content_len）
+    /// 输出: 副作用为刷新 self.selection_doc（首帧前区域为空则不动）
+    fn refresh_selection_doc(&mut self) {
+        if self.chat_area.width == 0 || self.chat_area.height == 0 {
+            return;
+        }
+        let current = self.scroll.content_len;
+        if current == 0 {
+            return;
+        }
+        if self
+            .selection_doc
+            .as_ref()
+            .is_some_and(|(lines, _)| lines.len() == current)
+        {
+            return;
+        }
+        let flags = crate::app::chat::RenderFlags {
+            show_thinking: self.show_thinking,
+            expand_tools: self.expand_tools,
+        };
+        let (lines, meta) = crate::app::chat::chat_lines(
+            &self.state,
+            flags,
+            &self.user_tool_expanded,
+            &self.thinking_overrides,
+        );
+        // 全文窗口：height = content_len → 窗口即全文（行号 = 绝对行）。
+        let height = current.min(u16::MAX as usize) as u16;
+        let (wrapped, _, _) = crate::app::wrap::wrap_for_viewport(
+            &lines,
+            self.chat_area.width,
+            height.max(1),
+            &ChatScroll::default(),
+            &meta,
+            None,
+        );
+        let len = wrapped.len();
+        self.selection_doc = Some((wrapped, len));
+    }
+
+    /// 起选（背景按下，design D4）：行界判定 → 连击词计算（仅上一击新鲜
+    /// 时才算行文本，省全文重算）→ 粒度/初选 → 覆盖旧选区。
+    ///
+    /// 输入: x/y — 0-based 屏幕坐标
+    /// 输出: true = 有视觉变化（新选区非空或旧高亮被清）需重绘；行界外 → false
+    fn start_selection(&mut self, x: u16, y: u16) -> bool {
+        if self.chat_area.width == 0
+            || y < self.chat_area.y
+            || y >= self.chat_area.y.saturating_add(self.chat_area.height)
+        {
+            return false;
+        }
+        let had_visual = self
+            .selection
+            .as_ref()
+            .is_some_and(|s| selection_exclusive_bounds(s).is_some());
+        let row = self.scroll.top + (y - self.chat_area.y) as usize;
+        let col = x
+            .saturating_sub(self.chat_area.x)
+            .min(self.chat_area.width.saturating_sub(1));
+        let now = std::time::Instant::now();
+        // 连击词每次按下都算（pi getWordSelection 无条件调用——lastClick
+        // 的记录依赖 word，首击不算会断连击链，apply 期实测教训；文档有
+        // 缓存，命中时仅长度比较，design D5）
+        self.refresh_selection_doc();
+        let (mut word, mut line_w) = (None, None);
+        if let Some(line) = self.selection_doc.as_ref().and_then(|(ls, _)| ls.get(row)) {
+            word = word_range_at(&line_text(line), col);
+            line_w = Some(line_display_width(line));
+        }
+        let (granularity, new_last) =
+            click_granularity(self.selection_last_click.as_ref(), row, word, now);
+        self.selection_last_click = new_last;
+        let (anchor, focus, initial) = match granularity {
+            SelectionGranularity::Word => {
+                let w = word.unwrap_or((col, col));
+                ((row, w.0), (row, w.1), Some(((row, w.0), (row, w.1))))
+            }
+            SelectionGranularity::Line => {
+                let w = line_w.unwrap_or(col);
+                ((row, 0), (row, w), Some(((row, 0), (row, w))))
+            }
+            SelectionGranularity::Character => ((row, col), (row, col), None),
+        };
+        let mut sel = SelectionState::new(anchor, (x, y));
+        sel.granularity = granularity;
+        sel.initial_range = initial;
+        sel.focus = focus;
+        let now_visual =
+            selection_exclusive_bounds(&sel).is_some();
+        self.selection = Some(sel);
+        self.selection_press_active = true;
+        now_visual || had_visual
+    }
+
+    /// 拖拽扩展焦点（design D5）：Character 逐点；Word/Line 按初选枢轴
+    /// 延展（pi updateSelectionFocus 同式：越出初选则锚/焦互换）；记录
+    /// 指针与边缘方向（原始 y 判缘，指针越界 clamp 进消息区，pi 同）。
+    ///
+    /// 输入: x/y — 0-based 屏幕坐标
+    /// 输出: true = 选区变化（需重绘）；无选区/词行无目标 → false
+    fn extend_selection(&mut self, x: u16, y: u16) -> bool {
+        if self.selection.is_none() || self.chat_area.width == 0 {
+            return false;
+        }
+        let cy = y.clamp(
+            self.chat_area.y,
+            self.chat_area
+                .y
+                .saturating_add(self.chat_area.height.saturating_sub(1)),
+        );
+        let cx = x.clamp(
+            self.chat_area.x,
+            self.chat_area
+                .x
+                .saturating_add(self.chat_area.width.saturating_sub(1)),
+        );
+        let row = self.scroll.top + (cy - self.chat_area.y) as usize;
+        let col = cx - self.chat_area.x;
+        let granularity = self.selection.as_ref().unwrap().granularity;
+        // Word/Line 需行文本：先刷文档（&mut 先于选区借用，避冲突）
+        let mut range: Option<(u16, u16)> = None;
+        if granularity != SelectionGranularity::Character {
+            self.refresh_selection_doc();
+            if let Some(line) = self.selection_doc.as_ref().and_then(|(ls, _)| ls.get(row)) {
+                range = match granularity {
+                    SelectionGranularity::Word => word_range_at(&line_text(line), col),
+                    _ => Some((0, line_display_width(line))),
+                };
+            }
+        }
+        let sel = self.selection.as_mut().unwrap();
+        sel.dragged = true;
+        sel.pointer = (x, y);
+        self.selection_last_click = None; // 拖动打断连击链
+        sel.auto_scroll = if y <= self.chat_area.y {
+            -1
+        } else if y >= self.chat_area.y + self.chat_area.height.saturating_sub(1) {
+            1
+        } else {
+            0
+        };
+        match granularity {
+            SelectionGranularity::Character => {
+                sel.focus = (row, col);
+                true // 拖拽事件频率有限，恒重绘（无洪水风险）
+            }
+            _ => {
+                let (Some(range), Some(initial)) = (range, sel.initial_range) else {
+                    return false; // pi：无词/无初选 → 不更新
+                };
+                let range_start = (row, range.0);
+                let (na, nf) = if range_start < initial.0 {
+                    (initial.1, range_start)
+                } else {
+                    (initial.0, (row, range.1))
+                };
+                let changed = sel.anchor != na || sel.focus != nf;
+                sel.anchor = na;
+                sel.focus = nf;
+                changed
+            }
+        }
+    }
+
+    /// 提取选区文本（design D2：复制时按现状签名重算全文管线 → 行切 →
+    /// 列切 → 行尾去空白 → join；ANSI/样式天然剥离——走文本不走屏）。
+    ///
+    /// 输入: start/end — exclusive 边界（selection_exclusive_bounds 产物）
+    /// 输出: Some(选中文本)；文档缺失/行越界/空 → None
+    fn extract_selection_text(
+        &mut self,
+        start: (usize, u16),
+        end: (usize, u16),
+    ) -> Option<String> {
+        self.refresh_selection_doc();
+        let (doc, _) = self.selection_doc.as_ref()?;
+        if start.0 >= doc.len() {
+            return None;
+        }
+        let last_row = end.0.min(doc.len() - 1);
+        let mut out: Vec<String> = Vec::new();
+        for (i, line) in doc[start.0..=last_row].iter().enumerate() {
+            let row = start.0 + i;
+            let s = if row == start.0 { start.1 } else { 0 };
+            let e = if row == last_row {
+                end.1
+            } else {
+                line_display_width(line)
+            };
+            out.push(slice_line_cols(line, s, e).trim_end().to_string());
+        }
+        let joined = out.join("\n");
+        if joined.is_empty() {
+            None
+        } else {
+            Some(joined)
+        }
+    }
+
+    /// 边缘自动滚动 tick（design D5；事件循环 200ms 超时支调用）：方向
+    /// 非 0 时每拍滚 1 行并按新视口重算焦点（复用 extend——指针未动、
+    /// 内容移动 → 焦点跟随指针下的内容）；已到顶/底不动不重绘。
+    ///
+    /// 输入: 无
+    /// 输出: true = 发生滚动（需重绘）
+    fn tick_selection_autoscroll(&mut self) -> bool {
+        let Some((dir, px, py)) = self
+            .selection
+            .as_ref()
+            .map(|s| (s.auto_scroll, s.pointer.0, s.pointer.1))
+        else {
+            return false;
+        };
+        if dir == 0 {
+            return false;
+        }
+        let top_before = self.scroll.top;
+        if dir < 0 {
+            self.scroll.scroll_up_lines(1);
+        } else {
+            self.scroll.scroll_down_lines(1);
+        }
+        if self.scroll.top == top_before {
+            return false;
+        }
+        self.mark_scroll_activity(); // 滚动移动 → 滚动条点亮（既有规则）
+        self.extend_selection(px, py)
     }
 
     /// scrub 核心（design D5，复刻 pi scrollScrollbarToPointer）：指针行 →
@@ -743,6 +1030,29 @@ impl App {
         self.scroll.set_top_abs(new_top);
         self.mark_scroll_activity(); // 拖动也是滚动移动（点亮/计时）
         true
+    }
+
+    /// 左键按下分发（add-select-to-copy design D4/D8）：滚动条列先被
+    /// 消费；浮层早退；组件行（Tool/Thinking）走既有点击并清选区；
+    /// 背景（MessageStart/普通行/行界外）落起选（行界外由 start 拒绝）。
+    ///
+    /// 输入: x/y — 0-based 屏幕坐标
+    /// 输出: true = 状态变化（点击生效/起选有视觉/清区）需重绘
+    fn handle_pointer_down(&mut self, x: u16, y: u16) -> bool {
+        if self.handle_scrollbar_press(x, y) {
+            return true;
+        }
+        if self.overlay.is_some() {
+            return false;
+        }
+        match self.hit_at(y) {
+            Some(wrap::HitKind::Tool(_)) | Some(wrap::HitKind::Thinking(_)) => {
+                let clicked = self.handle_click(y);
+                let cleared = self.clear_selection();
+                clicked || cleared
+            }
+            _ => self.start_selection(x, y),
+        }
     }
 
     /// 左键点击分发：行号 → 命中对象 → 按域翻转覆盖（design D4）。
@@ -3432,6 +3742,9 @@ impl App {
                 // 工具 id）；load_messages 又是 transcript 唯一整体重写点，
                 // 在此单点清表防旧覆盖错块（design D6）。
                 self.thinking_overrides.clear();
+                // 选区坐标指向被替换的 transcript（add-select-to-copy
+                // design D7，pi #9311 同理）。
+                self.clear_selection();
             }
             AsyncKind::SessionSwitched => {
                 let cmd = data
@@ -3671,7 +3984,19 @@ impl App {
             Vec::<wrap::Hit>::new(),
             ratatui::layout::Rect::default(),
         ));
-        terminal.draw(|frame| fb.set(view::render(frame, &self.state, &ui)))?;
+        let paint_sel = self
+            .selection
+            .as_ref()
+            .and_then(selection_exclusive_bounds)
+            .map(|(s, e)| (s, e, self.scroll.top, self.chat_area));
+        terminal.draw(|frame| {
+            fb.set(view::render(frame, &self.state, &ui));
+            // 选区反视频（add-select-to-copy design D3：paint 后 buffer
+            // 后处理——pi ANSI [7m 等价，样式保留仅 fg/bg 互换）。
+            if let Some((s, e, top, area)) = paint_sel {
+                view::paint_selection(frame.buffer_mut(), s, e, top, area);
+            }
+        })?;
         let (scroll, hits, chat_area) = fb.take();
         self.scroll = scroll;
         self.card_hits = hits;
@@ -3795,6 +4120,345 @@ mod input_tests {
         app.apply_intent(ctrl_t, intent);
         assert!(!app.show_thinking);
         assert!(app.thinking_overrides.is_empty());
+    }
+
+    /// 选区测试用会话：1 行用户 + 20 行 assistant（含一行中文）。
+    fn selection_test_state() -> SessionState {
+        let mut s = SessionState::new();
+        s.handle(&serde_json::json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"question"}]}}));
+        s.handle(&serde_json::json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+        let mut body = String::new();
+        for i in 1..=18 {
+            body.push_str(&format!("line{i:02}\n"));
+        }
+        body.push_str("中文测试行\n");
+        body.push_str("last line");
+        s.handle(&serde_json::json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text": body}]}}));
+        s
+    }
+
+    /// 选区测试用 App（区域/视口就位；content_len 故意≠doc 长 → 每次重建，
+    /// 不依赖渲染帧）。
+    fn selection_test_app() -> App {
+        let mut app = App::new();
+        app.state = selection_test_state();
+        app.chat_area = ratatui::layout::Rect::new(0, 1, 40, 20);
+        app.scroll.viewport = 20;
+        app.scroll.top = 0;
+        app.scroll.content_len = 9999;
+        app
+    }
+
+    /// 任务 2.1：按下路由优先级（add-select-to-copy design D4/D8）——
+    /// 浮层早退 / 组件点击+清区 / 滚动条消费 / 背景起选 / 行界外拒绝。
+    #[test]
+    fn click_routing_priority_and_selection_start() {
+        let mut app = selection_test_app();
+
+        // ① 浮层：按下被忽略（不开始选区）
+        app.overlay = Some(Overlay::Tree {
+            tree: Vec::new(),
+            leaf_id: None,
+            rows: Vec::new(),
+            cursor: 0,
+            folded: std::collections::HashSet::new(),
+            filter: crate::app::tree::FilterMode::Default,
+            search: String::new(),
+            loading: true,
+            seq: 0,
+        });
+        assert!(!app.handle_pointer_down(5, 3), "浮层下按下无动作");
+        assert!(app.selection.is_none(), "浮层下不起选");
+        app.overlay = None;
+
+        // ② 背景按下 → 起选（Character 空界：状态建立、无视觉）
+        assert!(!app.handle_pointer_down(5, 3), "空界无视觉变化");
+        assert!(app.selection.is_some(), "背景起选");
+        assert!(app.selection_press_active, "按压活跃");
+        assert!(app.handle_pointer_drag(12, 9), "拖出非空");
+        let _ = app.handle_pointer_up(); // 抬起复位（非空则完成复制）
+        assert!(!app.selection_press_active, "抬起复位按压");
+
+        // ③ 组件行（Tool 命中 y=3 → row2）→ 既有点击 + 清选区
+        app.card_hits = vec![wrap::Hit {
+            start: 2,
+            end: 5,
+            kind: wrap::HitKind::Tool("c1".into()),
+        }];
+        assert!(app.handle_pointer_down(3, 3), "组件点击需重绘");
+        assert_eq!(app.user_tool_expanded.get("c1"), Some(&true), "组件语义生效");
+        assert!(app.selection.is_none(), "组件按下清选区");
+
+        // ④ 滚动条列（x=39；content>viewport 几何存在）→ 消费，选区不动
+        let _ = app.handle_pointer_down(5, 6);
+        assert!(app.handle_pointer_drag(10, 8), "重建非空选区");
+        let sel_before = app.selection.clone();
+        assert!(app.handle_pointer_down(39, 5), "滚动条按下被消费");
+        assert_eq!(app.selection, sel_before, "滚动条按下不动选区");
+        assert_ne!(app.scroll.top, 0, "点轨道跳转生效（design D5）");
+        app.scrollbar_drag = None; // 收尾（真实流中 Up 会清）
+        app.scroll.top = 0;        // 归位供后续断言
+
+        // ⑤ MessageStart 命中 → 起选（覆盖旧选区）
+        app.card_hits = vec![wrap::Hit {
+            start: 0,
+            end: 1,
+            kind: wrap::HitKind::MessageStart(0),
+        }];
+        let _ = app.handle_pointer_down(1, 1);
+        let sel = app.selection.as_ref().expect("MessageStart 起选");
+        assert_eq!(sel.granularity, SelectionGranularity::Character);
+        assert_eq!(sel.anchor.0, 0, "绝对行0 起选");
+
+        // ⑥ 行界外（编辑器区 y=38）→ 不动
+        let snap = app.selection.clone();
+        assert!(!app.handle_pointer_down(5, 38), "行界外无动作");
+        assert_eq!(app.selection, snap, "行界外不改选区");
+    }
+
+    /// 任务 2.2：焦点扩展三粒度 + 抬起规则 + 会话重建清区
+    /// （add-select-to-copy design D5/D7）。
+    #[test]
+    fn drag_extends_by_granularity_and_release_rules() {
+        // Character：逐点扩展（行 = top + (y − area.y)）
+        let mut app = selection_test_app();
+        assert!(!app.handle_pointer_down(5, 3)); // row2 col5
+        assert!(app.handle_pointer_drag(12, 9)); // row8 col12
+        let sel = app.selection.as_ref().unwrap();
+        assert_eq!(sel.anchor, (2, 5), "锚=按下点");
+        assert_eq!(sel.focus, (8, 12), "Character 焦点=指针");
+        assert!(sel.dragged);
+        assert_eq!(sel.auto_scroll, 0, "非边缘无方向");
+
+        // Word：初选枢轴延展（越出初选 → 锚/焦互换，pi updateSelectionFocus）
+        let mut word = SelectionState::new((5, 0), (0, 0));
+        word.granularity = SelectionGranularity::Word;
+        word.initial_range = Some(((5, 0), (5, 4)));
+        word.focus = (5, 4);
+        app.selection = Some(word);
+        assert!(app.handle_pointer_drag(3, 7)); // y=7 → row6（初选之后）
+        let sel = app.selection.as_ref().unwrap();
+        assert_eq!(sel.anchor, (5, 0), "后延：anchor=初选起点");
+        assert_eq!(sel.focus.0, 6, "focus 跟到行6");
+        assert!(sel.focus.1 > 0, "focus=该行词末: {:?}", sel.focus);
+        assert!(app.handle_pointer_drag(3, 5)); // y=5 → row4（初选之前）
+        let sel = app.selection.as_ref().unwrap();
+        assert_eq!(sel.anchor, (5, 4), "前延：anchor=初选末");
+        assert_eq!(sel.focus.0, 4, "focus 跟到行4");
+
+        // Line：整行延展（行宽 = line08 宽 6）
+        let mut line_sel = SelectionState::new((5, 0), (0, 0));
+        line_sel.granularity = SelectionGranularity::Line;
+        line_sel.initial_range = Some(((5, 0), (5, 6)));
+        line_sel.focus = (5, 6);
+        app.selection = Some(line_sel);
+        assert!(app.handle_pointer_drag(3, 9)); // y=9 → row8
+        let sel = app.selection.as_ref().unwrap();
+        assert_eq!(sel.focus.0, 8, "Line 焦点跟行");
+        assert_eq!(sel.focus.1, 6, "Line 焦点=行宽（line08）");
+
+        // 抬起规则 a：按压未活跃 → 不完成
+        app.selection_press_active = false;
+        let snap = app.selection.clone();
+        assert!(!app.handle_pointer_up(), "非按压抬起不完成");
+        assert_eq!(app.selection, snap);
+
+        // 抬起规则 b：纯点击（空界）→ 无复制无提示
+        let empty = SelectionState::new((7, 3), (0, 0));
+        app.selection = Some(empty);
+        app.selection_press_active = true;
+        app.notice = None;
+        assert!(!app.handle_pointer_up(), "空选区不复制");
+        assert!(app.notice.is_none(), "空选区无提示");
+
+        // c：会话重建 → 清选区与文档缓存（design D7，pi #9311 同理）
+        let mut app2 = selection_test_app();
+        let _ = app2.handle_pointer_down(5, 3);
+        let _ = app2.handle_pointer_drag(10, 6);
+        assert!(app2.selection.is_some());
+        app2.handle_async_data(
+            AsyncKind::Messages,
+            0,
+            &serde_json::json!({"messages": [
+                {"role": "user", "content": [{"type": "text", "text": "new"}]}
+            ]}),
+        );
+        assert!(app2.selection.is_none(), "重建清选区");
+        assert!(app2.selection_doc.is_none(), "文档缓存随之清");
+    }
+
+    /// 任务 3.1：边缘自动滚动 tick（add-select-to-copy design D5）——
+    /// 方向判定、每拍 1 行、焦点跟随指针下内容、到顶停止、点亮滚动条。
+    #[test]
+    fn edge_autoscroll_ticks_and_moves_focus() {
+        let mut app = selection_test_app();
+        app.scroll.top = 10;
+        let _ = app.handle_pointer_down(5, app.chat_area.y); // row10
+        assert!(app.handle_pointer_drag(5, app.chat_area.y)); // 上缘 → dir=-1
+        let sel = app.selection.as_ref().unwrap();
+        assert_eq!(sel.auto_scroll, -1, "上缘方向 -1");
+        assert_eq!(sel.focus.0, 10, "起选焦点=行10");
+
+        // tick：top 10→9，焦点跟随（指针下内容变为行9）
+        assert!(app.tick_selection_autoscroll(), "tick 应滚动");
+        assert_eq!(app.scroll.top, 9, "每拍 1 行");
+        let sel = app.selection.as_ref().unwrap();
+        assert_eq!(sel.focus.0, 9, "焦点跟随指针下内容");
+        assert!(app.scrollbar_visible, "滚动点亮滚动条");
+
+        // 到顶：不动不重绘
+        app.scroll.top = 0;
+        assert!(!app.tick_selection_autoscroll(), "到顶不动不重绘");
+        assert_eq!(app.scroll.top, 0);
+
+        // 方向 0 → 不动
+        app.scroll.top = 10;
+        app.selection.as_mut().unwrap().auto_scroll = 0;
+        assert!(!app.tick_selection_autoscroll(), "无方向不滚");
+
+        // 下缘方向 +1
+        app.selection.as_mut().unwrap().auto_scroll = 1;
+        let top_before = app.scroll.top;
+        assert!(app.tick_selection_autoscroll());
+        assert_eq!(app.scroll.top, top_before + 1, "下缘每拍 +1");
+    }
+
+    /// 任务 4.1：选区文本提取（add-select-to-copy design D2）——多行
+    /// join、中文宽字符列不劈、空 → None。
+    #[test]
+    fn extract_selection_text_multirow_and_wide_chars() {
+        let mut app = selection_test_app();
+        // 文档行：row0 question、row1..18 line01..line18、row19 中文、row20 last
+        // 跨行：row1 col2 → row3 col4（exclusive）
+        let text = app
+            .extract_selection_text((1, 2), (3, 4))
+            .expect("跨行提取");
+        let rows: Vec<&str> = text.split('\n').collect();
+        assert_eq!(rows.len(), 3, "三行: {text:?}");
+        assert_eq!(rows[0], "ne01", "首行从 col2 起");
+        assert_eq!(rows[1], "line02", "中间行全文");
+        assert_eq!(rows[2], "line", "末行到 col4 exclusive（l-i-n-e）");
+
+        // 中文行：起点落在字内 → 吸附整字（列1 在首字内 → s=0；e=4 恰为
+        // 字界 → 文入中出）
+        let text = app.extract_selection_text((19, 1), (19, 4)).expect("中文行");
+        assert_eq!(text, "中文", "宽字符整字不啩: {text:?}");
+
+        // 空区间 → None
+        assert!(
+            app.extract_selection_text((5, 3), (5, 3)).is_none(),
+            "空选区 None"
+        );
+    }
+
+    /// 任务 4.2：释放即复制（add-select-to-copy design D6）——sink 双通路
+    /// 收到选中文本、绿色 Copied!；空选区静默。
+    #[test]
+    fn release_copies_via_dual_path_and_notifies() {
+        use std::sync::{Arc, Mutex};
+        let mut app = selection_test_app();
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink_copy = captured.clone();
+        app.set_terminal_sinks(crate::app::terminal::TerminalSinks {
+            copy_text: Some(Box::new(move |t| sink_copy.lock().unwrap().push(t))),
+            ..Default::default()
+        });
+
+        // 起选 + 拖出非空 → 抬起 → 复制一次 + Copied!
+        let _ = app.handle_pointer_down(0, 3); // row2 col0
+        assert!(app.handle_pointer_drag(12, 9)); // row8 col12
+        assert!(app.handle_pointer_up(), "非空选区抬起 → 完成");
+        let copied = captured.lock().unwrap().clone();
+        assert_eq!(copied.len(), 1, "恰好复制一次: {copied:?}");
+        assert!(copied[0].starts_with("line02"), "首行: {:?}", copied[0]);
+        assert!(copied[0].ends_with("line08"), "末行: {:?}", copied[0]);
+        assert_eq!(copied[0].lines().count(), 7, "跨7行");
+        assert_eq!(
+            app.notice.as_ref().map(|(t, c)| (t.as_str(), *c)),
+            Some(("Copied!", Color::Green)),
+            "绿色提示"
+        );
+
+        // 空选区抬起：不新增复制、无提示
+        let empty = SelectionState::new((9, 2), (0, 0));
+        app.selection = Some(empty);
+        app.selection_press_active = true;
+        app.notice = None;
+        assert!(!app.handle_pointer_up(), "空选区不复制");
+        assert!(app.notice.is_none(), "空选区无提示");
+        assert_eq!(captured.lock().unwrap().len(), 1, "复制次数不变");
+    }
+
+    /// 任务 5.1：选区反视频（add-select-to-copy design D3）——范围内加
+    /// REVERSED 修饰（=[7m，default 色文本也可见）且 fg/bg 值不动、
+    /// 区外/范围外不动、scroll_top 换算生效、越界裁剪。
+    #[test]
+    fn selection_reverses_buffer_cells() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect as R;
+        use ratatui::style::Style;
+        let area = R::new(0, 1, 10, 5); // y1..6
+        let mut buf = Buffer::empty(R::new(0, 0, 10, 6));
+        // 预置：起始行格(2,3) 红底蓝字；中间行格(5,4) 绿字；末行内格(1,5) 青字；
+        // 末行范围外格(5,5) 品红/黑；范围前格(0,2) 黄字
+        buf[(2, 3)].set_style(Style::default().fg(Color::Red).bg(Color::Blue));
+        buf[(5, 4)].set_style(Style::default().fg(Color::Green));
+        buf[(1, 5)].set_style(Style::default().fg(Color::Cyan));
+        buf[(5, 5)].set_style(Style::default().fg(Color::Magenta).bg(Color::Black));
+        buf[(0, 2)].set_style(Style::default().fg(Color::Yellow));
+
+        // scroll_top=0：abs2→y3、abs3→y4、abs4→y5（exclusive 列4）
+        view::paint_selection(&mut buf, (2, 2), (4, 4), 0, area);
+
+        use ratatui::style::Modifier;
+        // 范围内：加 REVERSED、fg/bg 值不动（属性级反转 = [7m）
+        assert!(
+            buf[(2, 3)].style().has_modifier(Modifier::REVERSED),
+            "起始格加 REVERSED"
+        );
+        assert_eq!(buf[(2, 3)].fg, Color::Red, "fg 值不动");
+        assert_eq!(buf[(2, 3)].bg, Color::Blue, "bg 值不动");
+        // default 色格（值交换对 default 不可见的原 bug）→ 加修饰即可见
+        assert!(
+            buf[(3, 3)].style().has_modifier(Modifier::REVERSED),
+            "default 色格也加修饰"
+        );
+        assert_eq!(buf[(3, 3)].fg, Color::Reset, "default 格 fg 不动");
+        // 中间行格（c0=0..width 全行）
+        assert!(
+            buf[(5, 4)].style().has_modifier(Modifier::REVERSED),
+            "中间行在范围"
+        );
+        // 末行范围内格（col1 < exclusive 4）
+        assert!(
+            buf[(1, 5)].style().has_modifier(Modifier::REVERSED),
+            "末行内格"
+        );
+        // 末行范围外格（col5 ≥ exclusive 4）→ 无修饰、样式原样
+        assert!(
+            !buf[(5, 5)].style().has_modifier(Modifier::REVERSED),
+            "范围外不动"
+        );
+        assert_eq!(buf[(5, 5)].fg, Color::Magenta, "范围外样式原样");
+        // 范围前（abs2 之前的 abs 行）→ 无修饰
+        assert!(
+            !buf[(0, 2)].style().has_modifier(Modifier::REVERSED),
+            "范围前不动"
+        );
+        assert_eq!(buf[(0, 2)].fg, Color::Yellow, "范围前样式原样");
+
+        // scroll_top 换算：top=1 → abs2 映射 y=1+(2-1)=2
+        let mut buf2 = Buffer::empty(R::new(0, 0, 10, 6));
+        buf2[(2, 2)].set_style(Style::default().fg(Color::Red).bg(Color::Blue));
+        view::paint_selection(&mut buf2, (2, 2), (2, 3), 1, area);
+        assert!(
+            buf2[(2, 2)].style().has_modifier(Modifier::REVERSED),
+            "scroll_top 换算生效"
+        );
+        assert!(
+            !buf2[(2, 3)].style().has_modifier(Modifier::REVERSED),
+            "行末（exclusive 3）不动"
+        );
     }
 
     /// 任务 2.1：滚动/跳转键映射先于 Edit 族（add-prompt-jump design D4）。

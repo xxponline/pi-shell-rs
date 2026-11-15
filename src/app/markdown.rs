@@ -414,6 +414,25 @@ fn highlight_uncached(lang: &str, body: &str) -> Vec<Line<'static>> {
     out
 }
 
+/// 按文件扩展名做语法高亮（add-tool-card-syntax-highlighting design D1）。
+///
+/// 输入: path — 文件路径（取最后一段扩展名，大小写归一；无扩展名 →
+///       None）；body — 内容
+/// 输出: Some(高亮行)——复用 `highlight_cached` 链（tab 归一、哈希缓存、
+///       theme 单例全部继承；其 Style 转换仅取 fg、不携带主题 bg，
+///       design D3 保工具卡面板底色）；None = 扩展名缺失或无对应语法 →
+///       **调用方走现状纯文本路径**（降级逐字节等价，design D1——不在此
+///       处内部降级）
+pub(crate) fn highlight_by_path(path: &str, body: &str) -> Option<Vec<Line<'static>>> {
+    let ext = std::path::Path::new(path).extension()?.to_str()?.to_lowercase();
+    if ext.is_empty() {
+        return None;
+    }
+    // 语法存在性门控：miss → None（交调用方原路径，design D1）。
+    syntax_set().find_syntax_by_extension(&ext)?;
+    Some(highlight_cached(&ext, body))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,6 +450,44 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// 任务 1.1：按路径高亮入口（add-tool-card-syntax-highlighting
+    /// design D1/D3）——扩展名命中走缓存链且仅 fg（不携带 bg）、
+    /// tab 归一继承；无扩展名/未知扩展/空路径 → None（调用方走现状）。
+    #[test]
+    fn highlight_by_path_hits_extension_and_returns_none_for_unknown() {
+        let py = "def hello():\n    return 42\n";
+        let hit = highlight_by_path("/tmp/demo.py", py).expect(".py 应命中");
+        assert!(!hit.is_empty());
+        assert!(
+            hit.iter()
+                .flat_map(|l| l.spans.iter())
+                .any(|s| s.style.fg.is_some()),
+            "应有带前景色的 span"
+        );
+        assert!(
+            hit.iter().all(|l| l.spans.iter().all(|s| s.style.bg.is_none())),
+            "fg-only——不携带主题 bg（design D3，保工具卡面板底色）"
+        );
+        // 大小写归一：大写扩展名同样命中
+        assert!(highlight_by_path("/tmp/DEMO.PY", py).is_some(), "大写扩展名归一");
+        // tab 归一继承（与 markdown 代码块同链）
+        let tabs = highlight_by_path("/tmp/t.rs", "a\tb").expect(".rs 应命中");
+        assert!(
+            render(&tabs).contains("    "),
+            "tab 已展开为 4 空格: {:?}",
+            render(&tabs)
+        );
+
+        // None：未知扩展 / 无扩展名 / 空路径 / 点文件
+        assert!(highlight_by_path("/tmp/x.xyzzy", py).is_none(), "未知扩展 → None");
+        assert!(highlight_by_path("/tmp/Makefile", py).is_none(), "无扩展名 → None");
+        assert!(highlight_by_path("", py).is_none(), "空路径 → None");
+        assert!(
+            highlight_by_path("/tmp/.gitignore", py).is_none(),
+            "点文件无扩展名 → None"
+        );
     }
 
     /// 收集带某修饰符/颜色的 span 文本。

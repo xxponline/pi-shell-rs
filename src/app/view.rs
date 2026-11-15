@@ -152,6 +152,55 @@ pub fn render(
     (scroll, hits, chunks[1])
 }
 
+/// 反视频：对 buffer 中选区范围加 REVERSED 修饰（add-select-to-copy
+/// design D3——pi paint 后 ANSI `[7m` 等价：**属性级反转**——对 default
+/// 色文本同样可见（值交换对 default 无效）、其余样式保留；宽字符双格
+/// 一并处理）。
+///
+/// 输入: buffer — 整帧缓冲；start/end — exclusive 边界（绝对屏行, 显示列）；
+///       scroll_top — 上帧视口首行（绝对行 → 屏幕行换算）；area — 消息区
+/// 输出: 无返回值；副作用为范围内 cell 加 REVERSED（越界裁剪）
+pub fn paint_selection(
+    buffer: &mut ratatui::buffer::Buffer,
+    start: (usize, u16),
+    end: (usize, u16),
+    scroll_top: usize,
+    area: ratatui::layout::Rect,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let area_bottom = area.y.saturating_add(area.height);
+    for abs_row in start.0..=end.0 {
+        if abs_row < scroll_top {
+            continue;
+        }
+        let sy = area.y + (abs_row - scroll_top) as u16;
+        if sy >= area_bottom {
+            break;
+        }
+        let mut c0 = if abs_row == start.0 { start.1 } else { 0 };
+        let mut c1 = if abs_row == end.0 { end.1 } else { area.width };
+        c0 = c0.min(area.width);
+        c1 = c1.min(area.width);
+        // 宽字符边界吸附（与提取同一语义，pi getSelectionColumns 同式）：
+        // 起点落在续格（宽字后半）→ 回退到字格；终点 exclusive 落在续格 →
+        // 扩一格纳入整字——否则半字反色。
+        while c0 > 0 && buffer[(area.x + c0, sy)].symbol().is_empty() {
+            c0 -= 1;
+        }
+        if c1 < area.width && buffer[(area.x + c1, sy)].symbol().is_empty() {
+            c1 += 1;
+        }
+        for cx in c0..c1 {
+            let x = area.x + cx;
+            let cell = &mut buffer[(x, sy)];
+            // 属性级反转（= [7m）：fg/bg 值不动——default 色文本才可见
+            cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+        }
+    }
+}
+
 /// 构建队列带行：`[steer]`/`[queue]` 前缀，最多 2 行，超出显示 `…N more`。
 ///
 /// 输入: state — 含 steering_queue/follow_up_queue 的会话状态

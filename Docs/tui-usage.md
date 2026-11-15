@@ -103,6 +103,8 @@ label（条目名；`/` 菜单中 value==label 视觉不变）。
   （exit code 在末尾可见）、grep 15、find/ls 20、write 10（带总行数）、
   其余头部 10 行；截断时带 `... (N earlier/more lines, ctrl+o to expand)`
   提示。exit 状态行与截断警告不参与折叠，始终可见。
+- **语法高亮**：read/write 卡片的文件内容按扩展名着色（与聊天区代码块
+  同一主题）；未知扩展降级纯文本，折叠预览与展开态着色一致。
 - **截断警告**：带具体数字/路径——bash `[Full output: <path>]` + 行数/字节
   详情，grep/find/ls 各自 limit（`500 matches limit` 等），read 三形态
   （首行超限/行数/字节）。
@@ -169,7 +171,7 @@ label（条目名；`/` 菜单中 value==label 视觉不变）。
 | Ctrl+↑ / Ctrl+↓ | **跳到上/下一条消息起点**（用户与 assistant 条目；ctrl+shift+↑/↓ 同义）；到端点分别归顶 / 贴底恢复跟随；跳转同样点亮滚动条；补全菜单不消费该键、浮层打开时无效。**macOS 注意**：若 plain `ctrl+↑/↓` 被系统 Mission Control / App Exposé 抢占（终端收不到，pi 同样收不到），改用 **`ctrl+shift+↑/↓`**（pi 同款备用键，系统默认未占用） |
 | Ctrl+Home / Ctrl+End | 消息区绝对**顶 / 底**（底 = 贴底恢复跟随） |
 | Shift+PageUp / Shift+PageDown | **半页滚动**（页长一半、至少 1 行）；补全菜单打开时仍为菜单整页翻页 |
-| 鼠标左键点击 | **工具卡片 / thinking 块的单块展开/收起切换**（工具卡仅已有结果的卡、运行中卡点击无效；thinking 点击仅作用于被点块；点普通文本行无动作）；Ctrl+O / Ctrl+T 全局切换并**重置对应单块状态**（全部跟随新全局） |
+| 鼠标左键点击 | **消息区背景：拖拽选中文本**（双击选词含路径整体、三击选行、贴边自动滚动，释放即自动复制 + `Copied!`）；**组件行**（工具卡片 / thinking 块）：单块展开/收起切换（运行中卡点击无效；点普通文本行即起选）；Ctrl+O / Ctrl+T 全局切换并**重置对应单块状态**（全部跟随新全局）；滚动条列维持滚动条语义（不开始选区） |
 | /resume·/tree 内 ctrl+d | 会话两段式删除（再按一次确认；拒绝删除活跃会话） |
 | /tree 内 ctrl+o / ←→ | 过滤模式循环 / 折叠展开子树 |
 | /tree 内直接键入 | **即时搜索**：可打印字符入查询（空白分词、全部命中、大小写不敏感子串）；backspace 删字符；Esc 先清查询（面板保持）再按才关；标题区显示 `filter:… · search:"…" (n 命中)`，零命中黄字提示；搜索与过滤/折叠正交叠加 |
@@ -192,8 +194,10 @@ label（条目名；`/` 菜单中 value==label 视觉不变）。
   （降级为暗色原文/代码样式）；图片不显示（显示 `(image: url)` 提示）。
 - Windows 键位差异（pi 在 Windows 用 ctrl+q 等）未做平台分支——当前只按
   macOS 键位实现。
-- 开启鼠标捕获后**原生鼠标选择失效**：拖拽选中文本需按住 Shift 由终端透传
-  （pi 以自家 select-to-copy 解决，该能力属挂账）。
+- 鼠标选区已由应用自建落地（`add-select-to-copy`，pi select-to-copy
+  同款）：背景**拖拽选中文本**（双击选词、三击选行、贴视口边自动滚动），
+  **释放即自动复制**并提示绿色 `Copied!`；原先的 Shift 透传 workaround
+  不再需要。thinking/工具卡行与滚动条列按下仍走各自语义。
 - 工具卡片覆盖 read/bash/edit/write/grep/find/ls（其余走通用卡片兜底）。
 - **Alt+T 打开 thinking 列表**与 `/thinking` 斜杠命令**都可用**（两者等价，
   pi 原生只有后者）；级别循环 Shift+Tab 与 pi 一致。
