@@ -21,7 +21,9 @@ src/
 ## rpc：连接与收发
 
 - `Transport::spawn_rpc(binary, extra_args)`：启动 `pi --mode rpc`（`binary` 通常取
-  `rpc::resolve_binary()`，受 `PI_BIN` 覆盖），返回 `events` / `stderr` 两个通道与发送句柄。
+  `rpc::resolve_binary()`：`PI_BIN` 覆盖优先；Windows 上按 PATHEXT 语义在 PATH 上找
+  `pi.exe`/`pi.cmd`/`pi.bat`，找不到回退 `pi`；非 Windows 为 `PI_BIN` 或 `pi`），
+  返回 `events` / `stderr` 两个通道与发送句柄。
 - `RpcClient`：在 Transport 之上的会话化客户端。
   - `send_command(value, timeout, policy)`：自动分配 `id`，返回该命令的响应 `data`；
     无 `id` 的消息（agent_*/message_*/tool_execution_*/extension_ui_request 等）

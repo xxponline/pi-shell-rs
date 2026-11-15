@@ -20,6 +20,8 @@ cargo run                       # 默认运行 TUI（default-run）
 ```
 
 - `pi` 不在 PATH 时：`PI_BIN=/path/to/pi cargo run`
+  （Windows 会自动在 PATH 上按 `pi.exe` → `pi.cmd` → `pi.bat` 解析，
+  覆盖安装器放在 `~\.pi\agent\bin\` 的 `pi.cmd`；非 Windows 仍需 `pi` 在 PATH 上）
 - 启动流程：进入 TUI → 拉起 `pi --mode rpc` → `get_state` 探活（15s）→
   进入界面。任何一步失败都会**恢复终端**后打印可读原因并以非零码退出。
 
