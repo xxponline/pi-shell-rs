@@ -8,16 +8,18 @@
 
 ## 主要功能 / Features
 
-- 流式对话：消息、思考块（可折叠）、工具调用卡片、markdown 渲染与代码高亮
-- 完整键位语义：流式中 Enter 打断重定向、follow-up 排队、`!命令` 直接跑 bash 等
+- 流式对话：消息、思考块（可折叠、单块展开）、工具调用卡片（单块展开、read/write 按语言语法高亮）、markdown 渲染与代码高亮
+- 鼠标与滚动：消息区滚动条（悬停显隐 / 拖拽定位）、滚轮翻页、拖选文本 + 双击选词/三击选行 + 选中自动复制、点击工具卡/思考块展开
+- 完整键位语义：流式中 Enter 打断重定向、follow-up 排队、`!命令` 直接跑 bash、`ctrl+↑/↓` 提示跳转、`shift+PageUp/Dn` 半页等
 - 会话管理：`/resume` 会话列表、`/tree` 会话树（搜索 / 过滤 / 分支）、`/new` `/fork` `/clone` 等
-- 斜杠命令与补全菜单、`@文件` 补全、外部编辑器（Ctrl+G）、剪贴板（Ctrl+X / Ctrl+V）
+- 斜杠命令与补全菜单、`@文件` 补全、路径 Tab 补全、外部编辑器（Ctrl+G）、剪贴板（Ctrl+X / Ctrl+V、OSC52）
 - 模型 / thinking 级别切换，token 与费用显示
 
-- Streaming chat: messages, collapsible thinking blocks, tool-call cards, markdown rendering with syntax highlighting
-- Native keybinding semantics: Enter steers while streaming, follow-up queue, `!command` runs bash directly, and more
+- Streaming chat: messages, collapsible & per-block-expandable thinking, tool-call cards (expandable, read/write syntax-highlighted by language), markdown rendering with syntax highlighting
+- Mouse & scrolling: message scrollbar (hover / drag-to-scrub), wheel paging, drag-to-select with double-click word / triple-click line and copy-on-select, click tool cards / thinking blocks to expand
+- Native keybinding semantics: Enter steers while streaming, follow-up queue, `!command` runs bash directly, `ctrl+↑/↓` prompt jumps, `shift+PageUp/Dn` half-page, and more
 - Session management: `/resume` list, `/tree` (search / filter / branch), `/new` `/fork` `/clone`, etc.
-- Slash commands with a completion menu, `@file` completion, external editor (Ctrl+G), clipboard (Ctrl+X / Ctrl+V)
+- Slash commands with a completion menu, `@file` completion, path Tab completion, external editor (Ctrl+G), clipboard (Ctrl+X / Ctrl+V, OSC52)
 - Model / thinking-level switching, token & cost display
 
 ## 与原生 pi TUI 的差异 / What's different from native pi
@@ -35,8 +37,9 @@ Most everyday features match native pi. The items below are **deliberately unsup
 | 会话树内编辑消息标签（Shift+L） | ❌ 不做 | 标签只能经 pi 扩展 API 写入，RPC 没有这个入口；pi 自身的这颗键也是未接线的。<br>Labels can only be written via pi's extension API (no RPC entry), and even pi's own key for this is unwired. |
 | 扩展快捷键、扩展参数补全 | ❌ 不支持 | 需要 pi 内部的扩展运行时配合，RPC 不提供。<br>Needs pi's internal extension runtime; RPC doesn't provide it. |
 | 图片渲染（kitty / sixel） | ❌ 未做 | 属于"像素级复刻"的重特性，按需后置。<br>A heavy "pixel-parity" feature, deferred. |
+| 消息区文本搜索 | ❌ 未做 | 原生 pi 的 alt-screen 搜索（`ctrl+shift+f`）已列为挂账，按需后置。<br>Native pi's alt-screen search (ctrl+shift+f) is tracked as deferred. |
 | Windows / Linux 专属键位 | ❌ 未做 | 目前只按 macOS 键位实现（个人项目，按需再补）。<br>Only macOS keybindings are implemented for now. |
-| 复制选区、粘贴文件列表 | ❌ 不支持 | 本 TUI 没有文本选区概念；剪贴板只做"图片 → 路径 / 文本"链。<br>This TUI has no text selection; clipboard handles only the image→path / text chain. |
+| 右键粘贴文件列表 | ❌ 不支持 | 无右键粘贴入口；文本选区已对齐（拖选 / 双击词 / 三击行，选中自动复制）。<br>No right-click paste entry; text selection now matches (drag / double-click word / triple-click line, copy-on-select). |
 | `@路径` 解析为附件 | ⚠️ 略有差异 | 在消息里按纯文本送入上下文（pi 会解析成附件）。<br>Sent as plain text into context (pi would resolve it as an attachment). |
 | `/copy` 剪贴板 | ⚠️ 略有差异 | 走终端的 OSC52 协议；终端禁用 OSC52 时无法复制。<br>Uses the terminal's OSC52 protocol; won't work if the terminal disables it. |
 
