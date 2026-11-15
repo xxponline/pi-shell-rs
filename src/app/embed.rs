@@ -43,6 +43,10 @@ pub struct EmbedConfig {
     pub set_title: Option<Box<dyn Fn(String) + Send>>,
     /// 剪贴板回调（`/copy` 等，替代 OSC52）。
     pub copy_text: Option<Box<dyn Fn(String) + Send>>,
+    /// 启动注入配色（宿主配色注入 design D5）；`None` = 默认深底现值，
+    /// 输出与未注入逐字节一致。语法主题名无效时渲染回退默认（不 panic，
+    /// 宿主可经 [`TuiTheme::is_syntax_theme_valid`] 预检）。
+    pub theme: Option<crate::app::theme::TuiTheme>,
 }
 
 /// 嵌入会话句柄：宿主持有它来注入输入、取帧、读状态、关闭会话。
@@ -74,6 +78,10 @@ impl EmbeddedApp {
             set_title: config.set_title,
             copy_text: config.copy_text,
         });
+        // 启动配色注入（design D5）：None = 默认；首帧起即用注入值。
+        if let Some(theme) = config.theme {
+            app.set_theme(theme);
+        }
 
         // 探活（spec: 启动即建立会话状态；失败则杀掉子进程返回 Err）
         match client.send_command(
@@ -159,6 +167,16 @@ impl EmbeddedApp {
                 crossterm::event::KeyModifiers::NONE,
             )));
         }
+    }
+
+    /// 运行时切换配色（宿主配色注入 design D5）：经 keys 通道送
+    /// `UiEvent::Theme`，event loop 应用新值、清渲染双缓存并重绘——
+    /// 下一帧全部注入面（工具卡面板/滚动条/语法高亮）按新值重发。
+    ///
+    /// 输入: theme — 完整配色值（语法主题名无效时渲染回退默认、不 panic）
+    /// 输出: 无返回值；副作用为事件入队（异步应用，下一帧生效）
+    pub fn set_theme(&self, theme: crate::app::theme::TuiTheme) {
+        let _ = self.keys.send(UiEvent::Theme(theme));
     }
 
     /// 宿主 pane 尺寸变化：写入共享槽并请求重绘（autoresize 生效）。
@@ -374,6 +392,54 @@ mod tests {
         match rx.try_recv().expect("click 应送达 keys 通道") {
             UiEvent::Click { x, y } => assert_eq!((x, y), (12, 7), "坐标原样透传"),
             other => panic!("期望 Click, 得到 {other:?}"),
+        }
+    }
+
+    /// 宿主配色注入（design D5）：`set_theme` 把完整配色原样送进 keys 通道
+    /// （UiEvent::Theme，event loop 应用）；`EmbedConfig` 默认 theme=None
+    /// （未注入路径与现状逐字节一致）；主题名预检让宿主可感知（design D3）。
+    ///
+    /// 输入: 无（构造直通 keys 通道的 EmbeddedApp）
+    /// 输出: 断言通过；载荷/默认值/预检三方面验证
+    #[test]
+    fn set_theme_forwards_payload_and_config_defaults_to_none() {
+        // None 默认：未注入路径行为不变
+        assert!(EmbedConfig::default().theme.is_none(), "默认不注入配色");
+        assert!(
+            crate::app::theme::TuiTheme::default().is_syntax_theme_valid(),
+            "默认主题名应有效"
+        );
+        let bogus = crate::app::theme::TuiTheme {
+            syntax_theme: "no-such-theme".to_string(),
+            ..Default::default()
+        };
+        assert!(
+            !bogus.is_syntax_theme_valid(),
+            "无效主题名应可被宿主预检出（渲染侧回退默认）"
+        );
+
+        // 注入值送达：set_theme → keys 通道收到原样 Theme 载荷
+        let (tx, rx) = std::sync::mpsc::channel();
+        let size = Arc::new(Mutex::new(Size::new(10, 4)));
+        let backend = VirtualBackend::with_shared_size(size.clone());
+        let app = EmbeddedApp {
+            keys: tx,
+            ansi: backend.buffer(),
+            state: Arc::new(RwLock::new(Default::default())),
+            size,
+            running: Arc::new(AtomicBool::new(true)),
+            thread: Mutex::new(None),
+        };
+
+        let injected = crate::app::theme::TuiTheme {
+            tool_running_bg: ratatui::style::Color::Rgb(1, 2, 3),
+            syntax_theme: "base16-ocean.light".to_string(),
+            ..Default::default()
+        };
+        app.set_theme(injected.clone());
+        match rx.try_recv().expect("set_theme 应送达 keys 通道") {
+            UiEvent::Theme(t) => assert_eq!(t, injected, "配色载荷原样透传"),
+            other => panic!("期望 Theme, 得到 {other:?}"),
         }
     }
 }

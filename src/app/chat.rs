@@ -35,7 +35,9 @@ pub struct RenderFlags {
 ///
 /// 默认配色薄包装（design D1 方案 A）：转发 [`chat_lines_themed`] 传
 /// [`TuiTheme::default()`]——存量 28 处调用点（含测试）签名零改动。
-/// 渲染主路径（view）应走 themed 入口。
+/// 渲染主路径（view/选区文档）走 themed 入口；本包装服务存量测试与
+/// 默认外观调用方。
+#[allow(dead_code)]
 pub fn chat_lines(
     state: &SessionState,
     flags: RenderFlags,

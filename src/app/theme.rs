@@ -32,6 +32,17 @@ pub struct TuiTheme {
     pub syntax_theme: String,
 }
 
+impl TuiTheme {
+    /// 校验语法高亮主题名是否有效（宿主注入前预检，宿主配色注入
+    /// design D3——无效名渲染回退默认，本方法让宿主可感知）。
+    ///
+    /// 输入: 无（读 `self.syntax_theme`）
+    /// 输出: true = 内置主题集中存在该名；false = 无效（将回退默认）
+    pub fn is_syntax_theme_valid(&self) -> bool {
+        crate::app::markdown::is_valid_syntax_theme(&self.syntax_theme)
+    }
+}
+
 impl Default for TuiTheme {
     /// 默认配色 = pi dark.json 深底现值（design D2：默认路径字节级不变）。
     ///

@@ -27,6 +27,9 @@ pub enum UiEvent {
     /// embed：宿主写共享槽后注入；standalone：SIGWINCH → crossterm Resize 转发，
     /// draw 时经 ioctl 取新尺寸。
     Resize,
+    /// 宿主切换配色（宿主配色注入 design D5）：应用新值、清渲染双缓存、
+    /// 置 need_draw 重绘——一帧内全部注入面按新值重发。
+    Theme(crate::app::theme::TuiTheme),
     /// 滚轮滚动消息区：有符号行数（负=上滚看更早内容、正=下滚看更新内容）；
     /// 行数已在事件源线程经 WheelAccel 加速并含 Alt 倍率（design D2）。
     Wheel(i16),

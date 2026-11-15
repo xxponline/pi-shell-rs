@@ -27,26 +27,27 @@
 
 ## 3. markdown 主题可切换与双缓存清理
 
-- [ ] 3.1 `theme()` 改为 `OnceLock<ThemeSet>` 按名查表；新增
+- [x] 3.1 `theme()` 改为 `OnceLock<ThemeSet>` 按名查表；新增
       `render_markdown_themed(text, theme)` + 默认包装；非法主题名回退默认
       且调用方可感知（返回值表达，不 panic）——验证：`cargo test` 全绿，
       新增非法名回退测试通过
-- [ ] 3.2 新增两缓存清理入口（`HL_CACHE` + `MD_CACHE` 同清）与
+- [x] 3.2 新增两缓存清理入口（`HL_CACHE` + `MD_CACHE` 同清）与
       `highlight_by_path`/`push_code_block` 的 themed 下传——验证：新增
       "切主题后渲染不含旧主题色" 测试（先用旧主题渲染、切新主题、断言
       代码块 fg 为新值）通过
-- [ ] 3.3 commit
+- [x] 3.3 commit
 
 ## 4. embed 注入与运行时切换
 
-- [ ] 4.1 `EmbedConfig` 加 `theme: Option<TuiTheme>`（None=默认），spawn 时
+- [x] 4.1 `EmbedConfig` 加 `theme: Option<TuiTheme>`（None=默认），spawn 时
       应用；`EmbeddedApp::set_theme` 经 keys 通道送 `UiEvent::Theme`——验证：
       embed 单测断言注入值送达与 None 默认路径行为不变
-- [ ] 4.2 `UiEvent::Theme` + event loop arm：应用 `self.theme`、清双缓存、
-      `need_draw = true`；`App` 持 theme 并填入 `ViewUi`——验证：
-      `TestBackend` 无头测试断言 `set_theme` 后一帧内工具卡面板/滚动条/
-      代码高亮三注入面全部按新值出色
-- [ ] 4.3 commit
+- [x] 4.2 `UiEvent::Theme` + event loop arm：应用 `self.theme`、清双缓存、
+      `need_draw = true`；`App` 持 theme 并填入 `ViewUi`——验证：无头测试断言
+      `set_theme` 后一帧内工具卡面板/滚动条/代码高亮三注入面全部按新值出色
+      （原计划 TestBackend——其 Error=Infallible 不满足 `App::draw` 约束，
+      改用 VirtualBackend+ANSI 断言，与 embed 宿主路径同源）
+- [x] 4.3 commit
 
 ## 5. spec 验收与文档
 

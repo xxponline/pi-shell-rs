@@ -50,8 +50,7 @@ pub(crate) const DEFAULT_SYNTAX_THEME: &str = "base16-ocean.dark";
 /// 输入: name — 宿主注入的主题名（任意字符串）
 /// 输出: true = 有效；false = 无效（调用方回退默认并让宿主感知，不 panic）
 ///
-/// 消费方：embed 启动注入与 `set_theme` 的主题名校验（组 4 接线）。
-#[allow(dead_code)] // 组 4（set_theme/embed 校验）接线前由测试消费
+/// 消费方：[`crate::app::theme::TuiTheme::is_syntax_theme_valid`]（宿主预检）。
 pub(crate) fn is_valid_syntax_theme(name: &str) -> bool {
     theme_set().themes.contains_key(name)
 }
@@ -128,8 +127,7 @@ pub fn render_markdown_themed(
 /// 输出: 无返回值；副作用为清空本线程（渲染线程）两个缓存——
 ///       `set_theme` 在 event loop 线程调用，与绘制同线程
 ///
-/// 消费方：`UiEvent::Theme` 应用 arm（组 4 接线）。
-#[allow(dead_code)] // 组 4（set_theme arm）接线前由测试消费
+/// 消费方：[`crate::app::App::set_theme`]（启动注入与 `UiEvent::Theme` arm）。
 pub fn clear_render_caches() {
     MD_CACHE.with(|c| c.borrow_mut().clear());
     HL_CACHE.with(|c| c.borrow_mut().clear());

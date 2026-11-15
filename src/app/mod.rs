@@ -211,6 +211,10 @@ pub struct App {
     sinks: TerminalSinks,
     /// 嵌入模式：状态发布槽（draw 时刷新给宿主只读句柄；standalone 为 None）。
     state_slot: Option<Arc<RwLock<SessionState>>>,
+    /// 注入配色（宿主配色注入 design D5）：默认 = 深底现值；embed 经
+    /// `EmbedConfig.theme` 启动注入、`UiEvent::Theme` 运行时切换；
+    /// standalone 恒为默认（R8 不动默认外观）。
+    theme: crate::app::theme::TuiTheme,
 }
 
 /// 默认构造：等价 [`App::new`]。
@@ -271,6 +275,7 @@ impl App {
             debug_log,
             sinks: TerminalSinks::default(),
             state_slot: None,
+            theme: crate::app::theme::TuiTheme::default(),
         }
     }
 
@@ -291,6 +296,18 @@ impl App {
     /// 缺省走真实终端。
     pub fn set_terminal_sinks(&mut self, sinks: TerminalSinks) {
         self.sinks = sinks;
+    }
+
+    /// 应用注入配色（宿主配色注入 design D5；embed 启动注入与
+    /// `UiEvent::Theme` arm 共用）。
+    ///
+    /// 输入: theme — 完整配色值（语法主题名无效时渲染层回退默认，
+    ///       不 panic——`theme_by_name` 兑底）
+    /// 输出: 无返回值；副作用为存储新值 + 清渲染双缓存（MD/HL 均烧入
+    ///       主题色，同线程清空后下次渲染按新值重建）
+    pub fn set_theme(&mut self, theme: crate::app::theme::TuiTheme) {
+        self.theme = theme;
+        crate::app::markdown::clear_render_caches();
     }
 
     /// 窗口标题出口：sink 注入优先，standalone 落回真实终端 SetTitle。
@@ -536,6 +553,14 @@ impl App {
                     }
                     Ok(UiEvent::Resize) => {
                         // embed: 宿主已写共享槽；standalone: draw 内 autoresize 经 ioctl 取新尺寸。
+                        need_draw = true;
+                    }
+                    Ok(UiEvent::Theme(theme)) => {
+                        // 宿主配色注入（design D5）：应用新值 + 清渲染双缓存
+                        //（MD/HL 均烧入主题色，同线程清空）+ 重绘——变色
+                        // 格子随 ratatui diff 带新 SGR 重发，一帧内生效。
+                        self.log_event("theme", &theme.syntax_theme);
+                        self.set_theme(theme);
                         need_draw = true;
                     }
                     // Idle timeout：无状态变化不重绘；但运行中工具需要每秒走字
@@ -793,11 +818,12 @@ impl App {
             show_thinking: self.show_thinking,
             expand_tools: self.expand_tools,
         };
-        let (lines, meta) = crate::app::chat::chat_lines(
+        let (lines, meta) = crate::app::chat::chat_lines_themed(
             &self.state,
             flags,
             &self.user_tool_expanded,
             &self.thinking_overrides,
+            &self.theme,
         );
         // 全文窗口：height = content_len → 窗口即全文（行号 = 绝对行）。
         let height = current.min(u16::MAX as usize) as u16;
@@ -808,9 +834,10 @@ impl App {
             &ChatScroll::default(),
             &meta,
             None,
-            // 选区文档只做文字提取、不回绘，滚动条不画（design D4）；传
-            // 默认配色即可，主题不进提取语义。
-            &crate::app::theme::TuiTheme::default(),
+            // 选区文档只做文字提取、不回绘，滚动条不画（design D4）；但
+            // chat_lines_themed 必须吃 self.theme——否则默认主题渲染会把
+            // MD_CACHE 重填为默认色（选区点击后下一帧漏回旧色）。
+            &self.theme,
         );
         let len = wrapped.len();
         self.selection_doc = Some((wrapped, len));
@@ -3995,9 +4022,8 @@ impl App {
             } else {
                 None
             },
-            // 宿主配色注入（design D5）：App 持值 → ViewUi 下传；当前为
-            // 默认（任务 4.2 接 UiEvent::Theme 后改读 self.theme）。
-            theme: crate::app::theme::TuiTheme::default(),
+            // 宿主配色注入（design D5）：App 持值 → ViewUi 下传渲染链。
+            theme: self.theme.clone(),
         };
         // 渲染回写（design D2）：ratatui 闭包返回 ()，经 Cell 带出
         // (滚动状态, 卡片命中区间)，闭包结束后存回。
@@ -8249,5 +8275,180 @@ done
             assert!(text.contains(needle), "键位表缺 {needle}");
         }
         assert!(text.contains("外部编辑器") && text.contains("粘贴剪贴板"), "{text}");
+    }
+
+    /// 宿主配色注入（design D5；spec 运行时切换一帧内生效）：VirtualBackend
+    /// （embed 同路径，Error=io::Error 满足 App::draw 约束）无头断言：默认帧
+    /// 三注入面为现值；经 `UiEvent::Theme` 走真实 event loop 切换后，下一帧
+    /// ANSI 中三个注入面全部按新值重发、旧 RGB 值不再出现（含双缓存清理——
+    /// 切后高亮不漏旧主题色）。
+    ///
+    /// 输入: 无（构造长文本+代码块+运行中工具卡的会话）
+    /// 输出: 断言通过；默认帧与切换后帧分别校验三注入面的 ANSI SGR 序列
+    #[test]
+    fn set_theme_switches_three_injected_surfaces_in_one_frame() {
+        use pi_shell_rs::session::{Block, Entry, ToolExecution, ToolStatus};
+
+        // 会话：用户消息 + 40 行文本 + rust 代码块（滚动条/高亮面）+
+        // 运行中工具卡（面板面，置于末尾保证在贴底视口内）。
+        let mut s = SessionState::new();
+        s.handle(&serde_json::json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"question"}]}}));
+        s.handle(&serde_json::json!({"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"question"}]}}));
+        let mut body = String::new();
+        for i in 1..=40 {
+            body.push_str(&format!("line{i:02}\n"));
+        }
+        body.push_str("```rust\nfn main() { let x = 42; }\n```");
+        let tool = ToolExecution {
+            status: ToolStatus::Running,
+            is_error: false,
+            result: Some(serde_json::json!({"content":[{"type":"text","text":"out"}]})),
+            ..Default::default()
+        };
+        s.transcript.push(Entry::Assistant {
+            turn: 1,
+            blocks: vec![
+                Block::Text { text: body },
+                Block::ToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    args_json: r#"{"command":"ls"}"#.into(),
+                    tool,
+                },
+            ],
+            usage: None,
+        });
+
+        let default_theme = crate::app::theme::TuiTheme::default();
+        let injected = crate::app::theme::TuiTheme {
+            tool_running_bg: Color::Rgb(1, 2, 3),
+            scrollbar_track: Color::Rgb(10, 20, 30),
+            scrollbar_thumb: Color::Rgb(40, 50, 60),
+            syntax_theme: "base16-ocean.light".to_string(),
+            ..Default::default()
+        };
+
+        // RGB 色 → crossterm SGR 序列（`38;2;r;g;b` 前景 / `48;2;…` 背景）。
+        let ansi_fg = |c: Color| match c {
+            Color::Rgb(r, g, b) => format!("38;2;{r};{g};{b}"),
+            other => panic!("期望 Rgb, 得到 {other:?}"),
+        };
+        let ansi_bg = |c: Color| match c {
+            Color::Rgb(r, g, b) => format!("48;2;{r};{g};{b}"),
+            other => panic!("期望 Rgb, 得到 {other:?}"),
+        };
+        // 同一代码片段在给定主题下 "fn main" 行的 Rgb 前景色集合
+        //（与渲染链同源：render_markdown_themed）。
+        let code_md = "```rust\nfn main() { let x = 42; }\n```";
+        let code_rgbs = |theme: &crate::app::theme::TuiTheme| -> Vec<Color> {
+            let lines = crate::app::markdown::render_markdown_themed(code_md, theme);
+            let line = lines
+                .iter()
+                .find(|l| {
+                    let text: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
+                    text.contains("fn main")
+                })
+                .expect("应有 fn main 行");
+            line.spans
+                .iter()
+                .filter_map(|sp| sp.style.fg)
+                .filter(|c| matches!(c, Color::Rgb(..)))
+                .collect()
+        };
+
+        // —— 默认帧：三注入面均为现值 ——
+        // 注意：MD/HL 缓存键不含主题，两主题的期望色必须各自清缓存后计算。
+        crate::app::markdown::clear_render_caches();
+        let default_code = code_rgbs(&default_theme);
+        crate::app::markdown::clear_render_caches();
+        let injected_code = code_rgbs(&injected);
+        crate::app::markdown::clear_render_caches();
+        // 两主题高亮色必须有差异（否则本测试对高亮面无区分度）
+        let injected_only: Vec<Color> = injected_code
+            .iter()
+            .copied()
+            .filter(|c| !default_code.contains(c))
+            .collect();
+        let default_only: Vec<Color> = default_code
+            .iter()
+            .copied()
+            .filter(|c| !injected_code.contains(c))
+            .collect();
+        assert!(
+            !injected_only.is_empty() && !default_only.is_empty(),
+            "两 syntect 主题的高亮色应有差异"
+        );
+
+        let mut app = App::new();
+        app.state = s;
+        app.scrollbar_visible = true;
+        let backend = crate::app::virtual_terminal::VirtualBackend::new(90, 30);
+        let ansi = backend.buffer();
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        app.draw(&mut terminal).unwrap();
+        let frame1 = String::from_utf8_lossy(&ansi.take()).into_owned();
+        assert!(
+            frame1.contains(&ansi_bg(default_theme.tool_running_bg)),
+            "默认帧应含运行灰工具卡面板 SGR"
+        );
+        assert!(
+            frame1.contains(&ansi_fg(default_theme.scrollbar_track))
+                || frame1.contains(&ansi_fg(default_theme.scrollbar_thumb)),
+            "默认帧应含默认滚动条色 SGR"
+        );
+        for c in &default_code {
+            assert!(
+                frame1.contains(&ansi_fg(*c)),
+                "默认帧应含默认高亮色 {}",
+                ansi_fg(*c)
+            );
+        }
+
+        // —— 经真实 event loop 切换（Theme + Shutdown 同批）——
+        let (client, cdir) = test_commander();
+        let commander = client.command_sender();
+        let (tx, rx) = std::sync::mpsc::channel::<UiEvent>();
+        let (rptx, _rprx) = std::sync::mpsc::channel::<UiEvent>();
+        tx.send(UiEvent::Theme(injected.clone())).unwrap();
+        tx.send(UiEvent::Shutdown).unwrap();
+        app.event_loop(&mut terminal, &rx, &commander, &rptx).unwrap();
+        assert_eq!(app.theme, injected, "event loop 已应用新配色");
+
+        // —— 切换后帧：三注入面全部按新值重发、旧值不再出现 ——
+        let frame2 = String::from_utf8_lossy(&ansi.take()).into_owned();
+        assert!(
+            frame2.contains(&ansi_bg(injected.tool_running_bg)),
+            "面板按注入值重发"
+        );
+        assert!(
+            !frame2.contains(&ansi_bg(default_theme.tool_running_bg)),
+            "默认面板色不应再出现（diff 重发新值）"
+        );
+        assert!(
+            frame2.contains(&ansi_fg(injected.scrollbar_track))
+                && frame2.contains(&ansi_fg(injected.scrollbar_thumb)),
+            "滚动条 track/thumb 按注入值重发"
+        );
+        assert!(
+            !frame2.contains(&ansi_fg(default_theme.scrollbar_track))
+                && !frame2.contains(&ansi_fg(default_theme.scrollbar_thumb)),
+            "默认滚动条色不应再出现"
+        );
+        for c in &injected_only {
+            assert!(
+                frame2.contains(&ansi_fg(*c)),
+                "代码高亮按注入主题重发 {}",
+                ansi_fg(*c)
+            );
+        }
+        for c in &default_only {
+            assert!(
+                !frame2.contains(&ansi_fg(*c)),
+                "旧主题高亮色不应残留 {}",
+                ansi_fg(*c)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&cdir);
     }
 }
