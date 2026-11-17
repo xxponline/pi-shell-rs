@@ -14,6 +14,11 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Windows 上 `Command::creation_flags` 所需的 trait；该 trait 在非 Windows
+/// 平台不存在，故整个 use 用 `cfg(windows)` 罩住。
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use crate::rpc::jsonl::{OutgoingCommand, WireMessage};
 
 /// Something observed on the child's stdout.
@@ -99,14 +104,18 @@ fn find_pi_on_path(path: Option<&std::ffi::OsStr>) -> Option<String> {
 }
 
 impl Transport {
-    /// Spawn `<bin> --mode rpc` with piped stdio (child inherits this
-    /// process's working directory).
+    /// 以管道 stdio 启动 `<bin> --mode rpc`（子进程继承本进程工作目录）。
+    ///
+    /// 输入: binary — 可执行文件路径；extra_args — 追加到 `--mode rpc` 之后的参数。
+    /// 输出: 就绪的 [`Transport`]；spawn 失败返回带上下文的 `io::Error`。
     pub fn spawn_rpc(binary: &str, extra_args: &[String]) -> std::io::Result<Self> {
         Self::spawn_rpc_in(binary, extra_args, None)
     }
 
-    /// Same as [`spawn_rpc`] with an explicit working directory for the
-    /// child (embed mode: the session's workspace path).
+    /// 同 [`spawn_rpc`]，但可为子进程指定工作目录（embed 模式：会话 workspace 路径）。
+    ///
+    /// 输入: binary / extra_args 同上；cwd — 子进程工作目录（`None` 继承本进程）。
+    /// 输出: 就绪的 [`Transport`]；spawn 失败返回带上下文的 `io::Error`。
     pub fn spawn_rpc_in(
         binary: &str,
         extra_args: &[String],
@@ -122,6 +131,12 @@ impl Transport {
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
         }
+        // GUI 宿主 (windows_subsystem="windows") 无控制台: 不加此标志时 Windows 会为
+        // pi 子进程新建可见控制台窗口 (实测 WT 标题变为 "pi"); debug 宿主有控制台,
+        // 子进程继承故不触发。stdio 已全部 piped, 不需要控制台; 实测加标志后
+        // RPC get_state 探活照常通过。
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
 
         let mut child = cmd.spawn().map_err(|e| {
             std::io::Error::new(
