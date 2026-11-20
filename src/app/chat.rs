@@ -66,59 +66,126 @@ pub fn chat_lines_themed(
     let mut thinking_seq = 0usize;
     // 语义消息序号（add-prompt-jump design D3：仅用户/assistant 消耗）。
     let mut msg_seq = 0usize;
+    // 逐条目布局（与条目缓存同源，design D2——保证缓存路径逐字节等价）。
     for entry in state.entries() {
-        let logical_start = lines.len();
-        let is_message = matches!(entry, Entry::User { .. } | Entry::Assistant { .. });
-        match entry {
-            Entry::User { text } => {
-                lines.push(prefixed("You", text, Color::Cyan, true));
-            }
-            Entry::Assistant { blocks, .. } => {
-                append_blocks(
-                    &mut lines,
-                    &mut meta,
-                    blocks,
-                    flags,
-                    overrides,
-                    thinking_overrides,
-                    &mut thinking_seq,
-                    theme,
-                );
-            }
-            Entry::Notice { kind, text } => {
-                lines.push(notice_line(kind, text));
-            }
-            Entry::Bash {
-                command,
-                output,
-                exit_code,
-                cancelled,
-                truncated,
-                full_output_path,
-                excluded,
-            } => append_bash(
-                &mut lines,
-                command,
-                output,
-                *exit_code,
-                *cancelled,
-                *truncated,
-                full_output_path.as_deref(),
-                *excluded,
-                false,
-            ),
-        }
-        // 非卡片路径补齐空标记组（与行等长；append_blocks 已自同步）。
-        meta.resize(lines.len(), Vec::new());
-        // 语义消息起点回填首逻辑行（design D3/D1）：push 与内容标记
-        // 共存不覆盖；通知/`!`bash 不标不耗 seq；空条目（无行）不标；
-        // seq 仅标记时递增（transcript append-only → 序号稳定）。
-        if is_message && lines.len() > logical_start {
-            meta[logical_start].push(HitKind::MessageStart(msg_seq));
-            msg_seq += 1;
-        }
+        let (el, em) = layout_entry(
+            entry,
+            flags,
+            overrides,
+            thinking_overrides,
+            &mut thinking_seq,
+            &mut msg_seq,
+            theme,
+        );
+        lines.extend(el);
+        meta.extend(em);
     }
     // 流式中尚未落盘的内容。
+    let (il, im) = layout_inflight(
+        state,
+        flags,
+        overrides,
+        thinking_overrides,
+        &mut thinking_seq,
+        theme,
+    );
+    lines.extend(il);
+    meta.extend(im);
+    // 运行中的用户 bash（分片实时增长）。
+    let (bl, bm) = layout_bash_tail(state);
+    lines.extend(bl);
+    meta.extend(bm);
+    meta.resize(lines.len(), Vec::new());
+    debug_assert_eq!(lines.len(), meta.len(), "meta 必须与行等长");
+    (lines, meta)
+}
+
+/// 单条目布局（oracle 与条目缓存共用的唯一实现，design D2）。
+///
+/// 输入: entry — transcript 条目；flags/overrides/thinking_overrides/theme —
+///       同 [`chat_lines_themed`]；thinking_seq/msg_seq — 全局序号游标
+///       （入口值 = 该条目基值，函数内推进，出口 = 下一条目基值）
+/// 输出: `(该条目的逻辑行, 逐行命中 meta)`——两者等长，命中种属携带
+///       **全局**序号（以入口游标为基渲染）；错误情形：无
+pub(crate) fn layout_entry(
+    entry: &Entry,
+    flags: RenderFlags,
+    overrides: &std::collections::HashMap<String, bool>,
+    thinking_overrides: &std::collections::HashMap<usize, bool>,
+    thinking_seq: &mut usize,
+    msg_seq: &mut usize,
+    theme: &TuiTheme,
+) -> (Vec<Line<'static>>, Vec<Vec<HitKind>>) {
+    let mut lines = Vec::new();
+    let mut meta: Vec<Vec<HitKind>> = Vec::new();
+    let is_message = matches!(entry, Entry::User { .. } | Entry::Assistant { .. });
+    match entry {
+        Entry::User { text } => {
+            lines.push(prefixed("You", text, Color::Cyan, true));
+        }
+        Entry::Assistant { blocks, .. } => {
+            append_blocks(
+                &mut lines,
+                &mut meta,
+                blocks,
+                flags,
+                overrides,
+                thinking_overrides,
+                thinking_seq,
+                theme,
+            );
+        }
+        Entry::Notice { kind, text } => {
+            lines.push(notice_line(kind, text));
+        }
+        Entry::Bash {
+            command,
+            output,
+            exit_code,
+            cancelled,
+            truncated,
+            full_output_path,
+            excluded,
+        } => append_bash(
+            &mut lines,
+            command,
+            output,
+            *exit_code,
+            *cancelled,
+            *truncated,
+            full_output_path.as_deref(),
+            *excluded,
+            false,
+        ),
+    }
+    // 非卡片路径补齐空标记组（与行等长；append_blocks 已自同步）。
+    meta.resize(lines.len(), Vec::new());
+    // 语义消息起点回填首逻辑行（design D3/D1）：push 与内容标记
+    // 共存不覆盖；通知/`!`bash 不标不耗 seq；空条目（无行）不标；
+    // seq 仅标记时递增（transcript append-only → 序号稳定）。
+    if is_message && !lines.is_empty() {
+        meta[0].push(HitKind::MessageStart(*msg_seq));
+        *msg_seq += 1;
+    }
+    (lines, meta)
+}
+
+/// 流式 in-flight 尾槽布局（design D1 易失槽；与 oracle 同源）。
+///
+/// 输入: state — 会话状态（读 `is_in_flight`/`in_flight`）；其余同
+///       [`layout_entry`]；thinking_seq — 全局游标（入口 = 已有条目合计，
+///       出口 = 含本槽合计）
+/// 输出: `(行, meta)`——两者等长；无进行中流式时皆为空
+pub(crate) fn layout_inflight(
+    state: &SessionState,
+    flags: RenderFlags,
+    overrides: &std::collections::HashMap<String, bool>,
+    thinking_overrides: &std::collections::HashMap<usize, bool>,
+    thinking_seq: &mut usize,
+    theme: &TuiTheme,
+) -> (Vec<Line<'static>>, Vec<Vec<HitKind>>) {
+    let mut lines = Vec::new();
+    let mut meta: Vec<Vec<HitKind>> = Vec::new();
     if state.is_in_flight() {
         append_blocks(
             &mut lines,
@@ -127,11 +194,25 @@ pub fn chat_lines_themed(
             flags,
             overrides,
             thinking_overrides,
-            &mut thinking_seq,
+            thinking_seq,
             theme,
         );
     }
-    // 运行中的用户 bash（分片实时增长）。
+    meta.resize(lines.len(), Vec::new());
+    (lines, meta)
+}
+
+/// 运行中 bash 尾槽布局（design D1 易失槽；与 oracle 同源）。
+///
+/// 输入: state — 会话状态（读 `bash_running`/`bash_command`/`bash_output`/
+///       `bash_excluded`）
+/// 输出: `(行, meta)`——两者等长；bash 未运行时皆为空；输出行数上限与
+///       [`append_bash`] 一致（500 行）
+pub(crate) fn layout_bash_tail(
+    state: &SessionState,
+) -> (Vec<Line<'static>>, Vec<Vec<HitKind>>) {
+    let mut lines = Vec::new();
+    let mut meta: Vec<Vec<HitKind>> = Vec::new();
     if state.bash_running {
         let excluded = state.bash_excluded;
         let command = state.bash_command.clone();
@@ -139,7 +220,6 @@ pub fn chat_lines_themed(
         append_bash(&mut lines, &command, &output, None, false, false, None, excluded, true);
     }
     meta.resize(lines.len(), Vec::new());
-    debug_assert_eq!(lines.len(), meta.len(), "meta 必须与行等长");
     (lines, meta)
 }
 

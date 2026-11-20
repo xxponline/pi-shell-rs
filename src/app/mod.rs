@@ -12,6 +12,7 @@ mod editor;
 mod external_editor;
 mod event;
 mod markdown;
+mod layout_cache;
 mod overlay;
 pub mod scroll; // 宿主（GUI）引 ALT_WHEEL_MULTIPLIER — terminal-pointer-and-scroll-input D1
 mod selection;
@@ -28,7 +29,6 @@ mod wrap;
 
 use std::io;
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -209,8 +209,8 @@ pub struct App {
     /// 终端副作用出口（标题/剪贴板）；None=standalone 走真实终端，
     /// 嵌入模式由宿主注入回调（design D4）。
     sinks: TerminalSinks,
-    /// 嵌入模式：状态发布槽（draw 时刷新给宿主只读句柄；standalone 为 None）。
-    state_slot: Option<Arc<RwLock<SessionState>>>,
+    /// 条目级布局缓存（design D1/D2/D7）：渲染与选区文档共用，增量重排。
+    layout_cache: crate::app::layout_cache::LayoutCache,
     /// 注入配色（宿主配色注入 design D5）：默认 = 深底现值；embed 经
     /// `EmbedConfig.theme` 启动注入、`UiEvent::Theme` 运行时切换；
     /// standalone 恒为默认（R8 不动默认外观）。
@@ -274,7 +274,7 @@ impl App {
             expand_tools: false,
             debug_log,
             sinks: TerminalSinks::default(),
-            state_slot: None,
+            layout_cache: Default::default(),
             theme: crate::app::theme::TuiTheme::default(),
         }
     }
@@ -818,25 +818,27 @@ impl App {
             show_thinking: self.show_thinking,
             expand_tools: self.expand_tools,
         };
-        let (lines, meta) = crate::app::chat::chat_lines_themed(
-            &self.state,
+        // D5：从条目布局缓存投影（复用缓存，删掉本函数的第二份全文排版）；
+        // 全文 wrap 保留供选区绝对行号。主题必须吃 self.theme——否则默认
+        // 主题渲染会把 MD_CACHE 重填为默认色（选区点击后下一帧漏回旧色）。
+        let (state, cache) = (&mut self.state, &mut self.layout_cache);
+        cache.refresh(
+            state,
             flags,
             &self.user_tool_expanded,
             &self.thinking_overrides,
             &self.theme,
+            self.chat_area.width,
         );
+        let chunks = cache.chunks();
         // 全文窗口：height = content_len → 窗口即全文（行号 = 绝对行）。
         let height = current.min(u16::MAX as usize) as u16;
-        let (wrapped, _, _) = crate::app::wrap::wrap_for_viewport(
-            &lines,
+        let (wrapped, _, _) = crate::app::wrap::wrap_for_viewport_windowed(
+            &chunks,
             self.chat_area.width,
             height.max(1),
             &ChatScroll::default(),
-            &meta,
             None,
-            // 选区文档只做文字提取、不回绘，滚动条不画（design D4）；但
-            // chat_lines_themed 必须吃 self.theme——否则默认主题渲染会把
-            // MD_CACHE 重填为默认色（选区点击后下一帧漏回旧色）。
             &self.theme,
         );
         let len = wrapped.len();
@@ -1106,6 +1108,8 @@ impl App {
                 let effective = *self.user_tool_expanded.get(&id).unwrap_or(&self.expand_tools);
                 self.user_tool_expanded.insert(id.clone(), !effective);
                 self.log_event("key", &format!("tool card {id} expanded -> {}", !effective));
+                // 单卡覆盖只影响该条目 → 精确失效（design D4）。
+                self.layout_cache.invalidate_tool(&id);
             }
             wrap::HitKind::Thinking(seq) => {
                 // 单块相对生效值翻转（覆盖优先、否则全局，design D3）。
@@ -1118,6 +1122,8 @@ impl App {
                     "key",
                     &format!("thinking block {seq} expanded -> {}", !effective),
                 );
+                // 单块覆盖只影响该条目 → 精确失效（design D4）。
+                self.layout_cache.invalidate_thinking(seq);
             }
             wrap::HitKind::MessageStart(_) => {
                 // 消息起点行点击无动作（add-prompt-jump design D5，
@@ -1698,16 +1704,10 @@ impl App {
             self.notice = Some(("No changelog entries found.".into(), Color::Yellow));
             return;
         }
-        use pi_shell_rs::session::Entry;
-        self.state.transcript.push(Entry::Notice {
-            kind: "changelog".into(),
-            text: "── What's New ──".into(),
-        });
+        // 经 session 入口追加（design D7：直改 transcript 会漏脏标记 → stale 渲染）。
+        self.state.push_notice("changelog", "── What's New ──".into());
         for line in body {
-            self.state.transcript.push(Entry::Notice {
-                kind: "changelog".into(),
-                text: line,
-            });
+            self.state.push_notice("changelog", line);
         }
         self.notice = Some(("✓ changelog 已显示".into(), Color::Green));
     }
@@ -3985,12 +3985,6 @@ impl App {
     where
         io::Error: From<B::Error>,
     {
-        // 嵌入模式：把最新状态发布给宿主只读句柄（仅状态变更帧触发）。
-        if let Some(slot) = &self.state_slot
-            && let Ok(mut guard) = slot.write()
-        {
-            *guard = self.state.clone();
-        }
         let input_text = self.editor.text();
         let ui = view::ViewUi {
             input: &input_text,
@@ -4038,13 +4032,20 @@ impl App {
             .and_then(selection_exclusive_bounds)
             .map(|(s, e)| (s, e, self.scroll.top, self.chat_area));
         terminal.draw(|frame| {
-            fb.set(view::render(frame, &self.state, &ui));
+            fb.set(view::render(frame, &mut self.state, &ui, &mut self.layout_cache));
             // 选区反视频（add-select-to-copy design D3：paint 后 buffer
             // 后处理——pi ANSI [7m 等价，样式保留仅 fg/bg 互换）。
             if let Some((s, e, top, area)) = paint_sel {
                 view::paint_selection(frame.buffer_mut(), s, e, top, area);
             }
         })?;
+        // 漏标对账提示（design D7）：refresh 已降级全量重建，此处断言告警
+        // （直接改 transcript 不经 handle 不 bump rev，不在此路径）。
+        debug_assert_eq!(
+            self.layout_cache.miss_rebuilds(),
+            0,
+            "layout cache 漏标检测：检查变异点是否漏埋脏标记（design D7）"
+        );
         let (scroll, hits, chat_area) = fb.take();
         self.scroll = scroll;
         self.card_hits = hits;
@@ -7609,7 +7610,8 @@ done
         });
 
         // 渲染断言：浮层含 doubleEsc 行与当前值
-        let state = pi_shell_rs::session::SessionState::new();
+        let mut state = pi_shell_rs::session::SessionState::new();
+        let mut cache = crate::app::layout_cache::LayoutCache::default();
         let backend = ratatui::backend::TestBackend::new(90, 30);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
@@ -7618,7 +7620,7 @@ done
                     overlay: app.overlay.as_ref(),
                     ..Default::default()
                 };
-                crate::app::view::render(frame, &state, &ui);
+                crate::app::view::render(frame, &mut state, &ui, &mut cache);
             })
             .unwrap();
         let buf = terminal.backend().buffer();

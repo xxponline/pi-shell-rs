@@ -7,13 +7,12 @@
 //! - 键盘事件由宿主经 [`EmbeddedApp::inject_key`] 注入（无 crossterm poll 线程）
 //! - 绘制输出为 ANSI 字节（[`VirtualBackend`] → [`EmbeddedApp::take_ansi`]），
 //!   宿主喂自己的 vt100 解析器
-//! - 暴露只读 [`SessionState`] 句柄供宿主读取结构化状态
 //! - 探活/启动失败返回 `Err`，绝不 `process::exit`（不能杀掉宿主进程）
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -25,7 +24,6 @@ use crate::app::terminal::TerminalGuard;
 use crate::app::virtual_terminal::{AnsiBuffer, VirtualBackend};
 use crate::app::App;
 use pi_shell_rs::rpc::{ResponsePolicy, RpcClient};
-use pi_shell_rs::session::SessionState;
 
 /// 嵌入会话配置。
 #[derive(Default)]
@@ -49,11 +47,10 @@ pub struct EmbedConfig {
     pub theme: Option<crate::app::theme::TuiTheme>,
 }
 
-/// 嵌入会话句柄：宿主持有它来注入输入、取帧、读状态、关闭会话。
+/// 嵌入会话句柄：宿主持有它来注入输入、取帧、关闭会话。
 pub struct EmbeddedApp {
     keys: Sender<UiEvent>,
     ansi: AnsiBuffer,
-    state: Arc<RwLock<SessionState>>,
     size: Arc<Mutex<Size>>,
     running: Arc<AtomicBool>,
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -109,16 +106,13 @@ impl EmbeddedApp {
             App::fetch_commands_quiet(&client.command_sender(), &sources.report, settings_path);
         }
 
-        // 共享尺寸槽 + 虚拟终端 + 状态发布槽。
+        // 共享尺寸槽 + 虚拟终端。
         let cols = if config.cols == 0 { 80 } else { config.cols };
         let rows = if config.rows == 0 { 24 } else { config.rows };
         let size = Arc::new(Mutex::new(Size::new(cols, rows)));
         let backend = VirtualBackend::with_shared_size(size.clone());
         let ansi = backend.buffer();
         let mut terminal = ratatui::Terminal::new(backend).map_err(|e| e.to_string())?;
-
-        let state_slot = Arc::new(RwLock::new(app.state.clone()));
-        app.state_slot = Some(state_slot.clone());
 
         let running = Arc::new(AtomicBool::new(true));
         let running_in_thread = running.clone();
@@ -136,7 +130,6 @@ impl EmbeddedApp {
         Ok(Self {
             keys: sources.keys,
             ansi,
-            state: state_slot,
             size,
             running,
             thread: Mutex::new(Some(thread)),
@@ -188,12 +181,6 @@ impl EmbeddedApp {
     /// 取走自上次取走以来的 ANSI 帧字节（宿主喂 vt100 解析器）。
     pub fn take_ansi(&self) -> Vec<u8> {
         self.ansi.take()
-    }
-
-    /// 只读状态句柄：app 线程在每次状态变更帧后发布 `SessionState` 快照，
-    /// 宿主读锁访问（token 用量、in-flight 工具、模型等结构化信息）。
-    pub fn session_state(&self) -> Arc<RwLock<SessionState>> {
-        self.state.clone()
     }
 
     /// 会话线程是否仍在运行（false = pi 已退出或已关闭；spec: `exited` 徽章）。
@@ -370,7 +357,6 @@ mod tests {
         let app = EmbeddedApp {
             keys: tx,
             ansi: backend.buffer(),
-            state: Arc::new(RwLock::new(Default::default())),
             size,
             running: Arc::new(AtomicBool::new(true)),
             thread: Mutex::new(None),
@@ -425,7 +411,6 @@ mod tests {
         let app = EmbeddedApp {
             keys: tx,
             ansi: backend.buffer(),
-            state: Arc::new(RwLock::new(Default::default())),
             size,
             running: Arc::new(AtomicBool::new(true)),
             thread: Mutex::new(None),

@@ -133,30 +133,29 @@ fn truncate_line_width(line: &mut Line<'static>, max_w: usize) {
     }
 }
 
-/// 将逻辑行按视口宽度换行，并按滚动状态截取视口窗口。
+/// 把分块逻辑行按视口宽度换行，并按滚动状态截取视口窗口。
 ///
 /// 输入:
-///   lines  — 逻辑行（span 内可含 `\n`，样式随 span 保留）
+///   chunks — `(逻辑行片, 逐行命中 meta 片)` 序列（条目分块借出，避免
+///            全文拼装；与单片输入逐行等价）。meta 片内为命中种属：已有
+///            结果的工具卡含 Tool(id)、非空 thinking 块含 Thinking(seq)、
+///            消息首行含 MessageStart(seq)——每行 Vec 多标记共存，
+///            design D1/D2
 ///   width  — 视口宽度（单元格数，CJK 按 2 计）
 ///   height — 视口高度（窗口行数上限，至少 1）
 ///   scroll — 滚动状态：following 取末尾（贴底跟随，即原底部锚定行为）；
 ///            钉住取 `[top, top+height)`，top 越界时 clamp 到底
-///   meta   — 逐逻辑行命中标记组（与 lines 等长；chat_lines 产出：已有
-///            结果的工具卡含 Tool(id)、非空 thinking 块含 Thinking(seq)、
-///            消息首行含 MessageStart(seq)——每行 Vec 多标记共存，
-///            design D1/D2）
 ///   scrollbar — 滚动条覆盖（None=本帧不画，design D2）
 /// 输出:
 ///   `(窗口行序列, 吸收后的 ChatScroll, Vec<Hit>)`——窗口总行数
 ///   ≤ height；返回状态已回写 `viewport=height`、`content_len=全量` 并
 ///   `absorb(...)`；hits 为**窗口化之前**的全量绝对屏行区间（供点击命中）。
 ///   空逻辑行保留为一个空行，保证段落间距不塌缩。
-pub fn wrap_for_viewport(
-    lines: &[Line<'static>],
+pub fn wrap_for_viewport_chunks(
+    chunks: &[(&[Line<'static>], &[Vec<HitKind>])],
     width: u16,
     height: u16,
     scroll: &ChatScroll,
-    meta: &[Vec<HitKind>],
     scrollbar: Option<ScrollbarOverlay>,
     theme: &TuiTheme,
 ) -> (Vec<Line<'static>>, ChatScroll, Vec<Hit>) {
@@ -167,20 +166,22 @@ pub fn wrap_for_viewport(
     // 逐屏行的命中标记组：一条逻辑行的全部子行继承同一组（logical→
     // screen 传播）。
     let mut screen_meta: Vec<Vec<HitKind>> = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        // 父行 style（如工具卡片 bg 面板）传播到拆分出的子行（design D5）：
-        // Paragraph 只给有文本的单元格上色，行尾还得补 pad。
-        let style = line.style;
-        let mark = meta.get(i).cloned().unwrap_or_default();
-        let start = wrapped.len();
-        for sub in split_on_newlines(line) {
-            wrap_one(&sub, width, &mut wrapped);
+    for (chunk_lines, chunk_meta) in chunks {
+        for (i, line) in chunk_lines.iter().enumerate() {
+            // 父行 style（如工具卡片 bg 面板）传播到拆分出的子行（design D5）：
+            // Paragraph 只给有文本的单元格上色，行尾还得补 pad。
+            let style = line.style;
+            let mark = chunk_meta.get(i).cloned().unwrap_or_default();
+            let start = wrapped.len();
+            for sub in split_on_newlines(line) {
+                wrap_one(&sub, width, &mut wrapped);
+            }
+            for l in &mut wrapped[start..] {
+                l.style = style;
+            }
+            // 新增屏行全部继承该逻辑行的标识。
+            screen_meta.resize(wrapped.len(), mark.clone());
         }
-        for l in &mut wrapped[start..] {
-            l.style = style;
-        }
-        // 新增屏行全部继承该逻辑行的标识。
-        screen_meta.resize(wrapped.len(), mark.clone());
     }
 
     // 全量屏行空间扫出点击命中区间（drain 窗口之前，绝对号，design D2）。
@@ -197,23 +198,58 @@ pub fn wrap_for_viewport(
         }
     }
 
-    // 窗口化（design D3）：following 取末尾（现底部锚定行为），钉住取
-    // [top, top+height)；top 越界（内容骤减）时 clamp 到底。
+    // 窗口化（design D3 单源 `window_bounds`）：following 取末尾（现底部
+    // 锚定行为），钉住取 [top, top+height)；top 越界（内容骤减）时 clamp。
     let len = wrapped.len();
-    let max_top = len.saturating_sub(height);
-    let effective_top = if scroll.following {
-        max_top
-    } else {
-        scroll.top.min(max_top)
-    };
-    // 贴底判定：窗口已覆盖到最后一行（含内容不足一屏、空内容）。
-    let at_bottom = effective_top + height >= len;
+    let (effective_top, at_bottom) = window_bounds(len, height, scroll);
 
     if effective_top > 0 {
         wrapped.drain(..effective_top);
     }
     wrapped.truncate(height);
 
+    let next = finish_frame(
+        &mut wrapped, width, len, height, effective_top, at_bottom, scroll, scrollbar, theme,
+    );
+    (wrapped, next, hits)
+}
+
+/// 窗口边界（design D3 单源，全文/窗口化两路径共用）。
+///
+/// 输入: len — 内容总屏行数；height — 视口高（≥1）；scroll — 滚动状态
+/// 输出: `(effective_top, at_bottom)`——following 取末尾、钉住取
+///       `[top, top+height)`（越界 clamp 到底）；贴底 = 窗口覆盖到末行
+///       （含内容不足一屏、空内容）
+fn window_bounds(len: usize, height: usize, scroll: &ChatScroll) -> (usize, bool) {
+    let max_top = len.saturating_sub(height);
+    let effective_top = if scroll.following {
+        max_top
+    } else {
+        scroll.top.min(max_top)
+    };
+    let at_bottom = effective_top + height >= len;
+    (effective_top, at_bottom)
+}
+
+/// 滚动条覆盖 + ChatScroll 回写（design D2 单源，全文/窗口化两路径共用）。
+///
+/// 输入: wrapped — 已开窗的行（原地画滚动条）；width — 视口宽（≥1）；
+///       len — 内容总屏行；height — 视口高；effective_top/at_bottom —
+///       窗口边界；scroll — 滚动状态；scrollbar — 覆盖（None=本帧不画）；
+///       theme — 滚动条配色
+/// 输出: 回写后的 `ChatScroll`（viewport/content_len/absorb）
+#[allow(clippy::too_many_arguments)] // 逐参语义直白优于打包（与 render_chat 同取舍）
+fn finish_frame(
+    wrapped: &mut [Line<'static>],
+    width: usize,
+    len: usize,
+    height: usize,
+    effective_top: usize,
+    at_bottom: bool,
+    scroll: &ChatScroll,
+    scrollbar: Option<ScrollbarOverlay>,
+    theme: &TuiTheme,
+) -> ChatScroll {
     // 滚动条绘制（design D2）：截断显示宽至 width-1 再补末列字符——CJK
     // 双格尾字整字丢弃；pad+字符同 span（fg=token 色、无 bg，对齐 pi
     // 整格替换：工具卡面板底色在该格让位）。仅窗口内行（内容超视口时
@@ -248,10 +284,220 @@ pub fn wrap_for_viewport(
     // at_bottom 恢复/维持跟随。
     let mut next = *scroll;
     next.viewport = height as u16;
-    // 内容总行数回写（drain 前全量，滚动条几何用，design D1）。
+    // 内容总行数回写（窗口化前全量，滚动条几何用，design D1）。
     next.content_len = len;
     next.absorb(effective_top, at_bottom);
+    next
+}
+
+/// 分块布局借出单元（design D3：窗口化 wrap 与命中扫描的共用输入）。
+pub struct Chunk<'a> {
+    /// 该块逻辑行（未 wrap；条目/易失尾槽各一块）。
+    pub lines: &'a [Line<'static>],
+    /// 逐逻辑行命中 meta（与 lines 等长）。
+    pub meta: &'a [Vec<HitKind>],
+    /// 逐逻辑行 wrap 计数（与 lines 等长）。
+    pub counts: &'a [u32],
+    /// 块屏行总数（= counts 和；O(块数) 起点定位与 len 汇总用）。
+    pub total: usize,
+    /// 标记跨度 `(首个非空行, 末个非空行, 首行屏内偏移)`；None = 全块
+    /// 无标记（命中扫描 O(1) 跳过）。
+    pub span: Option<(u32, u32, u32)>,
+}
+
+/// 计算块的标记跨度（design D3：命中扫描只走 [first..=last] 区间）。
+///
+/// 输入: meta — 逐逻辑行命中组；counts — 逐行 wrap 计数（与 meta 等长）
+/// 输出: `Some((first, last, first_offset))` 或全空时 `None`
+pub(crate) fn mark_span(meta: &[Vec<HitKind>], counts: &[u32]) -> Option<(u32, u32, u32)> {
+    let first = meta.iter().position(|r| !r.is_empty())?;
+    let last = meta.iter().rposition(|r| !r.is_empty())?;
+    let first_offset: u32 = counts.iter().take(first).sum();
+    Some((first as u32, last as u32, first_offset))
+}
+
+/// 按逻辑行计数扫描命中区间（design D3：无需排版，屏行号由计数前缀和推；
+/// 每块经 mark_span 跳过无标记区间，成本 O(块数 + 标记跨度)）。
+///
+/// 输入: chunks — 分块借出单元序列（含 meta/计数/总数/标记跨度）
+/// 输出: 与 [`collect_hits`]（屏行空间）逐项等价的绝对屏行区间序列——
+///       同一逻辑行的全部子行继承同一组标记且屏行连续，两遍序（先内容类、
+///       后 MessageStart）保持 hit_at 首匹配语义
+fn collect_hits_counted(chunks: &[Chunk<'_>]) -> Vec<Hit> {
+    let mut hits = Vec::new();
+    collect_runs_counted(chunks, &mut hits, |k| !matches!(k, HitKind::MessageStart(_)));
+    collect_runs_counted(chunks, &mut hits, |k| matches!(k, HitKind::MessageStart(_)));
+    hits
+}
+
+/// 单遍：按 want 谓词选 kind，逻辑行序扫描连续同 kind 段（屏行连续性由
+/// 相邻逻辑行首尾相接保证——design D1 两遍序在计数空间的等价实现）。
+///
+/// 输入: chunks — 分块借出单元；hits — 结果追加器；want — 目标 kind 判定
+/// 输出: 无返回值；副作用为向 hits 追加半开区间 `[start, end)`
+fn collect_runs_counted(
+    chunks: &[Chunk<'_>],
+    hits: &mut Vec<Hit>,
+    want: impl Fn(&HitKind) -> bool,
+) {
+    let mut base = 0usize;
+    let mut run: Option<(HitKind, usize, usize)> = None;
+    for chunk in chunks {
+        let entry_base = base;
+        base = entry_base + chunk.total;
+        let Some((first, last, first_offset)) = chunk.span else {
+            // 全块无标记：等价逐行 kind=None → 关闭未完 run（O(1)）。
+            if let Some((rk, start, end)) = run.take() {
+                hits.push(Hit { start, end, kind: rk });
+            }
+            continue;
+        };
+        let first_row_base = entry_base + first_offset as usize;
+        // 首标记行前的空隙：同样等价逐行 kind=None → 关闭（若 run 尚未
+        // 接到该行）。
+        if let Some((_, _, end)) = &run
+            && *end < first_row_base
+        {
+            let (rk, start, end) = run.take().expect("run 在场");
+            hits.push(Hit { start, end, kind: rk });
+        }
+        // 只走标记跨度 [first..=last]；跨内逐行运行状态机（同屏行版）。
+        let mut row_base = first_row_base;
+        for li in first..=last {
+            let row = &chunk.meta[li as usize];
+            let count = chunk.counts.get(li as usize).copied().unwrap_or(1) as usize;
+            let line_base = row_base;
+            row_base += count;
+            let kind = row.iter().find(|k| want(k)).cloned();
+            match (&mut run, kind) {
+                (Some((rk, start, end)), Some(k)) if *rk == k && *end == line_base => {
+                    *end = row_base; // 同 kind 且屏行相接 → 延伸区间
+                }
+                (slot, kind) => {
+                    if let Some((rk, start, end)) = slot.take() {
+                        hits.push(Hit { start, end, kind: rk });
+                    }
+                    if let Some(k) = kind {
+                        *slot = Some((k, line_base, row_base));
+                    }
+                }
+            }
+        }
+        // 跨尾之后的空隙留待下一块的首行检查关闭（run.end ≤ base 不变式）。
+    }
+    if let Some((kind, start, end)) = run.take() {
+        hits.push(Hit { start, end, kind });
+    }
+}
+
+/// 分块视口换行（design D3：只排版落在窗口内的逻辑行，成本 O(窗口行)）。
+///
+/// 输入:
+///   chunks — 分块借出单元序列（逻辑行/meta/计数/块总数/标记跨度；
+///            布局缓存产出）
+///   width/height/scroll/scrollbar/theme — 同 [`wrap_for_viewport`]
+/// 输出: 同 [`wrap_for_viewport`]——窗口行、ChatScroll 回写与 hits 与全文
+///       路径逐字节相等（5.2 回归保证）；空逻辑行保留一个空行
+pub fn wrap_for_viewport_windowed(
+    chunks: &[Chunk<'_>],
+    width: u16,
+    height: u16,
+    scroll: &ChatScroll,
+    scrollbar: Option<ScrollbarOverlay>,
+    theme: &TuiTheme,
+) -> (Vec<Line<'static>>, ChatScroll, Vec<Hit>) {
+    let width = width.max(1) as usize;
+    let height = height.max(1) as usize;
+
+    // 内容总行数 = 块级总数和（design D3：无需排版即得 len/content_len）。
+    let len: usize = chunks.iter().map(|c| c.total).sum();
+    let (effective_top, at_bottom) = window_bounds(len, height, scroll);
+
+    // 定位窗口起点：先按块屏行总数 O(块数) 找块，再块内精定位行 + 偏移
+    // （块内行数小，线性可接受；避免每帧扫全部逻辑行）。
+    let mut start: Option<(usize, usize, usize)> = None;
+    let mut base = 0usize;
+    for (ci, chunk) in chunks.iter().enumerate() {
+        if base + chunk.total > effective_top {
+            let mut inner = base;
+            for (li, c) in chunk.counts.iter().enumerate() {
+                let count = *c as usize;
+                if inner + count > effective_top {
+                    start = Some((ci, li, effective_top - inner));
+                    break;
+                }
+                inner += count;
+            }
+            break;
+        }
+        base += chunk.total;
+    }
+
+    // 从起点逐行排版，首行跳过行内偏移，凑满 height 截断（等价全文路径
+    // 的 drain+truncate，design D3）。
+    let mut wrapped: Vec<Line<'static>> = Vec::with_capacity(height.min(256));
+    if let Some((ci0, li0, offset)) = start {
+        'collect: for (ci, chunk) in chunks.iter().enumerate().skip(ci0) {
+            let li_start = if ci == ci0 { li0 } else { 0 };
+            for (i, line) in chunk.lines.iter().enumerate().skip(li_start) {
+                if wrapped.len() >= height {
+                    break 'collect;
+                }
+                let mut rows: Vec<Line<'static>> = Vec::new();
+                for sub in split_on_newlines(line) {
+                    wrap_one(&sub, width, &mut rows);
+                }
+                // 父行 style（面板 bg）传播到子行（design D5），同全文路径。
+                for r in &mut rows {
+                    r.style = line.style;
+                }
+                let skip = if ci == ci0 && i == li0 { offset } else { 0 };
+                for r in rows.into_iter().skip(skip) {
+                    if wrapped.len() >= height {
+                        break;
+                    }
+                    wrapped.push(r);
+                }
+            }
+        }
+    }
+
+    // 带 bg 的行补齐到视口宽（同全文路径，只作用于窗口内行）。
+    for l in &mut wrapped {
+        if l.style.bg.is_some() {
+            let cur: usize = l.spans.iter().map(|s| s.content.as_ref().width()).sum();
+            if cur < width {
+                l.spans.push(Span::styled(" ".repeat(width - cur), l.style));
+            }
+        }
+    }
+
+    // 命中区间：逻辑层计数扫描（design D3，无需排版）。
+    let hits = collect_hits_counted(chunks);
+    let next = finish_frame(
+        &mut wrapped, width, len, height, effective_top, at_bottom, scroll, scrollbar, theme,
+    );
     (wrapped, next, hits)
+}
+
+/// 单片输入的视口换行（全量路径：存量测试与 5.2 回归基准的 oracle；
+/// 渲染/选区主路径走 [`wrap_for_viewport_windowed`]，二者逐字节一致）。
+///
+/// 输入: lines/meta — 全量逻辑行与逐行命中 meta（等长，语义同 chunks
+///       的单块）；width/height/scroll/scrollbar/theme — 同
+///       [`wrap_for_viewport_windowed`]
+/// 输出: 同 [`wrap_for_viewport_windowed`]（单片 = 单块）
+#[allow(dead_code)]
+pub fn wrap_for_viewport(
+    lines: &[Line<'static>],
+    width: u16,
+    height: u16,
+    scroll: &ChatScroll,
+    meta: &[Vec<HitKind>],
+    scrollbar: Option<ScrollbarOverlay>,
+    theme: &TuiTheme,
+) -> (Vec<Line<'static>>, ChatScroll, Vec<Hit>) {
+    wrap_for_viewport_chunks(&[(lines, meta)], width, height, scroll, scrollbar, theme)
 }
 
 /// 把逐行多标记扫描为连续命中区间（纯函数，design D1 两遍序）。
@@ -290,6 +536,20 @@ fn collect_runs(
         }
         hits.push(Hit { start, end: i, kind });
     }
+}
+
+/// 计算单个逻辑行按视口宽度换行后的屏行数（design D3 前缀和原料）。
+///
+/// 输入: line — 逻辑行（span 内可含 `\n`）；width — 视口宽度（单元格）
+/// 输出: 屏行数（≥1；空行/仅换行均保留至少一行）；与
+///       `wrap_for_viewport*` 对该行的产出行数一致（回归由 5.2 保证）
+pub(crate) fn count_wrapped_rows(line: &Line<'static>, width: usize) -> u32 {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    for sub in split_on_newlines(line) {
+        wrap_one(&sub, width, &mut out);
+    }
+    out.len() as u32
 }
 
 /// 把一个逻辑行按 span 内的 `\n` 拆成多个子行（保留每个 span 的样式）。

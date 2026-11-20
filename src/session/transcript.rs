@@ -120,8 +120,16 @@ pub struct SessionState {
     inflight: Vec<Block>,
     /// Tool executions seen before their toolCall block arrives, keyed by id.
     pending_tools: std::collections::HashMap<String, crate::session::blocks::ToolExecution>,
-    /// Whether the in-flight assistant belongs to the current turn's appended entry.
+    /// in-flight assistant 是否已并入当前轮追加的条目。
     inflight_appended: bool,
+
+    /// 布局失效检测（design D7）：变异事件计数——`handle()` 出口统一递增，
+    /// 与 `dirty_from` 构成 draw 对账安全网（只 bump 不标 = 漏标，降级
+    /// 全量重建而非 stale 渲染）。
+    rev: u64,
+    /// 被触最小条目下标：`usize::MAX` = 无脏；尾部/易失变异记
+    /// `transcript.len()`（重排范围为空，仅保证对账非空）。
+    dirty_from: usize,
 }
 
 impl SessionState {
@@ -143,6 +151,7 @@ impl SessionState {
     /// 输入: command — 命令文本；excluded — 是否 `!!`（不进上下文）
     /// 输出: 无返回值；副作用为置运行态并清空输出缓冲
     pub fn start_bash(&mut self, command: &str, excluded: bool) {
+        self.mark_tail(); // bash 易失尾（design D7）
         self.bash_running = true;
         self.bash_command = command.to_string();
         self.bash_excluded = excluded;
@@ -158,6 +167,7 @@ impl SessionState {
         if !self.bash_running {
             return; // 迟到结果（传输失败已复位）：忽略，避免空命令条目
         }
+        self.mark_tail(); // push 前取 len = 新条目下标 + 清易失尾（design D7）
         let output = result
             .get("output")
             .and_then(|o| o.as_str())
@@ -192,6 +202,7 @@ impl SessionState {
     /// 输入: 无
     /// 输出: 无返回值；副作用为清运行态（缓冲丢弃）
     pub fn abort_bash_state(&mut self) {
+        self.mark_tail(); // bash 易失尾复位（design D7）
         self.bash_running = false;
         self.bash_output.clear();
         self.bash_command.clear();
@@ -199,6 +210,8 @@ impl SessionState {
     }
 
     pub fn load_messages(&mut self, data: &Value) {
+        // 整体替换 → 从 0 全量失效（design D7）。
+        self.mark_dirty(0);
         let empty = Vec::new();
         let msgs = data
             .get("messages")
@@ -362,9 +375,64 @@ impl SessionState {
         }
     }
 
-    /// Ordered transcript entries.
+    /// 有序 transcript 条目（只读）。
     pub fn entries(&self) -> &[Entry] {
         &self.transcript
+    }
+
+    /// 读取并复位条目级脏标记（design D7 变更检测入口）。
+    ///
+    /// 输入: 无（&mut self 以复位 `dirty_from`）
+    /// 输出: `(rev, dirty_from)`——rev 为累计变异事件计数（不清零，缓存侧
+    ///       存 `last_rev` 对账）；dirty_from 为自上次读取以来被触最小条目
+    ///       下标（`usize::MAX` = 无脏；派生默认 0 = 冷启动全量失效），
+    ///       读取即复位为 `usize::MAX`；错误情形：无
+    pub fn take_dirty(&mut self) -> (u64, usize) {
+        let dirty = std::mem::replace(&mut self.dirty_from, usize::MAX);
+        (self.rev, dirty)
+    }
+
+    /// 记条目级脏：idx 及其后条目需重排版（design D7 精确埋点）。
+    ///
+    /// 输入: idx — 被触条目下标（与现值取 min，多点变异保最小下标）
+    /// 输出: 无返回值；副作用为 `dirty_from = min(dirty_from, idx)`
+    fn mark_dirty(&mut self, idx: usize) {
+        self.dirty_from = self.dirty_from.min(idx);
+    }
+
+    /// 记尾部脏：只涉易失尾（inflight/bash）或无条目变更的良性事件——
+    /// 重排范围为空，仅保证对账非空、避免误判漏标（design D7）。
+    ///
+    /// 输入: 无（读 `transcript.len()`）
+    /// 输出: 无返回值；副作用为 `dirty_from = min(dirty_from, len)`
+    fn mark_tail(&mut self) {
+        let len = self.transcript.len();
+        self.mark_dirty(len);
+    }
+
+    /// 测试专用：模拟"漏标"——只 bump rev 不落任何脏标记（design D7
+    /// 安全网用例：draw 对账应降级全量重建而非渲染 stale 内容）。
+    ///
+    /// 输入: 无
+    /// 输出: 无返回值；副作用为 `rev += 1`，`dirty_from` 不变
+    #[cfg(test)]
+    pub(crate) fn simulate_missed_mark(&mut self) {
+        self.rev += 1;
+    }
+
+    /// 追加一条通知条目并落尾部脏标记（design D7；App 层展示类通知的唯一
+    /// 入口——不暴露 transcript 直改，保证标记不漏）。
+    ///
+    /// 输入: kind — 通知类别（error/retry/compaction/changelog 等）；
+    ///       text — 通知正文
+    /// 输出: 无返回值；副作用为尾部 push 一条 Entry::Notice + 尾部脏标记
+    ///       （push 前取 len = 新条目下标；连续调用 min 保首个下标）
+    pub fn push_notice(&mut self, kind: &str, text: String) {
+        self.mark_tail();
+        self.transcript.push(Entry::Notice {
+            kind: kind.to_string(),
+            text,
+        });
     }
 
     /// Blocks for the assistant message currently streaming but not yet
@@ -409,7 +477,10 @@ impl SessionState {
             return;
         };
         match kind {
-            "agent_start" => self.phase = Phase::Streaming,
+            "agent_start" => {
+                self.phase = Phase::Streaming;
+                self.mark_tail();
+            }
             "agent_settled" => {
                 self.flush_inflight();
                 self.phase = Phase::Idle;
@@ -417,8 +488,12 @@ impl SessionState {
             "turn_start" => {
                 self.phase = Phase::Streaming;
                 self.current_turn += 1;
+                self.mark_tail();
             }
             "turn_end" => {
+                // 良性兜底（design D7 选项 A）：无 message/toolResults 也落
+                // 尾部脏；精确标记由 correct_existing/apply_tool 命中时取更小值。
+                self.mark_tail();
                 // turn_end repeats the assistant message already finalized by its
                 // message_end, so it must not append a duplicate entry. Use it
                 // only to backfill authoritative content/tool results onto the
@@ -448,20 +523,24 @@ impl SessionState {
                     self.follow_up_queue =
                         q.iter().filter_map(|x| x.as_str().map(String::from)).collect();
                 }
+                self.mark_tail(); // 队列只进状态行，不入聊天区（design D7 良性）
             }
             "thinking_level_changed" => {
                 if let Some(l) = event.get("level").and_then(|v| v.as_str()) {
                     self.thinking_level = Some(l.to_string());
                 }
+                self.mark_tail();
             }
             "session_info_changed" => {
                 self.session_name = event
                     .get("name")
                     .and_then(|v| v.as_str())
                     .map(String::from);
+                self.mark_tail();
             }
             // 自动重试：归约为对话流通知（不影响 phase/消息归约）。
             "auto_retry_start" => {
+                self.mark_tail(); // push 前取 len = 新条目下标（design D7）
                 let attempt = event.get("attempt").and_then(|x| x.as_u64()).unwrap_or(0);
                 let max = event.get("maxAttempts").and_then(|x| x.as_u64()).unwrap_or(0);
                 let err = event
@@ -474,6 +553,7 @@ impl SessionState {
                 });
             }
             "auto_retry_end" => {
+                self.mark_tail(); // push 前取 len = 新条目下标（design D7）
                 let success = event.get("success").and_then(|x| x.as_bool()).unwrap_or(false);
                 let text = if success {
                     "重试成功".to_string()
@@ -491,6 +571,7 @@ impl SessionState {
             }
             // 手动压缩：置标志 + 通知（上层据此拦截输入提交）。
             "compaction_start" => {
+                self.mark_tail(); // push 前取 len = 新条目下标（design D7）
                 self.compacting = true;
                 self.transcript.push(Entry::Notice {
                     kind: "compaction".to_string(),
@@ -498,6 +579,7 @@ impl SessionState {
                 });
             }
             "compaction_end" => {
+                self.mark_tail(); // push 前取 len = 新条目下标（design D7）
                 self.compacting = false;
                 let aborted = event
                     .get("aborted")
@@ -532,19 +614,28 @@ impl SessionState {
             }
             // 用户 bash 输出分片：追加到运行缓冲（单命令门控，忽略事件 id）
             "bash_execution_update" => {
+                self.mark_tail(); // bash 易失尾输出（design D7）
                 if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
                     self.bash_output.push_str(delta);
                 }
             }
-            // Captured but not modeled in depth this phase:
+            // Captured but not modeled in depth this phase: 良性/忽略事件同样
+            // 落尾部脏（design D7 选项 A：对账非空、重排范围为空）。
             "summarization_retry_scheduled"
             | "summarization_retry_attempt_start" | "summarization_retry_finished"
-            | "entry_appended" | "agent_end" => {}
-            _ => {}
+            | "entry_appended" | "agent_end" => self.mark_tail(),
+            _ => self.mark_tail(),
         }
+        // 安全网（design D7）：任何入站事件必 bump rev；已知路径均落脏标记
+        // （精确或尾部），只 bump 不标 = 漏标 → draw 对账降级全量重建。
+        // 无 type 的畸形事件在解析处早退，不构成事件、不 bump。
+        self.rev += 1;
     }
 
     fn on_message_start(&mut self, message: Option<&Value>) {
+        // 尾部脏先落（design D7）：覆盖 user push（push 前取 len）与
+        // assistant inflight 重置；无 message 早退同样有标记。
+        self.mark_tail();
         let Some(message) = message else { return };
         match message.get("role").and_then(|r| r.as_str()) {
             Some("assistant") => {
@@ -562,6 +653,8 @@ impl SessionState {
     }
 
     fn on_message_update(&mut self, event: &Value) {
+        // inflight 增量 / usage-only 均只涉易失尾或状态行（design D7）。
+        self.mark_tail();
         if let Some(u) = event.get("usage")
             && let Some(usage) = Usage::from_json(u) {
                 self.usage = Some(usage);
@@ -673,6 +766,8 @@ impl SessionState {
     /// 输出: 无返回值；副作用为更新 in-flight/transcript，
     ///       且当 assistant 消息含非空 errorMessage 时追加 Notice{kind:"error"}
     fn on_message_end(&mut self, message: Option<&Value>) {
+        // flush 落盘 + error 通知 push 均在此函数内（design D7 先落尾部脏）。
+        self.mark_tail();
         let Some(message) = message else { return };
         if message.get("role").and_then(|r| r.as_str()) == Some("assistant") {
             self.replace_inflight_from_message(message);
@@ -691,6 +786,7 @@ impl SessionState {
     }
 
     fn on_tool_start(&mut self, event: &Value) {
+        self.mark_tail(); // tool 事件：inflight/尾部或 apply_tool 精确记（design D7）
         let Some(id) = event.get("toolCallId").and_then(|i| i.as_str()) else {
             return;
         };
@@ -703,6 +799,7 @@ impl SessionState {
     }
 
     fn on_tool_update(&mut self, event: &Value) {
+        self.mark_tail(); // tool 事件：同 on_tool_start（design D7）
         // partialResult 存为运行中部分结果（D1）；无该字段的 update 不清空
         // 已有 partial（merge 继承规则），首见时同时打点执行起点（D2）。
         let Some(id) = event.get("toolCallId").and_then(|i| i.as_str()) else {
@@ -723,6 +820,7 @@ impl SessionState {
     }
 
     fn on_tool_end(&mut self, event: &Value) {
+        self.mark_tail(); // tool 事件：同 on_tool_start（design D7）
         let Some(id) = event.get("toolCallId").and_then(|i| i.as_str()) else {
             return;
         };
@@ -887,19 +985,23 @@ impl SessionState {
                 }
         }
         // Also update an already-flushed assistant entry (tool_end may follow
-        // message_end ordering).
-        for entry in self.transcript.iter_mut().rev() {
-            if let Entry::Assistant { blocks, .. } = entry {
-                for b in blocks.iter_mut() {
-                    if let Block::ToolCall {
-                        id: bid, tool, ..
-                    } = b
-                        && bid == &id {
-                            *tool = merge_tool(tool, exec);
-                            return;
-                        }
-                }
+        // message_end ordering). 先扫命中下标（不可变），再单点变更并收紧
+        // 条目级脏（design D7 精确埋点；避免循环内 move exec）。
+        let hit = self.transcript.iter().enumerate().rev().find(|(_, e)| {
+            matches!(e, Entry::Assistant { blocks, .. }
+                if blocks.iter().any(|b| matches!(b, Block::ToolCall { id: bid, .. } if bid == &id)))
+        }).map(|(i, _)| i);
+        if let Some(i) = hit {
+            if let Some(Entry::Assistant { blocks, .. }) = self.transcript.get_mut(i)
+                && let Some(b) = blocks
+                    .iter_mut()
+                    .find(|b| matches!(b, Block::ToolCall { id: bid, .. } if bid == &id))
+                && let Block::ToolCall { tool, .. } = b
+            {
+                *tool = merge_tool(tool, exec);
             }
+            self.mark_dirty(i);
+            return;
         }
         self.pending_tools.insert(id, exec);
     }
@@ -939,15 +1041,16 @@ impl SessionState {
         let Some(content) = message.get("content").and_then(|c| c.as_array()) else {
             return;
         };
-        let Some(last) = self
+        let Some(pos) = self
             .transcript
-            .iter_mut()
-            .rev()
-            .find(|e| matches!(e, Entry::Assistant { .. }))
+            .iter()
+            .rposition(|e| matches!(e, Entry::Assistant { .. }))
         else {
             return;
         };
-        let Entry::Assistant { blocks, .. } = last else {
+        // 命中即精确记条目级脏（design D7）。
+        self.mark_dirty(pos);
+        let Some(Entry::Assistant { blocks, .. }) = self.transcript.get_mut(pos) else {
             return;
         };
         for (i, item) in content.iter().enumerate() {
@@ -1041,10 +1144,12 @@ impl SessionState {
     fn flush_inflight(&mut self) {
         if self.inflight.is_empty() {
             self.inflight_appended = false;
+            self.mark_tail(); // 仅状态复位、无条目变更（design D7）
             return;
         }
         let blocks = std::mem::take(&mut self.inflight);
         let pos = self.ensure_assistant_entry();
+        self.mark_dirty(pos); // 落盘目标条目（新建或复用）→ 精确下标（design D7）
         if let Some(Entry::Assistant {
             blocks: dst,
             usage: u,
@@ -1169,6 +1274,115 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// 1.1 take_dirty 语义：读取即复位；无变异时（首取消化冷启动标记后）
+    /// 返回"无脏"；rev 只读不清零。
+    /// 输入: 无；输出: 断言 (rev, dirty_from) 两段序列成立
+    #[test]
+    fn take_dirty_resets_and_reports_clean_when_untouched() {
+        let mut s = SessionState::new();
+        // 冷启动：派生默认 dirty_from=0 → 首取给出全量失效标记（缓存冷建全量）。
+        let (rev0, dirty0) = s.take_dirty();
+        assert_eq!((rev0, dirty0), (0, 0));
+        // 无变异：再次读取 = 无脏，rev 不变（take 不清零 rev）。
+        let (rev1, dirty1) = s.take_dirty();
+        assert_eq!(rev1, rev0);
+        assert_eq!(dirty1, usize::MAX);
+        // 再次读取仍为无脏（复位生效）。
+        let (_, dirty2) = s.take_dirty();
+        assert_eq!(dirty2, usize::MAX);
+    }
+
+    /// 1.2 逐类埋点：条目 push → 新条目下标（push 前标记）；flush 落盘 →
+    /// 精确下标；流式/bash/良性事件 → 尾部脏（dirty == len，选项 A）。
+    /// 输入: 无（构造事件序列）；输出: 断言各类 take_dirty 的 dirty_from
+    #[test]
+    fn dirty_marks_classify_mutation_kinds() {
+        let mut s = SessionState::new();
+        // user push：新条目下标 0（push 前取 len）。
+        s.handle(&json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}));
+        let (_, d) = s.take_dirty();
+        assert_eq!(d, 0, "user push 应记新条目下标");
+
+        // 流式 inflight（易失尾）→ 尾部脏 = len，不落条目下标。
+        s.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+        s.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"x"}}));
+        let (_, d) = s.take_dirty();
+        assert_eq!(d, s.entries().len(), "流式应记尾部脏");
+
+        // flush 落盘 → 精确到新 assistant 条目下标 1。
+        s.handle(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"x"}]}}));
+        let (_, d) = s.take_dirty();
+        assert_eq!(d, 1, "flush 应精确到落盘条目");
+
+        // 良性事件（queue_update）→ 尾部脏 = len = 2。
+        s.handle(&json!({"type":"queue_update","steering":["a"]}));
+        let (_, d) = s.take_dirty();
+        assert_eq!(d, 2, "良性事件应记尾部脏");
+
+        // bash 尾字段（bash_execution_update）→ 尾部脏 = len。
+        s.handle(&json!({"type":"bash_execution_update","delta":"out"}));
+        let (_, d) = s.take_dirty();
+        assert_eq!(d, 2, "bash 尾字段应记尾部脏");
+    }
+
+    /// 1.2 就地变异精确下标：apply_tool 命中已提交条目 → 命中下标（非尾部）。
+    /// 输入: 无（直接构造含 ToolCall 的 transcript）；输出: 断言 dirty == 1
+    #[test]
+    fn apply_tool_marks_hit_entry_index() {
+        let mut s = SessionState::new();
+        s.transcript.push(Entry::User { text: "q".into() });
+        s.transcript.push(Entry::Assistant {
+            turn: 1,
+            blocks: vec![Block::ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                args_json: "{}".into(),
+                tool: Default::default(),
+            }],
+            usage: None,
+        });
+        let _ = s.take_dirty(); // 清冷启动标记
+        s.handle(&json!({"type":"tool_execution_start","toolCallId":"c1"}));
+        let (_, d) = s.take_dirty();
+        assert_eq!(d, 1, "apply_tool 应记命中条目下标");
+    }
+
+    /// 1.2 push_notice 入口与全量替换：新条目下标 / 0。
+    /// 输入: 无；输出: 断言 dirty 分别为 1 与 0
+    #[test]
+    fn push_notice_marks_tail_and_load_messages_marks_zero() {
+        let mut s = SessionState::new();
+        s.handle(&json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"a"}]}}));
+        let _ = s.take_dirty();
+        s.push_notice("changelog", "line1".into());
+        let (_, d) = s.take_dirty();
+        assert_eq!(d, 1, "push_notice 应记新条目下标（push 前 len）");
+        s.load_messages(&json!({"messages":[{"role":"user","content":[{"type":"text","text":"b"}]}]}));
+        let (_, d) = s.take_dirty();
+        assert_eq!(d, 0, "全量替换应从 0 失效");
+        assert_eq!(s.entries().len(), 1);
+    }
+
+    /// 1.3 handle 出口统一 rev++：已知路径必落脏标记；无 type 畸形事件不 bump；
+    /// 漏标模拟（只 bump 不标）→ (rev↑, dirty=MAX)，即对账降级全量的键。
+    /// 输入: 无；输出: 断言 rev 单调与漏标模拟产出的对账键
+    #[test]
+    fn handle_bumps_rev_and_missed_mark_yields_bare_rev() {
+        let mut s = SessionState::new();
+        let (r0, _) = s.take_dirty();
+        s.handle(&json!({"type":"agent_start"}));
+        let (r1, d1) = s.take_dirty();
+        assert!(r1 > r0, "handle 出口应 bump rev");
+        assert_ne!(d1, usize::MAX, "已知路径应落脏标记（非漏标）");
+        s.handle(&json!({"no_type":true}));
+        let (r2, d2) = s.take_dirty();
+        assert_eq!(r2, r1, "无 type 畸形事件不 bump rev");
+        assert_eq!(d2, usize::MAX, "畸形事件无状态变更、无标记");
+        s.simulate_missed_mark();
+        let (r3, d3) = s.take_dirty();
+        assert!(r3 > r2, "漏标模拟应 bump rev");
+        assert_eq!(d3, usize::MAX, "漏标 = rev 变且无脏（对账将降级全量）");
+    }
     #[test]
     fn lifecycle_phase_and_user_assistant() {
         let mut s = SessionState::new();

@@ -8,9 +8,10 @@ use ratatui::Frame;
 
 use pi_shell_rs::session::{Phase, SessionState, Usage};
 
-use crate::app::chat::{chat_lines_themed, RenderFlags};
+use crate::app::chat::RenderFlags;
+use crate::app::layout_cache::LayoutCache;
 use crate::app::scroll::ChatScroll;
-use crate::app::wrap::wrap_for_viewport;
+use crate::app::wrap::wrap_for_viewport_windowed;
 use unicode_width::UnicodeWidthChar;
 
 /// 一帧所需的全部 UI 附加输入（与会话状态解耦，便于测试构造）。
@@ -54,7 +55,9 @@ pub struct ViewUi<'a> {
 
 /// 从不可变状态渲染一帧（含浮层）。
 ///
-/// 输入: frame — ratatui 帧；state — 会话状态；ui — 一帧的 UI 附加输入
+/// 输入: frame — ratatui 帧；state — 会话状态（消费脏标记，&mut 供
+///       `take_dirty`）；ui — 一帧的 UI 附加输入；cache — 条目级布局
+///       缓存（增量重排，design D1/D7）
 /// 输出: `(吸收后的 ChatScroll, Vec<Hit>, 消息区 Rect)`——前者为渲染端回写
 ///       （视口首行/贴底跟随/视口高，design D2），次者为可点击内容
 ///       （工具卡/thinking）绝对屏行命中区间（design D1/D2），末者为
@@ -62,8 +65,9 @@ pub struct ViewUi<'a> {
 ///       副作用为绘制整帧
 pub fn render(
     frame: &mut Frame,
-    state: &SessionState,
+    state: &mut SessionState,
     ui: &ViewUi<'_>,
+    cache: &mut LayoutCache,
 ) -> (ChatScroll, Vec<crate::app::wrap::Hit>, ratatui::layout::Rect) {
     let area = frame.area();
     let queue = queue_lines(state, ui.local_queue);
@@ -99,6 +103,7 @@ pub fn render(
         ui.thinking_overrides,
         ui.scrollbar,
         &ui.theme,
+        cache,
     );
     if queue_h > 0 {
         frame.render_widget(
@@ -343,41 +348,45 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, state: &Session
 /// 输入:
 ///   frame  — ratatui 帧
 ///   area   — 消息区矩形（三分区布局的 Min(1) 块）
-///   state  — 会话状态（chat_lines 展开源）
+///   state  — 会话状态（消费脏标记；条目排版由 cache 增量产出）
 ///   flags  — thinking/工具展开偏好
 ///   scroll — 当前滚动状态（following 贴底 / 钉住开窗）
 ///   tool_expanded — 单卡展开覆盖表（None=无覆盖，design D1）
 ///   thinking_overrides — thinking 单块覆盖（None=无覆盖，design D3）
+///   cache — 条目级布局缓存（design D1/D2/D7；refresh + 分块借出）
 /// 输出: `(吸收后的 ChatScroll, Vec<Hit>)`——前者为窗口首行/贴底判定/
 ///       视口高回写，后者为可点击内容绝对屏行命中区间（design D1/D2）；
 ///       副作用为在 area 上绘制消息区
 // 参：frame/area/state/flags/scroll/tool_expanded/thinking_overrides/
-// scrollbar —— 逐参语义直白优于打包结构（design D5 取舍）。
+// scrollbar/cache —— 逐参语义直白优于打包结构（design D5 取舍）。
 #[allow(clippy::too_many_arguments)]
 fn render_chat(
     frame: &mut Frame,
     area: ratatui::layout::Rect,
-    state: &SessionState,
+    state: &mut SessionState,
     flags: RenderFlags,
     scroll: ChatScroll,
     tool_expanded: Option<&std::collections::HashMap<String, bool>>,
     thinking_overrides: Option<&std::collections::HashMap<usize, bool>>,
     scrollbar: Option<crate::app::wrap::ScrollbarOverlay>,
     theme: &crate::app::theme::TuiTheme,
+    cache: &mut LayoutCache,
 ) -> (ChatScroll, Vec<crate::app::wrap::Hit>) {
     let empty = std::collections::HashMap::new();
     let overrides = tool_expanded.unwrap_or(&empty);
     let empty_t = std::collections::HashMap::new();
     let thinking = thinking_overrides.unwrap_or(&empty_t);
-    let (lines, meta) = chat_lines_themed(state, flags, overrides, thinking, theme);
+    // 条目级布局缓存（design D1/D2/D7）：增量重排 + 易失尾常新。
+    cache.refresh(state, flags, overrides, thinking, theme, area.width);
+    // 分块借出给 wrap（避免全文拼装克隆；与全量路径逐字节一致）。
+    let chunks = cache.chunks();
     // 自行换行后按滚动状态开窗口：ratatui 的 Wrap+scroll 偏移按换行后行数
     // 计，我们无法精确预知，会导致最新内容被挤出视口（见 wrap 模块说明）。
-    let (wrapped, next, hits) = wrap_for_viewport(
-        &lines,
+    let (wrapped, next, hits) = wrap_for_viewport_windowed(
+        &chunks,
         area.width,
         area.height,
         &scroll,
-        &meta,
         scrollbar,
         theme,
     );
@@ -581,6 +590,24 @@ mod render_tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use serde_json::json;
+
+    /// 测试渲染入口：保持旧签名（`state: &SessionState`），内部持线程局部
+    /// 布局缓存并克隆 state 供 `take_dirty`——克隆态 dirty 恒为非 MAX，
+    /// 每次全量重建，输出与全量路径等价；存量用例零改动（遮蔽 super::render）。
+    fn render(
+        frame: &mut ratatui::Frame,
+        state: &SessionState,
+        ui: &ViewUi<'_>,
+    ) -> (ChatScroll, Vec<crate::app::wrap::Hit>, ratatui::layout::Rect) {
+        thread_local! {
+            static CACHE: std::cell::RefCell<crate::app::layout_cache::LayoutCache> =
+                std::cell::RefCell::new(crate::app::layout_cache::LayoutCache::default());
+        }
+        CACHE.with(|c| {
+            let mut state = state.clone();
+            super::render(frame, &mut state, ui, &mut c.borrow_mut())
+        })
+    }
 
     /// Render the view into a TestBackend buffer and return its text.
     fn render_to_buffer(state: &SessionState, input: &str, w: u16, h: u16) -> String {
