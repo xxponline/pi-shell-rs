@@ -1,0 +1,5 @@
+schema: spec-driven
+created: 2026-11-20
+# 等价重构：可见行为不变、无 spec 级行为变化（见 proposal.md Capabilities），
+# 零 delta 显式豁免。
+skip_specs: true
