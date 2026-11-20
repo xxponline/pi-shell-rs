@@ -871,4 +871,161 @@ mod tests {
             mem / (1024 * 1024)
         );
     }
+
+    /// 4.2 常驻基准：长会话 + 流式增长尾槽的逐帧成本（design D3/D4：
+    /// 流式尾条场景补原 bench 暖帧口径盲区）。背景 = 合成 1500 条/5.8MB
+    /// bench 同款；尾条 = 40KB 互异代码块（~200B/delta，每 delta 一帧），
+    /// 分段计时基线/流式/落盘，并每 25 delta 记 memo/oracle 等价计数注记
+    /// （组 1 占位计数，组 2 接真断言）。
+    /// 输入: 无（全部合成内容，无真实会话数据）
+    /// 输出: [bench] 分段计时 + parity 计数 eprintln；组 1 不带预算断言
+    ///       （max frame < 5ms 断言随组 2 合入），手工核对分段基线
+    #[test]
+    fn bench_streaming_tail_under_budget() {
+        // 背景 = bench 同款合成 (约 1500 条/5.8MB, 与真实长会话 1496/5.9MB
+        // 同量级)。真实会话日志是 agent 日志格式 (非 probe 包装), replay
+        // 不认; 背景只需同量级条目/字节, 内容真实度由尾条负责。
+        let mut state =
+            replay_jsonl(std::io::Cursor::new(synthetic_jsonl().as_bytes())).expect("合成回放");
+        let n_entries = state.entries().len();
+        assert!(n_entries >= 1400, "背景应约 1500 条, 实得 {n_entries}");
+        let (o, t, theme) = defaults();
+        let flags = RenderFlags::default();
+
+        // ---- 基线对照: 冷建 / 暖帧 / 完整 draw (镜像 bench) ----
+        let mut cache = LayoutCache::default();
+        let cold0 = Instant::now();
+        cache.refresh(&mut state, flags, &o, &t, &theme, 100);
+        let cold_ms = cold0.elapsed().as_secs_f64() * 1e3;
+        let mut warm_best = f64::MAX;
+        for _ in 0..10 {
+            let t0 = Instant::now();
+            cache.refresh(&mut state, flags, &o, &t, &theme, 100);
+            let chunks = cache.chunks();
+            let _ = wrap::wrap_for_viewport_windowed(&chunks, 100, 36, &ChatScroll::default(), None, &theme);
+            warm_best = warm_best.min(t0.elapsed().as_secs_f64() * 1e3);
+        }
+        let backend = ratatui::backend::TestBackend::new(100, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let ui = crate::app::view::ViewUi::default();
+        let mut draw_warm_best = f64::MAX;
+        for _ in 0..5 {
+            let t0 = Instant::now();
+            terminal
+                .draw(|frame| {
+                    let _ = crate::app::view::render(frame, &mut state, &ui, &mut cache);
+                })
+                .unwrap();
+            draw_warm_best = draw_warm_best.min(t0.elapsed().as_secs_f64() * 1e3);
+        }
+        eprintln!(
+            "[bench] base: entries={n_entries} cold={cold_ms:.1}ms warm_best={warm_best:.2}ms draw_warm_best={draw_warm_best:.2}ms"
+        );
+
+        // ---- 流式场景: 40KB 混合 markdown/代码块响应, ~200B/delta, 每 delta 一帧 ----
+        state.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+        let mut source = String::new();
+        let mut blk = 0usize;
+        while source.len() < 40 * 1024 {
+            source.push_str("这是一段**流式**正文，用于模拟真实长回答的排版成本。行内 `code` 与中文混排 wrap 压力。\n\n");
+            blk += 1;
+            // 各块内容互异: 真实流式里代码块持续变化, 高亮缓存逐帧 miss。
+            source.push_str(&format!(
+                "```rust\nfn demo_{blk}(x: usize) -> usize {{\n    // 块 {blk}: 内容互异\n    (0..x).map(|i| i * {blk}).sum()\n}}\n```\n\n"
+            ));
+        }
+        let mut deltas: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        for ch in source.chars() {
+            cur.push(ch);
+            if cur.len() >= 200 {
+                deltas.push(std::mem::take(&mut cur));
+            }
+        }
+        if !cur.is_empty() {
+            deltas.push(cur);
+        }
+
+        // 单缓存探针 (dirty_from 是单缓存协议 — 双缓存会互相消费脏标记,
+        // 误触"漏标降级全量重建", 首版量测教训):
+        // 每 delta: handle -> [refresh 计时(尾槽重建)] -> [draw 计时
+        // (内部 refresh=空操作 + wrap + paint)], 两段相加 = 真实整帧。
+        let mut cache = LayoutCache::default();
+        cache.refresh(&mut state, flags, &o, &t, &theme, 100);
+        terminal
+            .draw(|frame| {
+                let _ = crate::app::view::render(frame, &mut state, &ui, &mut cache);
+            })
+            .unwrap();
+        let (mut sum_frame, mut max_frame) = (0f64, 0f64);
+        let (mut sum_refresh, mut max_refresh) = (0f64, 0f64);
+        // parity 计数注记（占位计数，组 2 接真断言）：每 25 delta 比对
+        // memo 路径（缓存摊平）与全量 oracle（chat_lines_themed）逐字节。
+        let (mut parity_ok, mut parity_checked) = (0usize, 0usize);
+        for (i, d) in deltas.iter().enumerate() {
+            let th = Instant::now();
+            state.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":d}}));
+            let handle_ms = th.elapsed().as_secs_f64() * 1e3;
+
+            let t1 = Instant::now();
+            cache.refresh(&mut state, flags, &o, &t, &theme, 100);
+            let refresh_ms = t1.elapsed().as_secs_f64() * 1e3;
+
+            let t0 = Instant::now();
+            terminal
+                .draw(|frame| {
+                    let _ = crate::app::view::render(frame, &mut state, &ui, &mut cache);
+                })
+                .unwrap();
+            let draw_ms = t0.elapsed().as_secs_f64() * 1e3;
+            let frame_ms = refresh_ms + draw_ms;
+
+            sum_frame += frame_ms;
+            max_frame = max_frame.max(frame_ms);
+            sum_refresh += refresh_ms;
+            max_refresh = max_refresh.max(refresh_ms);
+            if (i + 1) % 25 == 0 {
+                // 流式中间态等价计数（memo/oracle 逐字节；组 2 转真断言）。
+                let (cl, cm) = flatten(&cache);
+                let (ol, om) =
+                    chat::chat_lines_themed(&state, flags, &o, &t, &theme);
+                parity_checked += 1;
+                if cl == ol && cm == om {
+                    parity_ok += 1;
+                }
+                eprintln!(
+                    "[bench] delta#{:4} tail≈{:>6}B | handle={:.2} refresh={:.2} draw(wrap+paint)={:.2} frame={:.2}ms | parity=memo/oracle {}/{}",
+                    i + 1,
+                    (i + 1) * 200,
+                    handle_ms,
+                    refresh_ms,
+                    draw_ms,
+                    frame_ms,
+                    parity_ok,
+                    parity_checked
+                );
+            }
+        }
+        eprintln!(
+            "[bench] stream: deltas={} tail={}B | frame avg={:.2} max={:.2}ms | refresh avg={:.2} max={:.2}ms | parity=memo/oracle {}/{}",
+            deltas.len(),
+            source.len(),
+            sum_frame / deltas.len() as f64,
+            max_frame,
+            sum_refresh / deltas.len() as f64,
+            max_refresh,
+            parity_ok,
+            parity_checked
+        );
+
+        // ---- 收尾: message_end 落盘 (尾槽 -> 正式条目) 后一帧 ----
+        state.handle(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":source}]}}));
+        let t0 = Instant::now();
+        terminal
+            .draw(|frame| {
+                let _ = crate::app::view::render(frame, &mut state, &ui, &mut cache);
+            })
+            .unwrap();
+        eprintln!("[bench] land: message_end 后整帧={:.2}ms", t0.elapsed().as_secs_f64() * 1e3);
+    }
 }
