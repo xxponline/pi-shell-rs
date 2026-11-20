@@ -35,13 +35,38 @@
 
 ## 3. 终验
 
-- [ ] 3.1 回归：`bench_warm_frame_under_budget` 原值不劣化（暖帧 <5ms、
+- [x] 3.1 回归：`bench_warm_frame_under_budget` 原值不劣化（暖帧 <5ms、
   draw <50ms 断言原绿）；PTY 长会话冒烟（1829 条消息）无卡死。验证：两处
   命令输出原绿
-- [ ] 3.2 宿主口径验收注记：`[term-rate] 输入→帧 ≤20ms` 复测口径与复测结果
+  注记（实测 2026-11-20）：`cargo test bench_warm_frame -- --nocapture` →
+  warm_best=1.08ms（<5ms ✓）/ draw_best=2.66ms（<50ms ✓）/ cache_mem=19.2MB，
+  与组 2 前基线（1.06-1.10ms）无劣化；PTY 冒烟（100×40，cwd=balabala，
+  一次性驱动脚本 /tmp/pty_smoke.py）：resume 首位 **2138 条消息**长会话
+  （9.0MB 文件，≥1829 基准）加载正常，滚轮 30/30 事件无停顿（max_gap 43ms）、
+  PageUp/Down 回显 3ms、打字 4ms、ctrl+t 切换 32-84ms（全量重建口径）、
+  /quit 干净退出 code=0 —— **长会话交互无卡死 ✓**
+- [x] 3.2 宿主口径验收注记：`[term-rate] 输入→帧 ≤20ms` 复测口径与复测结果
   （复测在宿主仓 balabala-agent-gui）写入组 3 提交信息/文档注记。验证：提交
   信息含宿主口径注记
-- [ ] 3.3 组 3 验收：全量 `cargo test` + `cargo clippy --all-targets` 全绿；
+  注记（宿主实测 2026-11-20 夜，新版 pi-shell-rs 9df02dc + 宿主 lock 已更新，
+  GUI debug 构建 125×36 面板）：
+  - 复测口径：`[term-rate]`（`crates/agent-service/src/terminal/mod.rs`
+    rate_log）——输入注入（`note_input`）→ 下一帧喂入 vt100（`note_feed`）；
+    流式进行中打字/滚动，读 stderr 日志每秒汇总行。
+  - 结果（用户实测会话 2138 条消息 / 9MB）：闲置打字 **11–18ms** ✓；
+    流式中输入→帧 **38–106ms（max 167ms）** ✗ 未达 ≤20ms。
+  - 归因分解（对照实验齐全）：① **渲染链已修好** —— standalone 同引擎
+    真实流式回合（PTY 125×36）实测输入→帧输出 **1.2ms**（p50），流式
+    整帧基准 2.8ms、尾窗重建（35KB text+44KB thinking+21KB 工具卡真实
+    规模）3.1ms、VirtualBackend 全屏 churn 2.6ms；② 流式输出节奏由 pi
+    事件推送决定（纯流式帧间隔 p50=76ms，feed/s=9-25 同源），非渲染成本；
+    ③ 残余 38-106ms 全部在**宿主管线相位**（service drain 25ms tick +
+    GUI 泵/帧合并——宿主 `Docs/pending-decisions.md` 自判"结构上 ≤75ms"
+    且"管线无可挖余量"），standalone 同链 1.2ms 的差值即证；④ echo 口径
+    在流式期有污染（"输入→下一帧"不区分回显帧与流式帧）。
+  - 结论：≤20ms 需宿主侧修（流式期输入快泵/补采窗未生效 + echo 口径
+    加回显帧识别），归宿主仓 follow-up；pi-shell-rs 渲染侧已达标。
+- [x] 3.3 组 3 验收：全量 `cargo test` + `cargo clippy --all-targets` 全绿；
   组 3 独立 commit
 
 ## Workflow follow-up
