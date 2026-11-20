@@ -16,21 +16,21 @@
 
 ## 2. 尾条行级增量布局与高亮 memo（design D1–D3）
 
-- [ ] 2.1 spike：核对 syntect `HighlightState` 逐行推进 API 与 Clone 成本；
+- [x] 2.1 spike：核对 syntect `HighlightState` 逐行推进 API 与 Clone 成本；
   结论回写 design D1（若不可廉价克隆则启用兜底方案并记录）。验证：spike
   结论写入 design.md 的 D1 段
-- [ ] 2.2 尾槽行级 memo 实现：markdown 块上下文 + `HighlightState` 按**完结行**
+- [x] 2.2 尾槽行级 memo 实现：markdown 块上下文 + `HighlightState` 按**完结行**
   前缀推进缓存（按 block 分槽，双块交错独立推进）；开放行每帧单行重排；
   沿用 D4 失效矩阵（宽度/flags/theme 全量、override 条目级）。验证：`cargo build`
   通过 + 新增函数中文注释（功能/输入/输出）齐全
-- [ ] 2.3 parity 测试：流式逐 delta "memo 路径 vs 全量 oracle 逐字节相等"，
+- [x] 2.3 parity 测试：流式逐 delta "memo 路径 vs 全量 oracle 逐字节相等"，
   边界用例含互异代码块、嵌套列表/引用、thinking、畸形/未闭合 fence、
   CJK 混排、双块交错；等价断言失败处该行回退全量重排（失败安全）。
   验证：新增 parity 测试全绿
-- [ ] 2.4 预算断言合入：`bench_streaming_tail_under_budget` 钉 **max frame < 5ms**
+- [x] 2.4 预算断言合入：`bench_streaming_tail_under_budget` 钉 **max frame < 5ms**
   （现状 ~110ms 红 → 转绿）+ 行级 memo 缓存内存注记（超 D6 预算 2 倍 = P3 信号）。
   验证：基准断言通过且输出含内存注记
-- [ ] 2.5 组 2 验收：`cargo test` + `cargo clippy --all-targets` 全绿（382 既有
+- [x] 2.5 组 2 验收：`cargo test` + `cargo clippy --all-targets` 全绿（382 既有
   零改动 + 新增对账）；组 2 独立 commit
 
 ## 3. 终验

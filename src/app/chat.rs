@@ -327,9 +327,10 @@ fn notice_line(kind: &str, text: &str) -> Line<'static> {
 ///       flags — 渲染偏好；overrides — 单卡工具覆盖；thinking_overrides —
 ///       thinking 单块覆盖；thinking_seq — 全局 thinking 序号游标
 ///       （无条件递增、跨调用穿透，design D2）
-/// 输出: 无返回值；副作用为向 out/meta 追加
+/// 输出: 无返回值；副作用为向 out/meta 追加（流式尾槽分槽构建也走
+///       本入口，与全量 oracle 同源，design D1）
 #[allow(clippy::too_many_arguments)]
-fn append_blocks(
+pub(crate) fn append_blocks(
     out: &mut Vec<Line<'static>>,
     meta: &mut Vec<Vec<HitKind>>,
     blocks: &[Block],

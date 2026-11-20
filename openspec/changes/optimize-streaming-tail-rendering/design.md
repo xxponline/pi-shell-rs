@@ -57,6 +57,29 @@ memo 纯记忆化。实施首日 spike 核对 `HighlightState: Clone` 便宜可�
 （预期成立）；若个别语法状态不可廉价克隆，回退方案 = 每块只缓存行
 spans、按需从块首重推进（仍 O(块) 每帧，作为兜底不采用为终态）。
 
+> **spike 结论回写（组 2，2.1）**：
+> 1. **syntect 行级 API 成立**：`HighlightLines::state() -> (HighlightState,
+>    ParseState)` 与 `HighlightLines::from_state(theme, hs, ps)` 即官方增量
+>    续跑入口；`highlight_line` 逐行推进并返回新状态。`HighlightState` 与
+>    `ParseState` 均 `#[derive(Clone)]`（两个小 `Vec` + `ScopeStack`），实测
+>    Clone ≈ 0.85µs/次（debug），远低于单行高亮成本（debug 下 150–360µs/
+>    行——正是 ×10 放大器本体）。**兜底方案（按需块首重推进）未启用**。
+> 2. **memo 粒度落地**：代码 fence 内容行按完结行推进 `(ParseState,
+>    HighlightState)` 缓存（含行内 tab 展开与逐行 span 映射，与全量路径
+>    共用同一逐行映射函数，等价按构造成立）；开放代码行每帧从行首状态
+>    Clone 后单独重排（不推进状态）。markdown 侧落地为**块区行级**：块区 =
+>    以空白行/fence 为界的源区间，纯段落简单行（无行内标记）按完结行
+>    前缀冻结（开放行所在后缀每帧单行重排）；出现行内标记（`*_~` `[]` 等）
+>    停止冻结、出现块起始样式行（列表/引用/标题/主题线/setext/缩进代码
+>    候选）失效回块区首并整区重排——setext 回溯样式、紧表嵌套列表换行
+>    错位（pulldown 事件流怪癖）、松紧表 retro 重排等均由整区重排吸收，
+>    逐字节等价由 parity 测试兜底。**未完结代码块位于列表/引用块区内时
+>    走整区重排**（行级 HighlightState memo 只覆盖顶层 fence）——follow-up
+>    候选。reference 定义/空列表项/空标题（parse_to_lines 跨块泄漏怪癖）
+>    触发整槽全量回退（失败安全）。
+> 3. **双块交错**：行级状态按 block 分槽，thinking+text 并行流各自独立
+>    推进，互不共享游标。
+
 **D2 等价性纪律（parity 逐字节）。** 沿用 `layout_cache` 既有纪律：
 流式场景逐 delta 断言"memo 路径 vs 全量 oracle（`chat_lines_themed` +
 单片 wrap）逐字节相等"，覆盖：互异代码块、嵌套列表/引用、thinking、

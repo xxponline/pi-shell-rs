@@ -12,6 +12,7 @@ mod editor;
 mod external_editor;
 mod event;
 mod markdown;
+mod md_stream;
 mod layout_cache;
 mod overlay;
 pub mod scroll; // 宿主（GUI）引 ALT_WHEEL_MULTIPLIER — terminal-pointer-and-scroll-input D1

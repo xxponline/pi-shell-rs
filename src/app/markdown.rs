@@ -133,18 +133,34 @@ pub fn clear_render_caches() {
     HL_CACHE.with(|c| c.borrow_mut().clear());
 }
 
-/// 解析入口（无缓存的实现，供测试直接调用）。
+/// 解析入口（无缓存的实现，供测试与流式 memo 直接调用）。
 ///
 /// 输入: text — markdown 源文本；theme — 注入配色（下传代码块高亮）
 /// 输出: 渲染后的行序列
-fn parse_to_lines(text: &str, theme: &crate::app::theme::TuiTheme) -> Vec<Line<'static>> {
+pub(crate) fn parse_to_lines(text: &str, theme: &crate::app::theme::TuiTheme) -> Vec<Line<'static>> {
+    parse_to_lines_with(text, theme, Style::default())
+}
+
+/// 带初始样式的解析入口（流式 memo 的块区/后缀续渲用：标题样式在
+/// parse_to_lines 中跨块泄漏（style_stack 只压不弹），续渲段必须以
+/// 前缀末样式为初值才能逐字节对齐全量路径）。
+///
+/// 输入: text — markdown 源文本（块区/后缀切片）；theme — 注入配色；
+///       style0 — 前缀末的样式栈顶（无泄漏时为默认样式）
+/// 输出: 渲染后的行序列
+pub(crate) fn parse_to_lines_with(
+    text: &str,
+    theme: &crate::app::theme::TuiTheme,
+    style0: Style,
+) -> Vec<Line<'static>> {
     let opts = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     let parser = Parser::new_ext(text, opts);
 
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut cur: Vec<Span<'static>> = Vec::new();
-    // 内联样式栈（粗体/斜体等在 End 时弹出）。
-    let mut style_stack: Vec<Style> = vec![Style::default()];
+    // 内联样式栈（粗体/斜体等在 End 时弹出；标题样式不弹（全量路径
+    // 原语义），由 style0 承接前缀泄漏）。
+    let mut style_stack: Vec<Style> = vec![style0];
     // 代码块收集态：(语言, 正文)。
     let mut code: Option<(String, String)> = None;
     // 列表栈：(是否有序, 计数)。
@@ -368,15 +384,37 @@ fn parse_to_lines(text: &str, theme: &crate::app::theme::TuiTheme) -> Vec<Line<'
     out
 }
 
-/// 计算标题颜色（H1/H2 用青色，其余默认色）。
+/// 计算标题颜色（H1/H2 用青色，其余默认色）；流式 memo 的样式泄漏
+/// 推进与本函数同源。
 ///
 /// 输入: level — 标题级别
 /// 输出: 对应颜色
-fn heading_color(level: HeadingLevel) -> Color {
+pub(crate) fn heading_color(level: HeadingLevel) -> Color {
     match level {
         HeadingLevel::H1 | HeadingLevel::H2 => Color::Cyan,
         _ => Color::Reset,
     }
+}
+
+/// 代码块顶栏行（语言标签）；[`push_code_block`] 与流式 memo 共用，
+/// 保证两路径逐字节等价。
+///
+/// 输入: lang — fence 信息串（可空，空时标签为 "code"）
+/// 输出: `┌─ {label} ` 样式行（暗色）
+pub(crate) fn code_open_bar(lang: &str) -> Line<'static> {
+    let label = if lang.is_empty() { "code" } else { lang };
+    Line::from(Span::styled(
+        format!("┌─ {label} "),
+        Style::default().fg(Color::DarkGray),
+    ))
+}
+
+/// 代码块底栏行（`└─`）；[`push_code_block`] 与流式 memo 共用。
+///
+/// 输入: 无
+/// 输出: `└─` 样式行（暗色）
+pub(crate) fn code_close_bar() -> Line<'static> {
+    Line::from(Span::styled("└─", Style::default().fg(Color::DarkGray)))
 }
 
 /// 渲染一个代码块（顶栏语言标签 + 高亮正文 + 底栏）。
@@ -390,18 +428,11 @@ fn push_code_block(
     body: &str,
     theme: &crate::app::theme::TuiTheme,
 ) {
-    let label = if lang.is_empty() { "code" } else { lang };
-    out.push(Line::from(Span::styled(
-        format!("┌─ {label} "),
-        Style::default().fg(Color::DarkGray),
-    )));
+    out.push(code_open_bar(lang));
     for line in highlight_cached(lang, body, theme) {
         out.push(line);
     }
-    out.push(Line::from(Span::styled(
-        "└─",
-        Style::default().fg(Color::DarkGray),
-    )));
+    out.push(code_close_bar());
 }
 
 /// 按语言对代码做语法高亮（带缓存；未知语言/失败降级为纯文本行）。
@@ -426,7 +457,8 @@ fn highlight_cached(lang: &str, body: &str, theme: &crate::app::theme::TuiTheme)
     lines
 }
 
-/// 高亮实现（无缓存）：syntect 找语法 → 逐行着色；任何失败降级纯文本。
+/// 高亮实现（无缓存）：逐行推进 [`CodeLineState`]（与流式 memo 同一
+/// 逐行算法，等价按构造成立）；任何失败降级纯文本。
 ///
 /// 输入: lang — 语言标签；body — 代码原文；theme — 注入配色
 ///       （按 `syntax_theme` 名取主题，无效名回退默认，design D3）
@@ -436,53 +468,129 @@ fn highlight_uncached(
     body: &str,
     theme: &crate::app::theme::TuiTheme,
 ) -> Vec<Line<'static>> {
-    let normalized = body.replace('\t', "    ");
-    let ss = syntax_set();
-    let syntax = ss
-        .find_syntax_by_token(lang)
-        .or_else(|| ss.find_syntax_by_extension(lang))
-        .filter(|_| !lang.is_empty());
+    let mut st = CodeLineState::new(lang, theme);
+    syntect::util::LinesWithEndings::from(body)
+        .map(|line| st.push_line(line))
+        .collect()
+}
 
-    let Some(syntax) = syntax else {
-        // 未知语言：整块纯文本（暗色边框外不加样式）。
-        return normalized
-            .lines()
-            .map(|l| Line::from(Span::raw(l.to_string())))
-            .collect();
-    };
+/// 代码块逐行高亮状态（design D1：按完结行前缀推进的行级 memo，流式
+/// 尾槽与全量路径共用同一算法）。未知语法/高亮失败均降级纯文本行。
+///
+/// # Safety（Send 实现依据）
+/// 内部 `ParseState` 因 onig `Region` 裸指针未标 `Send`，但其全部内容
+/// （语法集下标、`Region` 捕获缓冲）都是**自有普通数据**：无 TLS、无
+/// 共享句柄，整体搬迁/单线程使用/析构均安全；本类型只随 App 整体移入
+/// 渲染线程后单线程使用，不存在并发访问。
+#[derive(Clone)]
+pub(crate) struct CodeLineState {
+    /// syntect 主题（按名查表得来，生命周期恒长）。
+    syn_theme: &'static syntect::highlighting::Theme,
+    /// 逐行推进状态（未知语言为 None → 纯文本降级）。
+    state: Option<(
+        syntect::parsing::ParseState,
+        syntect::highlighting::HighlightState,
+    )>,
+}
 
-    let mut highlighter = syntect::easy::HighlightLines::new(
-        syntax,
-        theme_by_name(&theme.syntax_theme),
-    );
-    let mut out = Vec::new();
-    for line in syntect::util::LinesWithEndings::from(&normalized) {
-        let spans = match highlighter.highlight_line(line, ss) {
-            Ok(ranges) => {
-                let mut spans: Vec<Span<'static>> = Vec::new();
-                for (style, text) in ranges {
-                    let text = text.trim_end_matches(['\n', '\r']);
-                    if text.is_empty() {
-                        continue;
-                    }
-                    spans.push(Span::styled(
-                        text.to_string(),
-                        Style::default()
-                            .fg(Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b)),
-                    ));
-                }
-                spans
-            }
-            Err(_) => vec![Span::raw(line.trim_end_matches(['\n', '\r']).to_string())],
-        };
-        // 空行也要占位，保持行数与源一致。
-        if spans.is_empty() {
-            out.push(Line::default());
-        } else {
-            out.push(Line::from(spans));
+// SAFETY: 见类型文档——ParseState 为自有普通数据，仅单线程使用。
+unsafe impl Send for CodeLineState {}
+
+impl CodeLineState {
+    /// 创建逐行高亮状态（按语言选语法；未知/空语言降级纯文本）。
+    ///
+    /// 输入: lang — fence 信息串（trim 后的标签）；theme — 注入配色
+    ///       （取 `syntax_theme` 选 syntect 主题，无效名回退默认）
+    /// 输出: 行级状态机；后续 [`push_line`] 逐行推进
+    pub(crate) fn new(lang: &str, theme: &crate::app::theme::TuiTheme) -> Self {
+        let ss = syntax_set();
+        let syntax = ss
+            .find_syntax_by_token(lang)
+            .or_else(|| ss.find_syntax_by_extension(lang))
+            .filter(|_| !lang.is_empty());
+        let state = syntax.map(|s| {
+            let hl = syntect::easy::HighlightLines::new(s, theme_by_name(&theme.syntax_theme));
+            let (hs, ps) = hl.state();
+            (ps, hs)
+        });
+        Self {
+            syn_theme: theme_by_name(&theme.syntax_theme),
+            state,
         }
     }
-    out
+
+    /// 推进并渲染一行（完结行须带行尾换行，与 LinesWithEndings 口径一致；
+    /// tab 展开为 4 空格）。
+    ///
+    /// 输入: line — 单行源文本（含或不含行尾换行）
+    /// 输出: 该行渲染；内部状态推进到行末（高亮失败时降级纯文本行，
+    ///       状态照常推进，与全量路径行为一致）
+    pub(crate) fn push_line(&mut self, line: &str) -> Line<'static> {
+        let normalized = line.replace('\t', "    ");
+        let Some((ps, hs)) = self.state.take() else {
+            return plain_code_line(&normalized);
+        };
+        let mut hl = syntect::easy::HighlightLines::from_state(self.syn_theme, hs, ps);
+        let out = match hl.highlight_line(&normalized, syntax_set()) {
+            Ok(ranges) => code_ranges_line(&ranges),
+            Err(_) => Line::from(Span::raw(
+                normalized.trim_end_matches(['\n', '\r']).to_string(),
+            )),
+        };
+        let (hs, ps) = hl.state();
+        self.state = Some((ps, hs));
+        out
+    }
+
+    /// 渲染开放行（不推进状态）：克隆行级状态后在克隆上推进（spike 实测
+    /// HighlightState/ParseState Clone ≈ 0.85µs，远低于单行高亮成本）。
+    ///
+    /// 输入: line — 开放行源文本（不带行尾换行）
+    /// 输出: 该行渲染；`self` 状态不变（开放行每帧可单独重排）
+    pub(crate) fn peek_line(&self, line: &str) -> Line<'static> {
+        self.clone().push_line(line)
+    }
+}
+
+/// syntect 高亮区间 → ratatui 行（高亮两路共用的逐行映射；只取 fg 色，
+/// 不携带主题 bg 以保工具卡面板底色，design D3）。
+///
+/// 输入: ranges — 单行的 (样式, 文本) 区间（文本可含行尾换行）
+/// 输出: 该行渲染；区间全空 → 空行占位（保持行数与源一致）
+fn code_ranges_line(ranges: &[(syntect::highlighting::Style, &str)]) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (style, text) in ranges {
+        let text = text.trim_end_matches(['\n', '\r']);
+        if text.is_empty() {
+            continue;
+        }
+        spans.push(Span::styled(
+            text.to_string(),
+            Style::default().fg(Color::Rgb(
+                style.foreground.r,
+                style.foreground.g,
+                style.foreground.b,
+            )),
+        ));
+    }
+    if spans.is_empty() {
+        Line::default()
+    } else {
+        Line::from(spans)
+    }
+}
+
+/// 纯文本代码行（未知语法降级；与 `.lines()` 逐行口径一致，行尾换行
+/// 按 `\n` 后单个 `\r` 剥离）。
+///
+/// 输入: line — 单行源文本（已 tab 归一，可含行尾换行）
+/// 输出: 无样式原文行
+fn plain_code_line(line: &str) -> Line<'static> {
+    let stripped = line
+        .strip_suffix('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .unwrap_or(line);
+    Line::from(Span::raw(stripped.to_string()))
 }
 
 /// 按文件扩展名做语法高亮（add-tool-card-syntax-highlighting design D1）。
@@ -804,4 +912,6 @@ mod tests {
         );
     }
 }
+
+
 

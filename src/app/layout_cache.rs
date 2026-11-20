@@ -8,9 +8,10 @@
 
 use ratatui::text::Line;
 
-use pi_shell_rs::session::SessionState;
+use pi_shell_rs::session::{Block, SessionState};
 
 use crate::app::chat::{self, RenderFlags};
+use crate::app::md_stream::StreamMemo;
 use crate::app::theme::TuiTheme;
 use crate::app::wrap::{self, HitKind};
 
@@ -57,6 +58,102 @@ struct EntryLayout {
     span: Option<(u32, u32, u32)>,
 }
 
+/// 易失尾槽分块（design D1：按 block 分槽，双块交错独立推进）。
+#[derive(Debug)]
+enum InflightSlot {
+    /// Text 块：流式行级 memo（markdown 块上下文 + HighlightState 前缀推进；
+    /// Box 装箱压平槽位体积，clippy large_enum_variant）。
+    Text(Box<StreamMemo>),
+    /// thinking / 工具卡块：每帧重建（行数小；工具输出流 memo 为 follow-up）。
+    Other {
+        lines: Vec<Line<'static>>,
+        meta: Vec<Vec<HitKind>>,
+        counts: Vec<u32>,
+        total: usize,
+        span: Option<(u32, u32, u32)>,
+    },
+}
+
+impl InflightSlot {
+    /// 槽与块形态匹配（Text/其它两分；内容变化由 memo 自防御）。
+    ///
+    /// 输入: block — in-flight 内容块
+    /// 输出: true = 该槽可继续复用
+    fn matches(&self, block: &Block) -> bool {
+        matches!(self, InflightSlot::Text(_)) == matches!(block, Block::Text { .. })
+    }
+
+    /// 新建空槽（宽度键控 memo）。
+    ///
+    /// 输入: block — in-flight 内容块；width — 视口宽度
+    /// 输出: 与块形态匹配的空槽
+    fn fresh(block: &Block, width: u16) -> Self {
+        match block {
+            Block::Text { .. } => InflightSlot::Text(Box::new(StreamMemo::new(width))),
+            _ => InflightSlot::Other {
+                lines: Vec::new(),
+                meta: Vec::new(),
+                counts: Vec::new(),
+                total: 0,
+                span: None,
+            },
+        }
+    }
+
+    /// 刷新单槽：Text 走行级 memo（免重排短路），其它每帧重建。
+    ///
+    /// 输入: block — in-flight 内容块；flags/overrides/thinking_overrides/
+    ///       theme — 同 `chat_lines_themed`；thinking_seq — 全局 thinking
+    ///       序号游标（入口 = 前置块合计，出口 = 含本块合计）；width —
+    ///       视口宽度
+    /// 输出: 无返回值；副作用为重建/推进该槽的行、计数与标记跨度
+    #[allow(clippy::too_many_arguments)]
+    fn refresh(
+        &mut self,
+        block: &Block,
+        flags: RenderFlags,
+        overrides: &std::collections::HashMap<String, bool>,
+        thinking_overrides: &std::collections::HashMap<usize, bool>,
+        thinking_seq: &mut usize,
+        theme: &TuiTheme,
+        width: u16,
+    ) {
+        match self {
+            InflightSlot::Text(memo) => {
+                if let Block::Text { text } = block {
+                    memo.render(text, theme, width);
+                }
+            }
+            InflightSlot::Other {
+                lines,
+                meta,
+                counts,
+                total,
+                span,
+            } => {
+                lines.clear();
+                meta.clear();
+                chat::append_blocks(
+                    lines,
+                    meta,
+                    std::slice::from_ref(block),
+                    flags,
+                    overrides,
+                    thinking_overrides,
+                    thinking_seq,
+                    theme,
+                );
+                *counts = lines
+                    .iter()
+                    .map(|l| wrap::count_wrapped_rows(l, width as usize))
+                    .collect();
+                *total = counts.iter().map(|c| *c as usize).sum();
+                *span = wrap::mark_span(meta, counts);
+            }
+        }
+    }
+}
+
 /// 条目级布局缓存（App 持有；渲染与选区文档共用）。
 #[derive(Debug)]
 pub struct LayoutCache {
@@ -70,18 +167,13 @@ pub struct LayoutCache {
     pending_from: usize,
     /// 漏标降级全量重建的累计次数（design D7 观测/断言钩子）。
     miss_rebuilds: usize,
-    /// 易失尾槽：流式 in-flight 布局（每帧重建，不入 `entries`）。
-    inflight_lines: Vec<Line<'static>>,
-    inflight_meta: Vec<Vec<HitKind>>,
+    /// 易失尾槽：in-flight 逐块分槽（Text 块行级 memo / 其余每帧重建）。
+    inflight: Vec<InflightSlot>,
     /// 易失尾槽：运行中 bash 布局（每帧重建，不入 `entries`）。
     bash_lines: Vec<Line<'static>>,
     bash_meta: Vec<Vec<HitKind>>,
-    /// 易失尾槽：in-flight 逐逻辑行 wrap 计数（宽度键控，design D3）。
-    inflight_counts: Vec<u32>,
     /// 易失尾槽：bash 逐逻辑行 wrap 计数（宽度键控，design D3）。
     bash_counts: Vec<u32>,
-    /// 易失尾槽：in-flight 标记跨度（每帧重算，design D3）。
-    inflight_span: Option<(u32, u32, u32)>,
     /// 易失尾槽：bash 标记跨度（每帧重算，design D3）。
     bash_span: Option<(u32, u32, u32)>,
 }
@@ -102,13 +194,10 @@ impl Default for LayoutCache {
             last_rev: 0,
             pending_from: usize::MAX,
             miss_rebuilds: 0,
-            inflight_lines: Vec::new(),
-            inflight_meta: Vec::new(),
+            inflight: Vec::new(),
             bash_lines: Vec::new(),
             bash_meta: Vec::new(),
-            inflight_counts: Vec::new(),
             bash_counts: Vec::new(),
-            inflight_span: None,
             bash_span: None,
         }
     }
@@ -226,24 +315,29 @@ impl LayoutCache {
             });
         }
         self.key = key;
-        // 易失尾槽：每帧重建（design D1）——in-flight 的 thinking 序号接在
-        // 条目合计之后（与全量 oracle 的游标穿透一致）。
-        let (il, im) = chat::layout_inflight(
-            state,
-            flags,
-            overrides,
-            thinking_overrides,
-            &mut thinking_base,
-            theme,
-        );
-        self.inflight_lines = il;
-        self.inflight_meta = im;
-        self.inflight_counts = self
-            .inflight_lines
-            .iter()
-            .map(|l| wrap::count_wrapped_rows(l, width as usize))
-            .collect();
-        self.inflight_span = wrap::mark_span(&self.inflight_meta, &self.inflight_counts);
+        // 易失尾槽：按 block 分槽推进（design D1）——Text 块走行级 memo
+        // （markdown 块上下文 + HighlightState 按完结行前缀推进），
+        // thinking/工具块每帧重建；in-flight 的 thinking 序号接在条目
+        // 合计之后（与全量 oracle 的游标穿透一致）。
+        {
+            let blocks = state.in_flight();
+            if self.inflight.len() != blocks.len()
+                || std::iter::zip(&self.inflight, blocks).any(|(s, b)| !s.matches(b))
+            {
+                self.inflight = blocks.iter().map(|b| InflightSlot::fresh(b, width)).collect();
+            }
+            for (slot, block) in std::iter::zip(&mut self.inflight, blocks) {
+                slot.refresh(
+                    block,
+                    flags,
+                    overrides,
+                    thinking_overrides,
+                    &mut thinking_base,
+                    theme,
+                    width,
+                );
+            }
+        }
         let (bl, bm) = chat::layout_bash_tail(state);
         self.bash_lines = bl;
         self.bash_meta = bm;
@@ -274,14 +368,39 @@ impl LayoutCache {
                 span: e.span,
             })
             .collect();
-        if !self.inflight_lines.is_empty() {
-            v.push(wrap::Chunk {
-                lines: &self.inflight_lines,
-                meta: &self.inflight_meta,
-                counts: &self.inflight_counts,
-                total: self.inflight_counts.iter().map(|c| *c as usize).sum(),
-                span: self.inflight_span,
-            });
+        // 易失尾槽逐块出借（design D1：Text 槽行级 memo，其余每帧重建）。
+        for slot in &self.inflight {
+            match slot {
+                InflightSlot::Text(memo) => {
+                    let (lines, counts, meta) = memo.parts();
+                    if !lines.is_empty() {
+                        v.push(wrap::Chunk {
+                            lines,
+                            meta,
+                            counts,
+                            total: memo.total(),
+                            span: None,
+                        });
+                    }
+                }
+                InflightSlot::Other {
+                    lines,
+                    meta,
+                    counts,
+                    total,
+                    span,
+                } => {
+                    if !lines.is_empty() {
+                        v.push(wrap::Chunk {
+                            lines,
+                            meta,
+                            counts,
+                            total: *total,
+                            span: *span,
+                        });
+                    }
+                }
+            }
         }
         if !self.bash_lines.is_empty() {
             v.push(wrap::Chunk {
@@ -389,6 +508,155 @@ mod tests {
         s.handle(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"hi **there**"},{"type":"thinking","thinking":"hmm"}]}}));
         s.push_notice("compaction", "压缩完成".into());
         s
+    }
+
+    /// 流式逐 delta parity（design D2/D3）：source 按步长切成 delta 逐个
+    /// 喂入 in-flight，每 delta 断言缓存摊平与全量 oracle 逐字节相等，
+    /// 落盘（message_end）后复验一次。
+    fn assert_stream_parity_chunks(source: &str, step: usize) {
+        let mut cache = LayoutCache::default();
+        let mut state = SessionState::new();
+        let (o, t, theme) = defaults();
+        let flags = RenderFlags::default();
+        assert_parity(&mut cache, &mut state, flags, &o, &t, &theme, 80);
+        state.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+        let chars: Vec<char> = source.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let end = (i + step).min(chars.len());
+            let delta: String = chars[i..end].iter().collect();
+            state.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":delta}}));
+            assert_parity(&mut cache, &mut state, flags, &o, &t, &theme, 80);
+            i = end;
+        }
+        state.handle(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":source}]}}));
+        assert_parity(&mut cache, &mut state, flags, &o, &t, &theme, 80);
+    }
+
+    /// 取 in-flight Text 槽的 memo（fallback 观测用）。
+    fn inflight_text_memo(cache: &LayoutCache) -> Option<&StreamMemo> {
+        cache.inflight.iter().find_map(|s| match s {
+            InflightSlot::Text(m) => Some(m.as_ref()),
+            _ => None,
+        })
+    }
+
+    /// 2.3 parity：互异代码块逐 delta 等价（行级 HighlightState memo 的
+    /// 核心场景），且快路径真实生效（未转全量回退）。
+    #[test]
+    fn stream_parity_distinct_code_blocks() {
+        let mut src = String::new();
+        for k in 0..6 {
+            src.push_str(&format!(
+                "段落 {k}：**流式** 正文与 `行内代码`。\n\n```rust\nfn demo_{k}(x: usize) -> usize {{\n    // 块 {k}\n    (0..x).map(|i| i * {k}).sum()\n}}\n```\n\n"
+            ));
+        }
+        assert_stream_parity_chunks(&src, 1);
+        assert_stream_parity_chunks(&src, 7);
+    }
+
+    /// 2.3 parity：嵌套列表/引用逐 delta 等价（含松紧表 retro、懒续行、
+    /// 任务列表与有序序号重排）。
+    #[test]
+    fn stream_parity_nested_lists_and_quotes() {
+        let src = "- 一级 a\n  - 二级 b\n    - 三级 c\n  续行文本\n- 一级 d\n\n1. 第一\n2. 第二\n   嵌套续\n\n> 引用一\n> 引用二\n>\n> - 引用内列表\n>   - 深层\n\n- 松散\n\n- 表项\n\n- [ ] 待办\n- [x] 完成\n";
+        assert_stream_parity_chunks(src, 1);
+        assert_stream_parity_chunks(src, 5);
+    }
+
+    /// 2.3 parity：畸形/未闭合 fence 逐 delta 等价（fence 内 fence、
+    /// 闭合行带垃圾、波浪/反引号混用、空 fence）。
+    #[test]
+    fn stream_parity_malformed_fences() {
+        let src = "```rust\nfn a() {}\n``` junk\n\n````\n```\n嵌套外观\n````\n\n~~~\nx\n```\n~~~\n\n```\n```\n\n```notalang-xyz\n纯文本降级\n```\n\n```a`b\n信息串含反引号不成 fence\n";
+        assert_stream_parity_chunks(src, 1);
+        assert_stream_parity_chunks(src, 4);
+    }
+
+    /// 2.3 parity：CJK 混排逐 delta 等价（双格宽度、行内标记、硬换行）。
+    #[test]
+    fn stream_parity_cjk_mix() {
+        let src = "中文**加粗**与 *斜体* 混排 wrap 压力测试。行内 `code_x` 与中文。\n第二行：全角标点（，。！）与 half-width mix。  \n硬换行后第三行 with english words and 中文词。\n\n- 列表：中文项 `a`\n- 列表：中文项 **b**\n";
+        assert_stream_parity_chunks(src, 1);
+        assert_stream_parity_chunks(src, 3);
+    }
+
+    /// 2.3 parity：thinking + text 双块交错逐 delta 等价（design D1 风险
+    /// 条目：并发流按 block 分槽独立推进）。
+    #[test]
+    fn stream_parity_dual_block_interleave() {
+        let mut cache = LayoutCache::default();
+        let mut state = SessionState::new();
+        let (o, t, theme) = defaults();
+        let flags = RenderFlags::default();
+        state.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+        state.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"text_start","contentIndex":0}}));
+        state.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"thinking_start","contentIndex":1}}));
+        let text_parts = ["正文 **第一段**\n", "继续正文\n", "```rust\nfn x() {}\n", "```\n"];
+        let think_parts = ["思考一 ", "思考二\n", "思考三", " 收尾"];
+        for i in 0..4 {
+            state.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":text_parts[i]}}));
+            assert_parity(&mut cache, &mut state, flags, &o, &t, &theme, 80);
+            state.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","contentIndex":1,"delta":think_parts[i]}}));
+            assert_parity(&mut cache, &mut state, flags, &o, &t, &theme, 80);
+        }
+    }
+
+    /// 2.3 parity：setext 回溯/行内标记跨行/尾随反斜杠/HTML/缩进代码等
+    /// 不确定构造逐 delta 等价（整区重排吸收，失败安全）。
+    #[test]
+    fn stream_parity_uncertain_constructs() {
+        let src = "标题下划线\n===\n\n跨行 *强调\n继续* 收尾。\n\n尾随反斜杠\\\n下一行。\n\n缩进代码候选\n    四空格行\n\n等号行\n--\n\n<div>\nhtml 块跨区泄漏\n</div>\n";
+        assert_stream_parity_chunks(src, 1);
+        assert_stream_parity_chunks(src, 6);
+    }
+
+    /// 2.3 失败安全：reference 定义/空列表项（parse_to_lines 跨区泄漏
+    /// 怪癖）触发整槽全量回退，回退后仍逐字节等价且可观测。
+    #[test]
+    fn stream_fallback_is_fail_safe_and_observable() {
+        for src in [
+            "引用行 [1] 在此。\n\n[1]: https://example.com\n",
+            "-\n泄漏怪癖\n",
+            "正文\n\n1.\n空序号项\n",
+            "#\n空标题怪癖\n",
+        ] {
+            let mut cache = LayoutCache::default();
+            let mut state = SessionState::new();
+            let (o, t, theme) = defaults();
+            let flags = RenderFlags::default();
+            state.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+            for ch in src.chars() {
+                let delta = ch.to_string();
+                state.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":delta}}));
+                assert_parity(&mut cache, &mut state, flags, &o, &t, &theme, 80);
+            }
+            assert!(
+                inflight_text_memo(&cache).is_some_and(|m| m.is_fallback()),
+                "应触发失败安全回退: {src:?}"
+            );
+        }
+    }
+
+    /// 2.3 快路径观测：常规流式内容（段落 + 代码块）不触发全量回退
+    /// （防止 memo 退化成每帧全量重排而不自知）。
+    #[test]
+    fn stream_fast_path_engages_for_common_content() {
+        let mut cache = LayoutCache::default();
+        let mut state = SessionState::new();
+        let (o, t, theme) = defaults();
+        let flags = RenderFlags::default();
+        state.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+        let src = "普通段落。\n\n```rust\nfn a() {}\n```\n\n- 列表项\n- 列表项二\n";
+        for ch in src.chars() {
+            let delta = ch.to_string();
+            state.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":delta}}));
+            cache.refresh(&mut state, flags, &o, &t, &theme, 80);
+        }
+        assert!(
+            !inflight_text_memo(&cache).is_some_and(|m| m.is_fallback()),
+            "常规内容不应触发全量回退"
+        );
     }
 
     /// 2.1 编号等价（局部游标 + 条目基值 → 全局）：跨空/单条/流式/落盘/
@@ -743,8 +1011,21 @@ mod tests {
             total += meta_bytes(&e.meta);
             total += std::mem::size_of_val(e.wrapped_rows_per_line.as_slice());
         }
-        total += cache.inflight_lines.iter().map(line_bytes).sum::<usize>();
-        total += meta_bytes(&cache.inflight_meta);
+        for slot in &cache.inflight {
+            match slot {
+                InflightSlot::Text(memo) => total += memo.memory_bytes(),
+                InflightSlot::Other {
+                    lines,
+                    meta,
+                    counts,
+                    ..
+                } => {
+                    total += lines.iter().map(line_bytes).sum::<usize>();
+                    total += meta_bytes(meta);
+                    total += std::mem::size_of_val(counts.as_slice());
+                }
+            }
+        }
         total += cache.bash_lines.iter().map(line_bytes).sum::<usize>();
         total += meta_bytes(&cache.bash_meta);
         total
@@ -878,8 +1159,9 @@ mod tests {
     /// 分段计时基线/流式/落盘，并每 25 delta 记 memo/oracle 等价计数注记
     /// （组 1 占位计数，组 2 接真断言）。
     /// 输入: 无（全部合成内容，无真实会话数据）
-    /// 输出: [bench] 分段计时 + parity 计数 eprintln；组 1 不带预算断言
-    ///       （max frame < 5ms 断言随组 2 合入），手工核对分段基线
+    /// 输出: [bench] 分段计时 + parity 计数 + memo/缓存内存注记 eprintln；
+    ///       预算断言（design D3）：整帧 best-of-2 max < 5ms、memo/oracle
+    ///       逐字节等价、memo 内存 < 2MB、缓存内存 < D6 预算 2 倍
     #[test]
     fn bench_streaming_tail_under_budget() {
         // 背景 = bench 同款合成 (约 1500 条/5.8MB, 与真实长会话 1496/5.9MB
@@ -946,86 +1228,151 @@ mod tests {
             deltas.push(cur);
         }
 
+        // 惰性静态预热（syntect 语法集/主题集进程级一次性加载，约几十 ms，
+        // 不属每帧成本；真实宿主在首次代码块前即已加载）。
+        crate::app::markdown::render_markdown("```rust\nfn warm() {}\n```");
+
         // 单缓存探针 (dirty_from 是单缓存协议 — 双缓存会互相消费脏标记,
-        // 误触"漏标降级全量重建", 首版量测教训):
-        // 每 delta: handle -> [refresh 计时(尾槽重建)] -> [draw 计时
-        // (内部 refresh=空操作 + wrap + paint)], 两段相加 = 真实整帧。
-        let mut cache = LayoutCache::default();
-        cache.refresh(&mut state, flags, &o, &t, &theme, 100);
-        terminal
-            .draw(|frame| {
-                let _ = crate::app::view::render(frame, &mut state, &ui, &mut cache);
-            })
-            .unwrap();
-        let (mut sum_frame, mut max_frame) = (0f64, 0f64);
+        // 误触"漏标降级全量重建", 首版量测教训)。计时口径（组 2 修正）:
+        // 每 delta: handle -> [draw#1 计时 = 真实整帧（app 口径：单次 draw，
+        // 内部 refresh 承担 memo 推进 + 尾窗）] -> [draw#2 计时 = 尾窗 +
+        // wrap + paint，分段归因]，refresh(推进) = 整帧 - draw#2。旧口径
+        // "refresh + draw 两段相加" 把尾窗重建双计（内部 refresh 并非空
+        // 操作），故不再作整帧度量；两遍取逐 delta 最小值（best-of-2 宽松
+        // 阈值防 CI 抖动，对齐 warm bench best-of-10 纪律）。
+        let mut best_frame = vec![f64::MAX; deltas.len()];
         let (mut sum_refresh, mut max_refresh) = (0f64, 0f64);
-        // parity 计数注记（占位计数，组 2 接真断言）：每 25 delta 比对
-        // memo 路径（缓存摊平）与全量 oracle（chat_lines_themed）逐字节。
+        let (mut sum_draw, mut max_draw) = (0f64, 0f64);
         let (mut parity_ok, mut parity_checked) = (0usize, 0usize);
-        for (i, d) in deltas.iter().enumerate() {
-            let th = Instant::now();
-            state.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":d}}));
-            let handle_ms = th.elapsed().as_secs_f64() * 1e3;
-
-            let t1 = Instant::now();
+        let (mut memo_mem, mut mem_total, mut land_ms) = (0usize, 0usize, 0f64);
+        for pass in 0..2 {
+            let mut state = replay_jsonl(std::io::Cursor::new(synthetic_jsonl().as_bytes()))
+                .expect("合成回放");
+            state.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+            let mut cache = LayoutCache::default();
             cache.refresh(&mut state, flags, &o, &t, &theme, 100);
-            let refresh_ms = t1.elapsed().as_secs_f64() * 1e3;
-
-            let t0 = Instant::now();
             terminal
                 .draw(|frame| {
                     let _ = crate::app::view::render(frame, &mut state, &ui, &mut cache);
                 })
                 .unwrap();
-            let draw_ms = t0.elapsed().as_secs_f64() * 1e3;
-            let frame_ms = refresh_ms + draw_ms;
+            for (i, d) in deltas.iter().enumerate() {
+                let th = Instant::now();
+                state.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":d}}));
+                let handle_ms = th.elapsed().as_secs_f64() * 1e3;
 
-            sum_frame += frame_ms;
-            max_frame = max_frame.max(frame_ms);
-            sum_refresh += refresh_ms;
-            max_refresh = max_refresh.max(refresh_ms);
-            if (i + 1) % 25 == 0 {
-                // 流式中间态等价计数（memo/oracle 逐字节；组 2 转真断言）。
-                let (cl, cm) = flatten(&cache);
-                let (ol, om) =
-                    chat::chat_lines_themed(&state, flags, &o, &t, &theme);
-                parity_checked += 1;
-                if cl == ol && cm == om {
-                    parity_ok += 1;
+                // 真实整帧（app 口径）。
+                let t1 = Instant::now();
+                terminal
+                    .draw(|frame| {
+                        let _ = crate::app::view::render(frame, &mut state, &ui, &mut cache);
+                    })
+                    .unwrap();
+                let frame_ms = t1.elapsed().as_secs_f64() * 1e3;
+                best_frame[i] = best_frame[i].min(frame_ms);
+
+                // 分段摸底：尾窗 + wrap + paint（重复 draw，仅供归因注记）。
+                let t2 = Instant::now();
+                terminal
+                    .draw(|frame| {
+                        let _ = crate::app::view::render(frame, &mut state, &ui, &mut cache);
+                    })
+                    .unwrap();
+                let draw_ms = t2.elapsed().as_secs_f64() * 1e3;
+                let refresh_ms = (frame_ms - draw_ms).max(0.0);
+
+                if pass == 0 {
+                    sum_refresh += refresh_ms;
+                    max_refresh = max_refresh.max(refresh_ms);
+                    sum_draw += draw_ms;
+                    max_draw = max_draw.max(draw_ms);
                 }
-                eprintln!(
-                    "[bench] delta#{:4} tail≈{:>6}B | handle={:.2} refresh={:.2} draw(wrap+paint)={:.2} frame={:.2}ms | parity=memo/oracle {}/{}",
-                    i + 1,
-                    (i + 1) * 200,
-                    handle_ms,
-                    refresh_ms,
-                    draw_ms,
-                    frame_ms,
-                    parity_ok,
-                    parity_checked
-                );
+                if pass == 0 && (i + 1) % 25 == 0 {
+                    // 流式中间态等价计数（memo/oracle 逐字节，真断言）。
+                    let (cl, cm) = flatten(&cache);
+                    let (ol, om) =
+                        chat::chat_lines_themed(&state, flags, &o, &t, &theme);
+                    parity_checked += 1;
+                    if cl == ol && cm == om {
+                        parity_ok += 1;
+                    }
+                    eprintln!(
+                        "[bench] delta#{:4} tail≈{:>6}B | handle={:.2} refresh(推进)={:.2} draw(尾窗+wrap+paint)={:.2} frame={:.2}ms | parity=memo/oracle {}/{}",
+                        i + 1,
+                        (i + 1) * 200,
+                        handle_ms,
+                        refresh_ms,
+                        draw_ms,
+                        frame_ms,
+                        parity_ok,
+                        parity_checked
+                    );
+                }
+            }
+            if pass == 1 {
+                // 末遍收尾：memo/缓存内存注记（落盘前，含行级 memo 增量）
+                // 与落盘整帧（message_end → 尾槽迁入正式条目的一次性重排）。
+                memo_mem = cache
+                    .inflight
+                    .iter()
+                    .map(|s| match s {
+                        InflightSlot::Text(m) => m.memory_bytes(),
+                        InflightSlot::Other { .. } => 0,
+                    })
+                    .sum();
+                mem_total = cache_memory_footprint(&cache);
+                state.handle(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":source}]}}));
+                let t0 = Instant::now();
+                terminal
+                    .draw(|frame| {
+                        let _ = crate::app::view::render(frame, &mut state, &ui, &mut cache);
+                    })
+                    .unwrap();
+                land_ms = t0.elapsed().as_secs_f64() * 1e3;
             }
         }
+        let best_max = best_frame.iter().cloned().fold(0f64, f64::max);
+        let best_avg = best_frame.iter().sum::<f64>() / deltas.len() as f64;
+        // 行级 memo 缓存内存注记（design D3：预期 <2MB；总量超 D6 预算
+        // 2 倍 = P3 信号，与暖帧基准同口径）。
+        let mem = mem_total;
         eprintln!(
-            "[bench] stream: deltas={} tail={}B | frame avg={:.2} max={:.2}ms | refresh avg={:.2} max={:.2}ms | parity=memo/oracle {}/{}",
+            "[bench] stream: deltas={} tail={}B | frame(best-of-2) avg={:.2} max={:.2}ms | refresh(推进) avg={:.2} max={:.2}ms | draw(尾窗+wrap+paint) avg={:.2} max={:.2}ms | parity=memo/oracle {}/{} | memo_mem={:.1}KB cache_mem={:.1}MB",
             deltas.len(),
             source.len(),
-            sum_frame / deltas.len() as f64,
-            max_frame,
+            best_avg,
+            best_max,
             sum_refresh / deltas.len() as f64,
             max_refresh,
+            sum_draw / deltas.len() as f64,
+            max_draw,
             parity_ok,
-            parity_checked
+            parity_checked,
+            memo_mem as f64 / 1024.0,
+            mem as f64 / (1024.0 * 1024.0)
+        );
+        // 预算断言（design D3/D4）：流式尾条整帧 max < 5ms（现状 ~110ms
+        // 红 → 转绿）；parity 计数接真断言（memo 路径逐字节等价）。
+        assert_eq!(
+            parity_ok, parity_checked,
+            "流式中间态 memo/oracle 必须逐字节等价"
+        );
+        assert!(
+            best_max < 5.0,
+            "流式整帧 {best_max:.2}ms 应 < 5ms（best-of-2 宽松阈值防 CI 抖动）"
+        );
+        assert!(
+            memo_mem < 2 * 1024 * 1024,
+            "行级 memo 缓存 {:.1}KB 应 < 2MB（design D3 预期）",
+            memo_mem as f64 / 1024.0
+        );
+        assert!(
+            mem < 36 * 1024 * 1024,
+            "缓存内存 {}MB 超 D6 预算 2 倍 → 应触发 P3 档 2",
+            mem / (1024 * 1024)
         );
 
-        // ---- 收尾: message_end 落盘 (尾槽 -> 正式条目) 后一帧 ----
-        state.handle(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":source}]}}));
-        let t0 = Instant::now();
-        terminal
-            .draw(|frame| {
-                let _ = crate::app::view::render(frame, &mut state, &ui, &mut cache);
-            })
-            .unwrap();
-        eprintln!("[bench] land: message_end 后整帧={:.2}ms", t0.elapsed().as_secs_f64() * 1e3);
+        // ---- 收尾: message_end 落盘 (尾槽 -> 正式条目) 后一帧（末遍内测） ----
+        eprintln!("[bench] land: message_end 后整帧={:.2}ms", land_ms);
     }
 }
