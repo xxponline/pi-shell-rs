@@ -14,6 +14,7 @@ mod event;
 mod markdown;
 mod md_stream;
 mod layout_cache;
+mod render_probe; // 临时渲染分段探针（任务 1.1；任务 3.2 拆除或门控）
 mod overlay;
 pub mod scroll; // 宿主（GUI）引 ALT_WHEEL_MULTIPLIER — terminal-pointer-and-scroll-input D1
 mod selection;
@@ -4092,6 +4093,7 @@ impl App {
             .map(|(s, e)| (s, e, self.scroll.top, self.chat_area));
         // 探针（临时，定位 A）：draw 耗时分解 — ui=闭包内 render；diff=ratatui
         // diff 余量(total−ui−ansi)；ansi=backend CSI 生成。定位卡顿段，量完即拆。
+        let _ = render_probe::take(); // 清残留分段（含选区文档 refresh），只记本 draw
         let probe_t0 = std::time::Instant::now();
         let probe_ui_ns = std::cell::Cell::new(0u64);
         terminal.draw(|frame| {
@@ -4118,6 +4120,25 @@ impl App {
                 ansi_ns as f64 / 1e6,
                 cells,
                 bytes,
+            );
+            // 临时二次分解（任务 1.1）：view::render 内部布局/高亮/wrap/paint
+            // 分段 + 布局缓存重排范围，量完即拆。
+            let seg = render_probe::take();
+            eprintln!(
+                "[draw-seg] layout={:.1}ms highlight={:.1}ms toolcard={:.1}ms wrapcount={:.1}ms wrap={:.1}ms paint={:.1}ms | relayout_from={} entries={} lines={}",
+                seg.layout_ns as f64 / 1e6,
+                seg.highlight_ns as f64 / 1e6,
+                seg.toolcard_ns as f64 / 1e6,
+                seg.wrapcount_ns as f64 / 1e6,
+                seg.wrap_ns as f64 / 1e6,
+                seg.paint_ns as f64 / 1e6,
+                if seg.relayout_from == usize::MAX {
+                    "-".to_string()
+                } else {
+                    seg.relayout_from.to_string()
+                },
+                seg.relayout_entries,
+                seg.relayout_lines,
             );
         }
         // 漏标对账提示（design D7）：refresh 已降级全量重建，此处断言告警

@@ -410,7 +410,7 @@ impl SessionState {
         self.mark_dirty(len);
     }
 
-    /// 测试专用：模拟"漏标"——只 bump rev 不落任何脏标记（design D7
+    /// 测试专用：模拟“漏标”——只 bump rev 不落任何脏标记（design D7
     /// 安全网用例：draw 对账应降级全量重建而非渲染 stale 内容）。
     ///
     /// 输入: 无
@@ -418,6 +418,16 @@ impl SessionState {
     #[cfg(test)]
     pub(crate) fn simulate_missed_mark(&mut self) {
         self.rev += 1;
+    }
+
+    /// 测试专用：给指定条目落脏标记（模拟“该条目被触”的变异点，供
+    /// 直改 transcript 的增量重排/重编号用例定向失效）。
+    ///
+    /// 输入: idx — 被触条目下标
+    /// 输出: 无返回值；副作用为 `mark_dirty(idx)`（不 bump rev）
+    #[cfg(test)]
+    pub(crate) fn mark_entry_dirty(&mut self, idx: usize) {
+        self.mark_dirty(idx);
     }
 
     /// 追加一条通知条目并落尾部脏标记（design D7；App 层展示类通知的唯一

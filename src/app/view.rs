@@ -376,8 +376,13 @@ fn render_chat(
     let overrides = tool_expanded.unwrap_or(&empty);
     let empty_t = std::collections::HashMap::new();
     let thinking = thinking_overrides.unwrap_or(&empty_t);
+    // 临时探针（任务 1.1）：布局/wrap/paint 分段计时（高亮段由 markdown
+    // 内部计入，落在布局段内），量完即拆。
+    let seg_t0 = std::time::Instant::now();
     // 条目级布局缓存（design D1/D2/D7）：增量重排 + 易失尾常新。
     cache.refresh(state, flags, overrides, thinking, theme, area.width);
+    let seg_t1 = std::time::Instant::now();
+    crate::app::render_probe::record_layout(seg_t1.duration_since(seg_t0).as_nanos() as u64);
     // 分块借出给 wrap（避免全文拼装克隆；与全量路径逐字节一致）。
     let chunks = cache.chunks();
     // 自行换行后按滚动状态开窗口：ratatui 的 Wrap+scroll 偏移按换行后行数
@@ -390,8 +395,13 @@ fn render_chat(
         scrollbar,
         theme,
     );
+    let seg_t2 = std::time::Instant::now();
+    crate::app::render_probe::record_wrap(seg_t2.duration_since(seg_t1).as_nanos() as u64);
     let paragraph = Paragraph::new(wrapped);
     frame.render_widget(paragraph.block(Block::default().borders(Borders::NONE)), area);
+    crate::app::render_probe::record_paint(
+        std::time::Instant::now().duration_since(seg_t2).as_nanos() as u64,
+    );
     (next, hits)
 }
 

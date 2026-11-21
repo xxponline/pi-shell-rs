@@ -8,7 +8,7 @@
 
 use ratatui::text::Line;
 
-use pi_shell_rs::session::{Block, SessionState};
+use pi_shell_rs::session::{Block, Entry, SessionState, ToolStatus};
 
 use crate::app::chat::{self, RenderFlags};
 use crate::app::md_stream::StreamMemo;
@@ -33,6 +33,10 @@ pub struct LayoutKey {
 /// 单条目布局产物（仅在自身内容或渲染键变化时重建）。
 #[derive(Debug)]
 struct EntryLayout {
+    /// 内容指纹（任务 2.1）：`entry_fingerprint` 产物，None = 含
+    /// wall-clock 依赖渲染（计时卡）恒重建。命中即免重排，只随基值平移
+    /// 重编号 meta 全局序号。
+    fingerprint: Option<u64>,
     /// 该条目的全部逻辑行（未 wrap；wrap 计数另存）。
     lines: Vec<Line<'static>>,
     /// 逐逻辑行命中种属，携带**全局**序号（构建时以条目基值渲染）。
@@ -154,6 +158,204 @@ impl InflightSlot {
     }
 }
 
+/// FNV-1a 64 位：把字节混入哈希状态。
+///
+/// 输入: h — 哈希状态（就地更新）；bytes — 待混入字节
+/// 输出: 无返回值；副作用为状态更新
+fn fnv_mix(h: &mut u64, bytes: &[u8]) {
+    for b in bytes {
+        *h ^= *b as u64;
+        *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+}
+
+/// 递归混入 serde_json::Value（弱类型边界集中判别；不分配）。
+///
+/// 输入: h — 哈希状态（就地更新）；v — 任意 JSON 值（工具结果/部分结果）
+/// 输出: 无返回值；副作用为状态更新
+fn hash_json(h: &mut u64, v: &serde_json::Value) {
+    use serde_json::Value;
+    match v {
+        Value::Null => fnv_mix(h, b"\x00"),
+        Value::Bool(b) => fnv_mix(h, &[0x10 + u8::from(*b)]),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                fnv_mix(h, &i.to_le_bytes());
+            } else if let Some(u) = n.as_u64() {
+                fnv_mix(h, &u.to_le_bytes());
+            } else if let Some(f) = n.as_f64() {
+                fnv_mix(h, &f.to_le_bytes());
+            }
+        }
+        Value::String(s) => {
+            fnv_mix(h, b"s");
+            fnv_mix(h, s.as_bytes());
+        }
+        Value::Array(items) => {
+            fnv_mix(h, b"[");
+            for item in items {
+                hash_json(h, item);
+            }
+        }
+        Value::Object(map) => {
+            fnv_mix(h, b"{");
+            for (k, item) in map {
+                fnv_mix(h, k.as_bytes());
+                hash_json(h, item);
+            }
+        }
+    }
+}
+
+/// 条目布局指纹（任务 2.1）：覆盖 `layout_entry` 消费的全部字段与有效
+/// 渲染选项（thinking/工具展开生效位——查表结果折入，键值本身不入：
+/// 基值平移后生效位不变即不失配），内容或选项任一变化即失配。
+///
+/// 输入: entry — 待指纹条目；flags/overrides/thinking_overrides — 渲染
+///       选项（生效位折入指纹）；thinking_base — 该条目思考全局序号基值
+///       （查表用）
+/// 输出: Some(指纹)；错误情形：含随 wall-clock 变化渲染的卡（运行中/
+///       无服务端时长的已完结计时）时返回 None = 恒重建，保计时走字
+fn entry_fingerprint(
+    entry: &Entry,
+    flags: RenderFlags,
+    overrides: &std::collections::HashMap<String, bool>,
+    thinking_overrides: &std::collections::HashMap<usize, bool>,
+    thinking_base: usize,
+) -> Option<u64> {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut think_seq = thinking_base;
+    match entry {
+        Entry::User { text } => {
+            fnv_mix(&mut h, b"U");
+            fnv_mix(&mut h, text.as_bytes());
+        }
+        Entry::Assistant { blocks, .. } => {
+            // turn/usage 不进布局（状态行消费），不入指纹。
+            fnv_mix(&mut h, b"A");
+            for b in blocks {
+                match b {
+                    Block::Text { text } => {
+                        fnv_mix(&mut h, b"T");
+                        fnv_mix(&mut h, text.as_bytes());
+                    }
+                    Block::Thinking { text } => {
+                        let seq = think_seq;
+                        think_seq += 1;
+                        fnv_mix(&mut h, b"H");
+                        fnv_mix(&mut h, text.as_bytes());
+                        if !text.is_empty() {
+                            let expanded = flags.show_thinking
+                                || thinking_overrides.get(&seq).copied().unwrap_or(false);
+                            fnv_mix(&mut h, &[0x20 + u8::from(expanded)]);
+                        }
+                    }
+                    Block::ToolCall {
+                        id,
+                        name,
+                        args_json,
+                        tool,
+                    } => {
+                        // 计时卡（`timer_text` 取 `started_at.elapsed()`）随
+                        // wall-clock 变 → 无指纹恒重建。
+                        if tool.started_at.is_some()
+                            && !(tool.status == ToolStatus::Ended && tool.duration_ms.is_some())
+                        {
+                            return None;
+                        }
+                        fnv_mix(&mut h, b"C");
+                        fnv_mix(&mut h, id.as_bytes());
+                        fnv_mix(&mut h, name.as_bytes());
+                        fnv_mix(&mut h, args_json.as_bytes());
+                        fnv_mix(
+                            &mut h,
+                            &[match tool.status {
+                                ToolStatus::Pending => 0u8,
+                                ToolStatus::Running => 1,
+                                ToolStatus::Ended => 2,
+                            }],
+                        );
+                        fnv_mix(&mut h, &[0x30 + u8::from(tool.is_error)]);
+                        if let Some(r) = &tool.result {
+                            hash_json(&mut h, r);
+                        }
+                        if let Some(p) = &tool.partial {
+                            hash_json(&mut h, p);
+                        }
+                        if let Some(d) = tool.duration_ms {
+                            fnv_mix(&mut h, &d.to_le_bytes());
+                        }
+                        let expanded = overrides
+                            .get(id.as_str())
+                            .copied()
+                            .unwrap_or(flags.expand_tools);
+                        fnv_mix(&mut h, &[0x40 + u8::from(expanded)]);
+                    }
+                }
+            }
+        }
+        Entry::Notice { kind, text } => {
+            fnv_mix(&mut h, b"N");
+            fnv_mix(&mut h, kind.as_bytes());
+            fnv_mix(&mut h, text.as_bytes());
+        }
+        Entry::Bash {
+            command,
+            output,
+            exit_code,
+            cancelled,
+            truncated,
+            full_output_path,
+            excluded,
+        } => {
+            fnv_mix(&mut h, b"B");
+            fnv_mix(&mut h, command.as_bytes());
+            fnv_mix(&mut h, output.as_bytes());
+            if let Some(c) = exit_code {
+                fnv_mix(&mut h, &c.to_le_bytes());
+            }
+            fnv_mix(
+                &mut h,
+                &[
+                    0x50 + u8::from(*cancelled),
+                    0x54 + u8::from(*truncated),
+                    0x58 + u8::from(*excluded),
+                ],
+            );
+            if let Some(p) = full_output_path {
+                fnv_mix(&mut h, p.as_bytes());
+            }
+        }
+    }
+    Some(h)
+}
+
+/// 基值平移重编号（任务 2.1）：条目 meta 里的全局序号按基值增量平移，
+/// 与全量 oracle 在新基值下重建的结果逐号一致（思考序号 = 基值 + 块内
+/// 局部序；消息序号同理）。
+///
+/// 输入: meta — 该条目的逐行命中组（就地修改）；d_think — 思考基值增量；
+///       d_msg — 消息基值增量（0 = 该维度不动）
+/// 输出: 无返回值；副作用为 Thinking(seq)/MessageStart(seq) 各自平移
+fn shift_meta(meta: &mut [Vec<HitKind>], d_think: i64, d_msg: i64) {
+    if d_think == 0 && d_msg == 0 {
+        return;
+    }
+    for row in meta {
+        for k in row {
+            match k {
+                HitKind::Thinking(seq) if d_think != 0 => {
+                    *seq = (*seq as i64 + d_think) as usize;
+                }
+                HitKind::MessageStart(seq) if d_msg != 0 => {
+                    *seq = (*seq as i64 + d_msg) as usize;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 /// 条目级布局缓存（App 持有；渲染与选区文档共用）。
 #[derive(Debug)]
 pub struct LayoutCache {
@@ -204,14 +406,17 @@ impl Default for LayoutCache {
 }
 
 impl LayoutCache {
-    /// 按需重建缓存并刷新易失尾槽（每帧调用，design D7）。
+    /// 按需重建缓存并刷新易失尾槽（每帧调用，design D7；任务 2.1 增量化）。
     ///
     /// 输入: state — 会话状态（`take_dirty` 消费脏标记）；flags/overrides/
     ///       thinking_overrides/theme — 同 `chat_lines_themed`；width —
     ///       视口宽度（`max(1)` 归一）
-    /// 输出: 无返回值；副作用为增量重排 `[脏下标..]` 与尾部窗口 K≥2、
-    ///       整键变化全量重建、易失尾槽常新；错误情形：漏标（rev 变而无脏）
-    ///       时降级全量重建并累计 `miss_rebuilds`（不 panic，保降级可测）
+    /// 输出: 无返回值；副作用为增量重排——`[脏下标..]` 里只重排内容/选项
+    ///       失配的条目（指纹比对），未变条目随基值平移重编号 meta 序号；
+    ///       尾部窗口 K≥2 同走指纹（命中即免重排，直改/漏标由失配或 rev
+    ///       对账兜住）；整键变化（width/theme/flags）全量重建；错误情形：
+    ///       漏标（rev 变而无脏）时降级全量**指纹校验**（失配条目重排，
+    ///       不渲染 stale）并累计 `miss_rebuilds`（不 panic）
     pub fn refresh(
         &mut self,
         state: &mut SessionState,
@@ -251,17 +456,18 @@ impl LayoutCache {
         // 收窄到尾窗（from 恒为实际下标，不再有空档）。
         from = from.min(n.saturating_sub(TAIL_WINDOW));
 
-        // 同步保留段（truncate 保前段；from==0 全清）。
-        if from == 0 {
+        // 整键变化（width/theme/flags 烧入产物，指纹不可见）→ 全清重建；
+        // 其余 from==0 场景（漏标降级/整体替换/entry#0 被触）交给逐条目
+        // 指纹校验甄别（任务 2.1）：内容未变的条目命中即免重排。
+        if key != self.key {
             self.entries.clear();
-        } else {
-            self.entries.truncate(from);
         }
-        // 前缀合计（对保留段全量整数重算，design D7——O(n) 加法）。
+        // 前缀合计（对保留段 [0..kept) 全量整数重算，design D7——O(n) 加法）。
+        let kept = self.entries.len().min(from);
         let mut row_base = 0usize;
         let mut thinking_base = 0usize;
         let mut msg_base = 0usize;
-        for e in &self.entries {
+        for e in &self.entries[..kept] {
             // 保留段基值与前缀和一致（缓存内部不变量，design D2/D3；
             // 同时消费 base_row/base_msg/wrap 计数字段供 P2 视口化对账）。
             debug_assert_eq!(e.base_row, row_base, "行基应与前缀和一致");
@@ -275,13 +481,42 @@ impl LayoutCache {
             thinking_base += e.thinking_count;
             msg_base += e.msg_consumed;
         }
-        // 起点之后的条目全部重排版（含尾窗）。
-        let start = self.entries.len();
-        for i in start..n {
+        // 增量重排（任务 2.1）：起点之后逐条目按内容指纹比对——命中
+        // （内容与渲染选项生效位均未变）免重排，只随基值平移把 meta 全局
+        // 序号重编号；失配条目才走全量 oracle 同源重排（只排变化条目，
+        // 必要后续 = 重编号/敏感重排）。结构增删由逐下标失配自愈：错位段
+        // 全数重建，多余尾部末尾截断。
+        let (mut rebuilt_entries, mut rebuilt_lines) = (0usize, 0usize);
+        let mut relayout_from = usize::MAX;
+        for i in kept..n {
             let entry = &state.entries()[i];
             let (t0, m0, r0) = (thinking_base, msg_base, row_base);
-            let mut tcur = thinking_base;
-            let mut mcur = msg_base;
+            let fp = entry_fingerprint(entry, flags, overrides, thinking_overrides, t0);
+            if fp.is_some()
+                && self
+                    .entries
+                    .get(i)
+                    .is_some_and(|old| old.fingerprint == fp)
+            {
+                let e = &mut self.entries[i];
+                // 命中：平移重编号后原样保留（基值平移可能来自前置条目
+                // 计数变化；生效位已折入指纹，选项敏感重排由失配覆盖）。
+                shift_meta(
+                    &mut e.meta,
+                    t0 as i64 - e.base_thinking as i64,
+                    m0 as i64 - e.base_msg as i64,
+                );
+                e.base_row = r0;
+                e.base_thinking = t0;
+                e.base_msg = m0;
+                row_base = r0 + e.line_count;
+                thinking_base = t0 + e.thinking_count;
+                msg_base = m0 + e.msg_consumed;
+                continue;
+            }
+            // 失配：全量 oracle 同源重排该条目。
+            let mut tcur = t0;
+            let mut mcur = m0;
             let (lines, meta) = chat::layout_entry(
                 entry,
                 flags,
@@ -291,16 +526,28 @@ impl LayoutCache {
                 &mut mcur,
                 theme,
             );
-            let wrapped_rows_per_line: Vec<u32> = lines
-                .iter()
-                .map(|l| wrap::count_wrapped_rows(l, width as usize))
-                .collect();
+            let wrapped_rows_per_line: Vec<u32> = {
+                // 临时探针（任务 1.1）：wrap 行数计数分段，量完即拆。
+                let probe_t0 = std::time::Instant::now();
+                let counts: Vec<u32> = lines
+                    .iter()
+                    .map(|l| wrap::count_wrapped_rows(l, width as usize))
+                    .collect();
+                crate::app::render_probe::record_wrapcount(
+                    probe_t0.elapsed().as_nanos() as u64,
+                );
+                counts
+            };
             let screen_rows: usize = wrapped_rows_per_line.iter().map(|c| *c as usize).sum();
             let span = wrap::mark_span(&meta, &wrapped_rows_per_line);
             row_base = r0 + lines.len();
             thinking_base = tcur;
             msg_base = mcur;
-            self.entries.push(EntryLayout {
+            rebuilt_entries += 1;
+            rebuilt_lines += lines.len();
+            relayout_from = relayout_from.min(i);
+            let layout = EntryLayout {
+                fingerprint: fp,
                 line_count: lines.len(),
                 thinking_count: tcur - t0,
                 msg_consumed: mcur - m0,
@@ -312,8 +559,17 @@ impl LayoutCache {
                 wrapped_rows_per_line,
                 screen_rows,
                 span,
-            });
+            };
+            if i < self.entries.len() {
+                self.entries[i] = layout;
+            } else {
+                self.entries.push(layout);
+            }
         }
+        // 结构收缩自愈：错位段已在循环内全数重建，此处截掉多余尾部。
+        self.entries.truncate(n);
+        // 临时探针（任务 1.1）：记录本次重排范围，量完即拆。
+        crate::app::render_probe::record_relayout(relayout_from, rebuilt_entries, rebuilt_lines);
         self.key = key;
         // 易失尾槽：按 block 分槽推进（design D1）——Text 块走行级 memo
         // （markdown 块上下文 + HighlightState 按完结行前缀推进），
@@ -980,6 +1236,56 @@ mod tests {
         out
     }
 
+    /// 合成 agentic 会话 JSONL（任务 1.2 常驻基准）：`turns` 轮 × (user +
+    /// assistant[thinking+text+toolCall] + toolResult 预览)。卡体/预览均互异
+    /// （语法高亮缓存不命中），对齐真实会话形态（卡/消息 p95≈2、预览
+    /// p95≈4.5KB），输出形如探针归档 `{seq,dir,raw}` 逐行。
+    ///
+    /// 输入: turns — 轮数（每轮 2 条目 + 1 张工具卡）
+    /// 输出: 可喂 `replay_jsonl` 的 JSONL 字符串；纯合成内容，无真实会话数据
+    fn agentic_jsonl(turns: usize) -> String {
+        let mut out = String::with_capacity(turns * 10 * 1024);
+        let mut seq = 0u64;
+        for i in 0..turns {
+            let thinking = format!("思考过程 {i}：先分析问题，再决定调用工具。\n").repeat(40);
+            let text = format!(
+                "## 结果 {i}\n\n**步骤 {i}**：查看文件后修改。\n\n```rust\nfn f_{i}(x: usize) -> usize {{ x * {i} }}\n```\n"
+            )
+            .repeat(12);
+            let preview: String = (0..70)
+                .map(|k| format!("pub fn p_{i}_{k}(x: usize) -> usize {{ x + {k} * {i} }}\n"))
+                .collect();
+            let events = [
+                json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":format!("任务 {i}")}]}}),
+                json!({"type":"message_end","message":{"role":"assistant","content":[
+                    {"type":"thinking","thinking":thinking},
+                    {"type":"text","text":text},
+                    {"type":"toolCall","id":format!("AG{i}"),"name":"read","arguments":format!("{{\"path\":\"src/f_{i}.rs\"}}")},
+                ]}}),
+                json!({"type":"tool_execution_end","toolCallId":format!("AG{i}"),"isError":false,"result":{"structuredContent":preview},"durationMs":10}),
+            ];
+            for raw in events {
+                out.push_str(&format!("{{\"seq\":{seq},\"dir\":\"in\",\"raw\":{}}}\n", raw));
+                seq += 1;
+            }
+        }
+        out
+    }
+
+    /// 预算断言的档位换算（任务 1.2）：预算（30ms/3ms）为宿主 release
+    /// 口径；debug 档对字符串/分配密集负载慢 3–6 倍，断言乘 6 留抖动余量，
+    /// 真实预算以 release 档为准（eprintln 同时打印两档预算与实测值）。
+    ///
+    /// 输入: 无
+    /// 输出: release 返回 1.0；debug 返回 6.0
+    fn budget_factor() -> f64 {
+        if cfg!(debug_assertions) {
+            6.0
+        } else {
+            1.0
+        }
+    }
+
     /// 实测缓存内存足迹（结构头 + 行/meta/计数内容字节近似和；含 String
     /// 堆内容长度，不含分配器开销）。
     fn cache_memory_footprint(cache: &LayoutCache) -> usize {
@@ -1374,6 +1680,492 @@ mod tests {
 
         // ---- 收尾: message_end 落盘 (尾槽 -> 正式条目) 后一帧（末遍内测） ----
         eprintln!("[bench] land: message_end 后整帧={:.2}ms", land_ms);
+    }
+
+    /// 任务 1.2 常驻基准：布局缓存失效帧钉预算（design 方向 3 先红后绿）。
+    ///
+    /// 场景（合成 agentic 300 轮/600 条目，卡预览互异，257×61）：条目增
+    /// （消息边界 user push + 新流式槽）与旧条目失效（tool_end 迟到命中
+    /// entry#1 → `[k..n]` 重排，宿主 533ms 冷帧同机制）。另计胖条目落盘帧
+    /// 作信息注记（卡体首渲染成本，不入断言——见 design 归因补记）。
+    /// 输入: 无（全部合成内容）；输出: `[bench]` 计时/重排范围/预算判定
+    ///       eprintln + 断言：失效帧 < 30ms（宿主 release 口径；debug 档
+    ///       ×6 防抖，见 [`budget_factor`]）
+    #[test]
+    fn bench_layout_cache_invalidation() {
+        let mut state =
+            replay_jsonl(std::io::Cursor::new(agentic_jsonl(300).as_bytes())).expect("合成回放");
+        let n_entries = state.entries().len();
+        assert!(n_entries >= 590, "背景应约 600 条目, 实得 {n_entries}");
+        let mut cache = crate::app::layout_cache::LayoutCache::default();
+        let ui = crate::app::view::ViewUi::default();
+        let backend = ratatui::backend::TestBackend::new(257, 61);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut draw = |state: &mut SessionState,
+                        cache: &mut crate::app::layout_cache::LayoutCache|
+         -> (f64, crate::app::render_probe::SegProbe) {
+            let _ = crate::app::render_probe::take();
+            let t0 = Instant::now();
+            terminal
+                .draw(|frame| {
+                    let _ = crate::app::view::render(frame, state, &ui, cache);
+                })
+                .unwrap();
+            (t0.elapsed().as_secs_f64() * 1e3, crate::app::render_probe::take())
+        };
+        // 冷建 + 暖化（预算只看失效帧，背景成本不入账）。
+        draw(&mut state, &mut cache);
+        for _ in 0..2 {
+            draw(&mut state, &mut cache);
+        }
+
+        // ---- 帧 A：条目增（消息边界） ----
+        state.handle(&json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"下一问"}]}}));
+        state.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+        let (add_ms, add_seg) = draw(&mut state, &mut cache);
+
+        // ---- 帧 B：旧条目失效（tool_end 迟到命中 entry#1）——冷帧 533ms 类 ----
+        state.handle(&json!({"type":"tool_execution_end","toolCallId":"AG0","isError":false,"result":{"structuredContent":"更新后预览"},"durationMs":5}));
+        let (cold_ms, cold_seg) = draw(&mut state, &mut cache);
+
+        // ---- 信息注记：胖条目落盘帧（卡体首渲染，不入断言） ----
+        let fat_text = "## 落盘\n\n**正文**与 `code`。\n\n".repeat(400);
+        state.handle(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":fat_text}]}}));
+        let (land_ms, _) = draw(&mut state, &mut cache);
+
+        let budget = 30.0 * budget_factor();
+        let worst = add_ms.max(cold_ms);
+        eprintln!(
+            "[bench] invalidation: entries={n_entries} | entry_add={add_ms:.1}ms (relayout {}条) cold_invalidate={cold_ms:.1}ms (relayout {}条 from={}) | land(信息)={land_ms:.1}ms | budget=30ms×{:.0}={budget:.0}ms → {}",
+            add_seg.relayout_entries,
+            cold_seg.relayout_entries,
+            cold_seg.relayout_from,
+            budget_factor(),
+            if worst < budget { "GREEN" } else { "RED" }
+        );
+        assert!(
+            worst < budget,
+            "失效帧 worst={worst:.1}ms 应 < {budget:.0}ms（预算 30ms 宿主 release 口径；现状冷帧 = [k..n] 全量重排）"
+        );
+    }
+
+    /// 任务 1.2 常驻基准：cells=1 暖帧钉预算（design 方向 3 先红后绿）。
+    ///
+    /// 场景（宿主形态，257×61）：合成 agentic 背景 + 胖尾条（两条尾条目
+    /// 携 14 张 read 卡，预览取真实 toolResult p95-max 量级 20–37KB）+
+    /// 流式 in-flight（40KB 文本增量 + 7 张工具卡部分结果），取无事件回显
+    /// 帧（cells=1）best-of-10，分段计时归因。
+    /// 输入: 无（全部合成内容）；输出: `[bench]` 分段计时/预算判定 eprintln
+    ///       + 断言：暖帧 < 3ms（宿主 release 口径；debug 档 ×6 防抖）
+    #[test]
+    fn bench_warm_frame_cells1() {
+        let mut state =
+            replay_jsonl(std::io::Cursor::new(agentic_jsonl(300).as_bytes())).expect("合成回放");
+        let mut cache = crate::app::layout_cache::LayoutCache::default();
+        let ui = crate::app::view::ViewUi::default();
+        let backend = ratatui::backend::TestBackend::new(257, 61);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut draw = |state: &mut SessionState,
+                        cache: &mut crate::app::layout_cache::LayoutCache| {
+            terminal
+                .draw(|frame| {
+                    let _ = crate::app::view::render(frame, state, &ui, cache);
+                })
+                .unwrap();
+        };
+        // 胖尾条（真实会话 max 形态）：两条尾条目 + 流式 in-flight，卡预览
+        // 取真实工具结果 p95-max 量级（20-37KB），互异防缓存命中失真。
+        let mut content = vec![
+            json!({"type":"thinking","thinking":"思考".repeat(3000)}),
+            json!({"type":"text","text":"## 小节\n\n**加粗**与 `行内代码` 混排的长回答。\n\n".repeat(1400)}),
+        ];
+        for k in 0..7 {
+            content.push(json!({"type":"toolCall","id":format!("W{k}"),"name":"read","arguments":format!("{{\"path\":\"src/w_{k}.rs\"}}")}));
+        }
+        state.handle(&json!({"type":"message_end","message":{"role":"assistant","content":content}}));
+        for k in 0..7 {
+            // 预览 ≈37KB（真实 toolResult max 36762B）互异。
+            let preview: String = (0..600)
+                .map(|i| format!("pub fn w_{k}_{i}(x: usize) -> usize {{ x * {i} + {k} }}\n"))
+                .collect();
+            state.handle(&json!({"type":"tool_execution_end","toolCallId":format!("W{k}"),"isError":false,"result":{"structuredContent":preview},"durationMs":10}));
+        }
+        // 流式中：in-flight 文本增量 + 工具卡部分结果（Other 槽每帧重建）。
+        state.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+        for chunk in "流式**正文**与 `code` 混排的长回答，模拟真实排版压力。\n\n".repeat(1400)
+            .as_bytes()
+            .chunks(200)
+        {
+            state.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":String::from_utf8_lossy(chunk)}}));
+        }
+        for k in 0..7 {
+            state.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"toolcall_start","contentIndex":k+1,"id":format!("LW{k}"),"toolName":"read"}}));
+            let partial: String = (0..200)
+                .map(|i| format!("const C_{k}_{i}: usize = {};\n", i * 7 + k))
+                .collect();
+            state.handle(&json!({"type":"tool_execution_update","toolCallId":format!("LW{k}"),"partialResult":{"structuredContent":partial}}));
+        }
+        draw(&mut state, &mut cache);
+        // cells=1 暖帧（无事件帧）× 10 取最优（宽松阈值防抖，对齐既有纪律）。
+        let mut best = f64::MAX;
+        let mut seg = crate::app::render_probe::SegProbe::default();
+        for _ in 0..10 {
+            let _ = crate::app::render_probe::take();
+            let t0 = Instant::now();
+            draw(&mut state, &mut cache);
+            let frame_ms = t0.elapsed().as_secs_f64() * 1e3;
+            let s = crate::app::render_probe::take();
+            if frame_ms < best {
+                best = frame_ms;
+                seg = s;
+            }
+        }
+        let budget = 3.0 * budget_factor();
+        eprintln!(
+            "[bench] warm cells=1: frame_best={best:.2}ms | layout={:.2} (toolcard={:.2} wrapcount={:.2}) highlight={:.2} wrap={:.2} paint={:.2} | budget=3ms×{:.0}={budget:.0}ms → {}",
+            seg.layout_ns as f64 / 1e6,
+            seg.toolcard_ns as f64 / 1e6,
+            seg.wrapcount_ns as f64 / 1e6,
+            seg.highlight_ns as f64 / 1e6,
+            seg.wrap_ns as f64 / 1e6,
+            seg.paint_ns as f64 / 1e6,
+            budget_factor(),
+            if best < budget { "GREEN" } else { "RED" }
+        );
+        assert!(
+            best < budget,
+            "暖帧 {best:.2}ms 应 < {budget:.0}ms（预算 3ms 宿主 release 口径；现状 = 尾窗/in-flight 每帧全量重排）"
+        );
+    }
+
+    /// 2.1 重编号 parity（消息序号）：末位 assistant 被 turn_end 权威内容
+    /// 空化 → 消息序号消耗 1→0，后续用户条目的 MessageStart 全局序号平移
+    /// ——增量路径只重排变化条目，未变条目必须重编号 meta，与全量 oracle
+    /// 逐号相等。
+    /// 输入: 无（构造 [assistant, user, assistant(空化), user] 事件序列）
+    /// 输出: 断言摊平 meta 与 oracle 逐号相等 + 重排条目数 == 1
+    #[test]
+    fn invalidation_renumber_msg_seq_parity() {
+        let mut cache = LayoutCache::default();
+        let mut state = SessionState::new();
+        let (o, t, theme) = defaults();
+        let flags = RenderFlags::default();
+        state.handle(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"a1"}]}}));
+        state.handle(&json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"u1"}]}}));
+        state.handle(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"b1"}]}}));
+        state.handle(&json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"u2"}]}}));
+        assert_parity(&mut cache, &mut state, flags, &o, &t, &theme, 80);
+        // turn_end 权威回填把末位 assistant（entry#2）文本空化：条目 0 行、
+        // 不耗消息序号 → entry#3 的 MessageStart 平移 -1。
+        state.handle(&json!({"type":"turn_end","message":{"role":"assistant","content":[{"type":"text","text":""}]}}));
+        let _ = crate::app::render_probe::take();
+        assert_parity(&mut cache, &mut state, flags, &o, &t, &theme, 80);
+        let seg = crate::app::render_probe::take();
+        assert_eq!(seg.relayout_entries, 1, "应只重排变化条目（entry#2）");
+    }
+
+    /// 2.1 重编号 parity（思考序号）：前置条目直改追加 thinking 块 → 思考
+    /// 消耗 +1，后续 assistant 的 Thinking 全局序号平移——增量路径未变条目
+    /// 重编号后与全量 oracle 逐号相等。
+    /// 输入: 无（构造双 thinking 会话 + 直改 entry#0 + mark_entry_dirty(0)）
+    /// 输出: 断言摊平 meta 与 oracle 逐号相等 + 重排条目数 == 1
+    #[test]
+    fn invalidation_renumber_thinking_seq_parity() {
+        let mut cache = LayoutCache::default();
+        let mut state = SessionState::new();
+        let (o, t, theme) = defaults();
+        let flags = RenderFlags::default();
+        state.handle(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"thinking","thinking":"t0"},{"type":"text","text":"a1"}]}}));
+        state.handle(&json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"u1"}]}}));
+        state.handle(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"thinking","thinking":"t1"},{"type":"text","text":"a2"}]}}));
+        assert_parity(&mut cache, &mut state, flags, &o, &t, &theme, 80);
+        // 直改 entry#0 追加 thinking 块（模拟未来编辑/重生成类变异点）+ 定向失效。
+        if let Entry::Assistant { blocks, .. } = &mut state.transcript[0] {
+            blocks.push(Block::Thinking {
+                text: "t0-late".into(),
+            });
+        }
+        state.mark_entry_dirty(0);
+        let _ = crate::app::render_probe::take();
+        assert_parity(&mut cache, &mut state, flags, &o, &t, &theme, 80);
+        let seg = crate::app::render_probe::take();
+        assert_eq!(seg.relayout_entries, 1, "应只重排变化条目（entry#0）");
+    }
+
+    /// 2.1 多点失效 parity：同一批次两处旧条目工具更新（entry#0/#2）——
+    /// 增量路径只重排两条失配条目，中间未变条目命中指纹跳过，与全量
+    /// oracle 逐字节相等。
+    /// 输入: 无（构造三工具卡会话 + 同批双 tool_end）
+    /// 输出: 断言摊平 lines/meta 与 oracle 相等 + 重排条目数 == 2
+    #[test]
+    fn invalidation_multi_point_rebuild_parity() {
+        let mut cache = LayoutCache::default();
+        let mut state = SessionState::new();
+        let (o, t, theme) = defaults();
+        let flags = RenderFlags::default();
+        for k in 0..3 {
+            state.handle(&json!({"type":"message_end","message":{"role":"assistant","content":[
+                {"type":"text","text":format!("m{k}")},
+                {"type":"toolCall","id":format!("P{k}"),"name":"bash","arguments":"{}"},
+            ]}}));
+            state.handle(&json!({"type":"tool_execution_end","toolCallId":format!("P{k}"),"isError":false,"result":{"content":format!("out{k}")},"durationMs":1}));
+        }
+        state.handle(&json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"tail"}]}}));
+        assert_parity(&mut cache, &mut state, flags, &o, &t, &theme, 80);
+        // 同批两处失效：P0 与 P2 的结果更新（entry#0/#2 失配，#1 命中）。
+        state.handle(&json!({"type":"tool_execution_end","toolCallId":"P0","isError":true,"result":{"content":"updated-0"},"durationMs":2}));
+        state.handle(&json!({"type":"tool_execution_end","toolCallId":"P2","isError":false,"result":{"content":"updated-2"},"durationMs":2}));
+        let _ = crate::app::render_probe::take();
+        assert_parity(&mut cache, &mut state, flags, &o, &t, &theme, 80);
+        let seg = crate::app::render_probe::take();
+        assert_eq!(seg.relayout_entries, 2, "应只重排 entry#0/#2，中间命中指纹跳过");
+    }
+
+    /// 2.1 滚动锚定/选区坐标一致性：中段失效（工具卡行数变化 → 后续屏行
+    /// 平移）后，钉住态（following=false）窗口内容、ChatScroll 回写与命中
+    /// 区间（选区/点击坐标原料）均与全量 oracle 路径逐字节一致。
+    /// 输入: 无（构造含工具卡/消息标记的会话 + 钉住滚动 + 旧条目 tool_end）
+    /// 输出: 断言窗口行/回写/hits 三者与 oracle 相等
+    #[test]
+    fn invalidation_window_and_hits_parity() {
+        let mut cache = LayoutCache::default();
+        let mut state = SessionState::new();
+        let (o, t, theme) = defaults();
+        let flags = RenderFlags::default();
+        for k in 0..6 {
+            let out = format!("输出{k}\n输出{k}\n输出{k}\n");
+            state.handle(&json!({"type":"message_end","message":{"role":"assistant","content":[
+                {"type":"thinking","thinking":format!("tk{k}")},
+                {"type":"text","text":format!("正文 {k}：**加粗**与 `code` 混排。")},
+                {"type":"toolCall","id":format!("Q{k}"),"name":"bash","arguments":"{}"},
+            ]}}));
+            state.handle(&json!({"type":"tool_execution_end","toolCallId":format!("Q{k}"),"isError":false,"result":{"content":out},"durationMs":1}));
+        }
+        assert_parity(&mut cache, &mut state, flags, &o, &t, &theme, 80);
+        // 钉住态：top=2（非贴底），失效前先固定参照。
+        let scroll = ChatScroll {
+            top: 2,
+            following: false,
+            viewport: 10,
+            content_len: 0,
+        };
+        // 中段失效：entry#1 的工具卡结果变长（行数变化 → 后续屏行平移）。
+        let grown = "改后输出\n".repeat(8);
+        state.handle(&json!({"type":"tool_execution_end","toolCallId":"Q1","isError":false,"result":{"content":grown},"durationMs":2}));
+        cache.refresh(&mut state, flags, &o, &t, &theme, 80);
+        let chunks = cache.chunks();
+        let (cw, cn, ch) =
+            wrap::wrap_for_viewport_windowed(&chunks, 80, 10, &scroll, None, &theme);
+        let (ol, om) = chat::chat_lines_themed(&state, flags, &o, &t, &theme);
+        let (ow, on, oh) = wrap::wrap_for_viewport(&ol, 80, 10, &scroll, &om, None, &theme);
+        assert_eq!(cw, ow, "钉住态窗口行应与 oracle 逐字节一致（滚动锚定）");
+        assert_eq!(cn, on, "ChatScroll 回写应一致（锚定/贴底判定同源）");
+        assert_eq!(ch, oh, "命中区间应一致（选区/点击坐标）");
+    }
+
+    /// 任务 1.1 临时诊断（量完随任务 3.2 拆除）：view::render 内部二次分解。
+    ///
+    /// 场景矩阵（合成 1500 条/5.8MB 背景 + 首部工具条目，257×61 宿主 2k
+    /// 最大化口径）：冷建 / 闲档回显（cells=1）/ 流式回显（cells=1，流式中
+    /// 无事件帧）/ 流式内容帧 / 冷帧三触发（旧条目工具更新、消息边界条目
+    /// 增、漏标降级）。每场景打一行 `[diag]`：分段计时（布局/高亮/wrap/
+    /// paint）+ 布局缓存重排范围（from/条目/行）。
+    /// 输入: 无（全部合成内容）；输出: `[diag]` eprintln，无断言
+    #[test]
+    fn diag_render_segments() {
+        fn ms(ns: u64) -> f64 {
+            ns as f64 / 1e6
+        }
+        /// 把一段事件包装为探针归档行（replay_jsonl 输入格式）。
+        fn wrap_jsonl(raws: &[serde_json::Value]) -> String {
+            let mut out = String::new();
+            for (i, raw) in raws.iter().enumerate() {
+                out.push_str(&format!(
+                    "{{\"seq\":{},\"dir\":\"in\",\"raw\":{}}}\n",
+                    i, raw
+                ));
+            }
+            out
+        }
+        // 首部工具条目（entry#1 = assistant 携 toolCall T0）+ 合成背景：
+        // 旧条目失效场景的重排范围需要工具条目在低位下标。
+        let prefix = wrap_jsonl(&[
+            json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"帮我跑个工具"}]}}),
+            json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"toolCall","id":"T0","name":"bash","arguments":"{\"cmd\":\"ls\"}"}]}}),
+        ]);
+        let jsonl = format!("{prefix}{}", synthetic_jsonl());
+        let mut state = replay_jsonl(std::io::Cursor::new(jsonl.as_bytes())).expect("合成回放");
+        let n_entries = state.entries().len();
+        assert!(n_entries >= 1400, "背景应约 1500 条, 实得 {n_entries}");
+        let mut cache = crate::app::layout_cache::LayoutCache::default();
+        let ui = crate::app::view::ViewUi::default();
+        let backend = ratatui::backend::TestBackend::new(257, 61);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        // 每场景一帧：清探针 -> draw（view::render 内部分段记录）-> 取快照。
+        let mut draw_once = |state: &mut SessionState,
+                             cache: &mut crate::app::layout_cache::LayoutCache,
+                             label: &str| {
+            let _ = crate::app::render_probe::take();
+            let t0 = Instant::now();
+            terminal
+                .draw(|frame| {
+                    let _ = crate::app::view::render(frame, state, &ui, cache);
+                })
+                .unwrap();
+            let frame_ms = t0.elapsed().as_secs_f64() * 1e3;
+            let seg = crate::app::render_probe::take();
+            eprintln!(
+                "[diag] {label}: frame={frame_ms:.1}ms | layout={:.1} highlight={:.1} toolcard={:.1} wrapcount={:.1} wrap={:.1} paint={:.1} | relayout from={} entries={} lines={}",
+                ms(seg.layout_ns),
+                ms(seg.highlight_ns),
+                ms(seg.toolcard_ns),
+                ms(seg.wrapcount_ns),
+                ms(seg.wrap_ns),
+                ms(seg.paint_ns),
+                if seg.relayout_from == usize::MAX {
+                    "-".to_string()
+                } else {
+                    seg.relayout_from.to_string()
+                },
+                seg.relayout_entries,
+                seg.relayout_lines,
+            );
+            frame_ms
+        };
+
+        // ---- 冷建（全量首建，对照 4f7b6ef 冷帧 600ms） ----
+        draw_once(&mut state, &mut cache, "cold_build");
+
+        // ---- 闲档回显（cells=1：无事件帧）× 3 ----
+        for i in 0..3 {
+            draw_once(&mut state, &mut cache, &format!("idle_echo#{i}"));
+        }
+
+        // ---- 流式中：内容帧（text_delta 后）与回显帧（cells=1：无事件）交错 ----
+        state.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+        draw_once(&mut state, &mut cache, "stream_start");
+        for i in 0..5 {
+            let delta = "流式**正文**与 `code` 混排，模拟真实长回答的排版压力。\n\n".repeat(4);
+            state.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":delta}}));
+            draw_once(&mut state, &mut cache, &format!("stream_content#{i}"));
+            draw_once(&mut state, &mut cache, &format!("stream_echo#{i}"));
+        }
+        state.handle(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"流式正文落盘"}]}}));
+        draw_once(&mut state, &mut cache, "land");
+
+        // ---- 冷帧触发 1：旧条目工具更新（tool_end 迟到命中 entry#1） ----
+        state.handle(&json!({"type":"tool_execution_end","toolCallId":"T0","isError":false,"result":{"content":"done"},"durationMs":100}));
+        draw_once(&mut state, &mut cache, "cold_tool_update");
+
+        // ---- 冷帧触发 2：消息边界条目增（land + user push + 新流式槽） ----
+        state.handle(&json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"下一问"}]}}));
+        state.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+        draw_once(&mut state, &mut cache, "cold_entry_add");
+
+        // ---- 冷帧触发 3：漏标降级全量重建（安全网参照） ----
+        state.simulate_missed_mark();
+        draw_once(&mut state, &mut cache, "cold_miss_rebuild");
+
+        // ---- 胖尾条暖帧：大落盘条目（thinking+大文本+多工具卡）进尾窗后，
+        // 无事件回显帧的构成（宿主 9ms 疑点：尾窗 K=2 对胖条目每帧全量重排）。
+        {
+            let fat_text = {
+                let mut s = String::new();
+                while s.len() < 36 * 1024 {
+                    s.push_str("## 小节\n\n**加粗**与 `行内代码` 混排的长回答正文，模拟真实排版压力。\n\n");
+                    s.push_str("```rust\nfn demo(x: usize) -> usize {\n    (0..x).map(|i| i * 3).sum()\n}\n```\n\n");
+                }
+                s
+            };
+            let mut content = vec![
+                json!({"type":"thinking","thinking":"思考".repeat(1500)}),
+                json!({"type":"text","text":fat_text}),
+            ];
+            for k in 0..6 {
+                content.push(json!({"type":"toolCall","id":format!("FAT{k}"),"name":"read","arguments":format!("{{\"path\":\"src/file_{k}.rs\"}}")}));
+            }
+            state.handle(&json!({"type":"message_end","message":{"role":"assistant","content":content}}));
+            for k in 0..6 {
+                // read 卡预览 = 整文件原文（8KB 互异代码）：高亮全文后 collapse
+                // 前 10 行——真实宿主胖尾条的卡体形态。
+                let preview: String = (0..120)
+                    .map(|i| format!("pub fn f_{k}_{i}(x: usize) -> usize {{ x * {i} + {k} }}\n"))
+                    .collect();
+                state.handle(&json!({"type":"tool_execution_end","toolCallId":format!("FAT{k}"),"isError":false,"result":{"structuredContent":preview},"durationMs":10}));
+            }
+            draw_once(&mut state, &mut cache, "fat_tail_land");
+            for i in 0..3 {
+                draw_once(&mut state, &mut cache, &format!("fat_tail_echo#{i}"));
+            }
+            // 宿主形态暖帧：流式中（in-flight 含工具卡，每帧重建 Other 槽）
+            // + 胖尾条在尾窗（卡预览高亮缓存被流式体重高亮扰动）。
+            state.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+            let mut source = String::new();
+            while source.len() < 40 * 1024 {
+                source.push_str("流式**正文**与 `code` 混排的长回答，模拟真实排版压力。\n\n");
+                source.push_str("```rust\nfn s(x: usize) -> usize { x * 2 }\n```\n\n");
+            }
+            for chunk in source.as_bytes().chunks(200) {
+                state.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":String::from_utf8_lossy(chunk)}}));
+            }
+            for k in 0..3 {
+                state.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"toolcall_start","contentIndex":k+1,"id":format!("LIVE{k}"),"toolName":"read"}}));
+                let partial: String = (0..80)
+                    .map(|i| format!("const V_{k}_{i}: usize = {};\n", i * 7 + k))
+                    .collect();
+                state.handle(&json!({"type":"tool_execution_update","toolCallId":format!("LIVE{k}"),"partialResult":{"structuredContent":partial}}));
+            }
+            draw_once(&mut state, &mut cache, "host_like_content");
+            for i in 0..3 {
+                draw_once(&mut state, &mut cache, &format!("host_like_echo#{i}"));
+            }
+        }
+
+        // ==== 真实会话口径（临时诊断专用；缺失时优雅跳过）====
+        // 宿主实测 533ms/9ms 的同源数据：balabala-agent-gui 长会话 agent 日志
+        // （含 toolCall/thinking/大工具输出）经 load_messages 裁入。
+        const REAL_SESSION: &str = "/Users/b.f.peng/.pi/agent/sessions/--Users-b.f.peng-Documents-Projects-balabala-agent-gui--/2026-11-19T09-02-49-512Z_01a1f30b-58a7-714a-a875-a6608c59673b.jsonl";
+        let Ok(raw_log) = std::fs::read_to_string(REAL_SESSION) else {
+            eprintln!("[diag] 真实会话日志缺失（{REAL_SESSION}），跳过 real_* 场景");
+            return;
+        };
+        let messages: Vec<serde_json::Value> = raw_log
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("message"))
+            .filter_map(|mut v| v.get_mut("message").map(|m| m.take()))
+            .collect();
+        let mut rstate = SessionState::new();
+        rstate.load_messages(&json!({"messages": messages}));
+        let n_real = rstate.entries().len();
+        eprintln!("[diag] real_session: entries={n_real}");
+        let mut rcache = crate::app::layout_cache::LayoutCache::default();
+        draw_once(&mut rstate, &mut rcache, "real_cold_build");
+        for i in 0..3 {
+            draw_once(&mut rstate, &mut rcache, &format!("real_idle_echo#{i}"));
+        }
+        // 流式中回显（cells=1：流式激活但无事件帧）与内容帧交错。
+        rstate.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+        for i in 0..3 {
+            let delta = "流式**正文**与 `code` 混排，模拟真实长回答的排版压力。\n\n".repeat(4);
+            rstate.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":delta}}));
+            draw_once(&mut rstate, &mut rcache, &format!("real_stream_content#{i}"));
+            draw_once(&mut rstate, &mut rcache, &format!("real_stream_echo#{i}"));
+        }
+        // 冷帧触发：旧条目工具更新（取首部 toolCall id，tool_end 迟到命中）。
+        let old_tool = rstate.entries().iter().find_map(|e| match e {
+            pi_shell_rs::session::Entry::Assistant { blocks, .. } => blocks.iter().find_map(
+                |b| match b {
+                    pi_shell_rs::session::Block::ToolCall { id, .. } => Some(id.clone()),
+                    _ => None,
+                },
+            ),
+            _ => None,
+        });
+        if let Some(id) = old_tool {
+            rstate.handle(&json!({"type":"tool_execution_end","toolCallId":id,"isError":false,"result":{"content":"done"},"durationMs":100}));
+            draw_once(&mut rstate, &mut rcache, "real_cold_tool_update");
+        }
     }
 }
 
