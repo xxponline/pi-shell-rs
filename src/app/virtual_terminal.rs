@@ -9,14 +9,17 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-// 探针（临时，change 2026-11-20-streaming-input-echo-latency 定位 A）：
-// draw 耗时分解 — backend.draw 自身（CSI/SGR 生成）/ cells / 字节量。
-// 与 App::draw 的 ui 段计时相减即得 ratatui diff 余量。量完即拆。
+// draw 分解统计（`[draw-cost]` 诊断；`PI_RENDER_PROBE` 门控，默认旁路）：
+// backend.draw 自身（CSI/SGR 生成）/ cells / 字节量。与 App::draw 的 ui 段
+// 计时相减即得 ratatui diff 余量。
 static PROBE_ANSI_NS: AtomicU64 = AtomicU64::new(0);
 static PROBE_CELLS: AtomicU64 = AtomicU64::new(0);
 static PROBE_BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// 取走并清零 draw 分解统计：(cells, ansi_ns, bytes)
+/// 取走并清零 draw 分解统计：(cells, ansi_ns, bytes)（仅供门控诊断消费）。
+///
+/// 输入: 无
+/// 输出: 自上次取走以来的累计三元组并清零
 pub fn probe_take() -> (u64, u64, u64) {
     (
         PROBE_CELLS.swap(0, Ordering::Relaxed),
@@ -51,7 +54,9 @@ impl AnsiBuffer {
 
 impl Write for AnsiBuffer {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        PROBE_BYTES.fetch_add(buf.len() as u64, Ordering::Relaxed);
+        if crate::app::render_probe::enabled() {
+            PROBE_BYTES.fetch_add(buf.len() as u64, Ordering::Relaxed);
+        }
         self.0.lock().unwrap().extend_from_slice(buf);
         Ok(buf.len())
     }
@@ -111,7 +116,10 @@ impl Backend for VirtualBackend {
     where
         I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
     {
-        // 探针（临时）：backend.draw 自身耗时（CSI/SGR 生成）+ cells 计数
+        // 分解统计（门控）：未开启时零开销直通。
+        if !crate::app::render_probe::enabled() {
+            return self.inner.draw(content);
+        }
         let probe_t0 = std::time::Instant::now();
         let mut probe_cells = 0u64;
         let r = self.inner.draw(content.inspect(|_| probe_cells += 1));

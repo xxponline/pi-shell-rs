@@ -14,7 +14,7 @@ mod event;
 mod markdown;
 mod md_stream;
 mod layout_cache;
-mod render_probe; // 临时渲染分段探针（任务 1.1；任务 3.2 拆除或门控）
+mod render_probe; // 渲染分段计量（常驻基准归因 + PI_RENDER_PROBE 门控诊断）
 mod overlay;
 pub mod scroll; // 宿主（GUI）引 ALT_WHEEL_MULTIPLIER — terminal-pointer-and-scroll-input D1
 mod selection;
@@ -405,9 +405,7 @@ impl App {
         // design D3：运行中工具的计时刷新（Elapsed 走字）——Timeout 分支按
         // 1s 粒度条件重绘；正常事件重绘不重置该窗口（多画一帧无害）。
         let mut last_tick_draw = std::time::Instant::now();
-        // 探针（临时，change 2026-11-20-streaming-input-echo-latency 复核）：
-        // batch/draw 节奏 — 验证回显延迟是否来自「输入混入大流式 batch、
-        // 整批只 draw 一次」。量完即拆。
+        // batch/draw 节奏诊断（[draw-probe]，`PI_RENDER_PROBE` 门控）。
         let mut last_draw_at = std::time::Instant::now();
 
         while !self.should_quit {
@@ -426,27 +424,28 @@ impl App {
                     }
                 }
             }
-            // 探针（临时）：本批组成 — input=输入类(Key/Wheel/Click/Pointer)、
-            // rpc=流式 UiEvent::Rpc；大 rpc 批里含 input = 回显被合并进大帧。
-            let probe_len = batch.len();
-            let probe_input = batch
-                .iter()
-                .filter(|e| {
-                    matches!(
-                        e,
-                        Ok(UiEvent::Key(_))
-                            | Ok(UiEvent::Wheel(_))
-                            | Ok(UiEvent::Click { .. })
-                            | Ok(UiEvent::PointerMove { .. })
-                            | Ok(UiEvent::PointerDrag { .. })
-                            | Ok(UiEvent::PointerUp)
-                    )
-                })
-                .count();
-            let probe_rpc = batch
-                .iter()
-                .filter(|e| matches!(e, Ok(UiEvent::Rpc(_))))
-                .count();
+            // 本批组成诊断（门控）：input=输入类(Key/Wheel/Click/Pointer)、
+            // rpc=流式 UiEvent::Rpc。
+            let (probe_len, probe_input, probe_rpc) = if render_probe::enabled() {
+                let input = batch
+                    .iter()
+                    .filter(|e| {
+                        matches!(
+                            e,
+                            Ok(UiEvent::Key(_))
+                                | Ok(UiEvent::Wheel(_))
+                                | Ok(UiEvent::Click { .. })
+                                | Ok(UiEvent::PointerMove { .. })
+                                | Ok(UiEvent::PointerDrag { .. })
+                                | Ok(UiEvent::PointerUp)
+                        )
+                    })
+                    .count();
+                let rpc = batch.iter().filter(|e| matches!(e, Ok(UiEvent::Rpc(_)))).count();
+                (batch.len(), input, rpc)
+            } else {
+                (0, 0, 0)
+            };
             // H5 修复（change 2026-11-20-streaming-input-echo-latency）：输入类
             // 事件优先 —— 稳定前置到 batch 头部（同组相对序不变），先处理 +
             // 先 draw，回显不等流式大 batch（原 D4「整批只 draw 一次」会把输入
@@ -638,14 +637,16 @@ impl App {
                 let probe_gap = last_draw_at.elapsed();
                 let probe_t0 = std::time::Instant::now();
                 self.draw(terminal)?;
-                eprintln!(
-                    "[draw-probe] batch={} input={} rpc={} gap={:.0}ms draw_cost={:.1}ms",
-                    probe_len,
-                    probe_input,
-                    probe_rpc,
-                    probe_gap.as_secs_f64() * 1000.0,
-                    probe_t0.elapsed().as_secs_f64() * 1000.0,
-                );
+                if render_probe::enabled() {
+                    eprintln!(
+                        "[draw-probe] batch={} input={} rpc={} gap={:.0}ms draw_cost={:.1}ms",
+                        probe_len,
+                        probe_input,
+                        probe_rpc,
+                        probe_gap.as_secs_f64() * 1000.0,
+                        probe_t0.elapsed().as_secs_f64() * 1000.0,
+                    );
+                }
                 last_draw_at = std::time::Instant::now();
             }
         }
@@ -4091,55 +4092,63 @@ impl App {
             .as_ref()
             .and_then(selection_exclusive_bounds)
             .map(|(s, e)| (s, e, self.scroll.top, self.chat_area));
-        // 探针（临时，定位 A）：draw 耗时分解 — ui=闭包内 render；diff=ratatui
-        // diff 余量(total−ui−ansi)；ansi=backend CSI 生成。定位卡顿段，量完即拆。
-        let _ = render_probe::take(); // 清残留分段（含选区文档 refresh），只记本 draw
-        let probe_t0 = std::time::Instant::now();
-        let probe_ui_ns = std::cell::Cell::new(0u64);
-        terminal.draw(|frame| {
-            let ui_t0 = std::time::Instant::now();
-            fb.set(view::render(frame, &mut self.state, &ui, &mut self.layout_cache));
-            // 选区反视频（add-select-to-copy design D3：paint 后 buffer
-            // 后处理——pi ANSI [7m 等价，样式保留仅 fg/bg 互换）。
-            if let Some((s, e, top, area)) = paint_sel {
-                view::paint_selection(frame.buffer_mut(), s, e, top, area);
+        // draw 耗时分解诊断（[draw-cost]/[draw-seg]；`PI_RENDER_PROBE` 门控，
+        // 默认旁路零开销）：ui=闭包内 render；diff=ratatui diff 余量
+        // (total−ui−ansi)；ansi=backend CSI 生成；[draw-seg] 为 render 内部
+        // 分段与布局缓存重排范围。
+        if render_probe::enabled() {
+            let _ = render_probe::take(); // 清残留分段（含选区文档 refresh），只记本 draw
+            let probe_t0 = std::time::Instant::now();
+            let probe_ui_ns = std::cell::Cell::new(0u64);
+            terminal.draw(|frame| {
+                let ui_t0 = std::time::Instant::now();
+                fb.set(view::render(frame, &mut self.state, &ui, &mut self.layout_cache));
+                // 选区反视频（add-select-to-copy design D3：paint 后 buffer
+                // 后处理——pi ANSI [7m 等价，样式保留仅 fg/bg 互换）。
+                if let Some((s, e, top, area)) = paint_sel {
+                    view::paint_selection(frame.buffer_mut(), s, e, top, area);
+                }
+                probe_ui_ns.set(ui_t0.elapsed().as_nanos() as u64);
+            })?;
+            {
+                let total_ns = probe_t0.elapsed().as_nanos() as u64;
+                let (cells, ansi_ns, bytes) = crate::app::virtual_terminal::probe_take();
+                let ui_ns = probe_ui_ns.get();
+                let diff_ns = total_ns.saturating_sub(ui_ns).saturating_sub(ansi_ns);
+                eprintln!(
+                    "[draw-cost] total={:.1}ms ui={:.1}ms diff={:.1}ms ansi={:.1}ms | cells={} bytes={}B",
+                    total_ns as f64 / 1e6,
+                    ui_ns as f64 / 1e6,
+                    diff_ns as f64 / 1e6,
+                    ansi_ns as f64 / 1e6,
+                    cells,
+                    bytes,
+                );
+                let seg = render_probe::take();
+                eprintln!(
+                    "[draw-seg] layout={:.1}ms highlight={:.1}ms toolcard={:.1}ms wrapcount={:.1}ms wrap={:.1}ms paint={:.1}ms | relayout_from={} entries={} lines={}",
+                    seg.layout_ns as f64 / 1e6,
+                    seg.highlight_ns as f64 / 1e6,
+                    seg.toolcard_ns as f64 / 1e6,
+                    seg.wrapcount_ns as f64 / 1e6,
+                    seg.wrap_ns as f64 / 1e6,
+                    seg.paint_ns as f64 / 1e6,
+                    if seg.relayout_from == usize::MAX {
+                        "-".to_string()
+                    } else {
+                        seg.relayout_from.to_string()
+                    },
+                    seg.relayout_entries,
+                    seg.relayout_lines,
+                );
             }
-            probe_ui_ns.set(ui_t0.elapsed().as_nanos() as u64);
-        })?;
-        // 探针输出（临时，定位 A）
-        {
-            let total_ns = probe_t0.elapsed().as_nanos() as u64;
-            let (cells, ansi_ns, bytes) = crate::app::virtual_terminal::probe_take();
-            let ui_ns = probe_ui_ns.get();
-            let diff_ns = total_ns.saturating_sub(ui_ns).saturating_sub(ansi_ns);
-            eprintln!(
-                "[draw-cost] total={:.1}ms ui={:.1}ms diff={:.1}ms ansi={:.1}ms | cells={} bytes={}B",
-                total_ns as f64 / 1e6,
-                ui_ns as f64 / 1e6,
-                diff_ns as f64 / 1e6,
-                ansi_ns as f64 / 1e6,
-                cells,
-                bytes,
-            );
-            // 临时二次分解（任务 1.1）：view::render 内部布局/高亮/wrap/paint
-            // 分段 + 布局缓存重排范围，量完即拆。
-            let seg = render_probe::take();
-            eprintln!(
-                "[draw-seg] layout={:.1}ms highlight={:.1}ms toolcard={:.1}ms wrapcount={:.1}ms wrap={:.1}ms paint={:.1}ms | relayout_from={} entries={} lines={}",
-                seg.layout_ns as f64 / 1e6,
-                seg.highlight_ns as f64 / 1e6,
-                seg.toolcard_ns as f64 / 1e6,
-                seg.wrapcount_ns as f64 / 1e6,
-                seg.wrap_ns as f64 / 1e6,
-                seg.paint_ns as f64 / 1e6,
-                if seg.relayout_from == usize::MAX {
-                    "-".to_string()
-                } else {
-                    seg.relayout_from.to_string()
-                },
-                seg.relayout_entries,
-                seg.relayout_lines,
-            );
+        } else {
+            terminal.draw(|frame| {
+                fb.set(view::render(frame, &mut self.state, &ui, &mut self.layout_cache));
+                if let Some((s, e, top, area)) = paint_sel {
+                    view::paint_selection(frame.buffer_mut(), s, e, top, area);
+                }
+            })?;
         }
         // 漏标对账提示（design D7）：refresh 已降级全量重建，此处断言告警
         // （直接改 transcript 不经 handle 不 bump rev，不在此路径）。

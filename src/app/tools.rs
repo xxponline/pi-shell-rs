@@ -40,14 +40,14 @@ pub fn tool_lines_themed(
     expanded: bool,
     theme: &crate::app::theme::TuiTheme,
 ) -> Vec<Line<'static>> {
-    // 临时探针（任务 1.1）：工具卡渲染分段计时，量完即拆。
+    // 分段计量（render_probe）：工具卡渲染归因段。
     let probe_t0 = std::time::Instant::now();
     let out = tool_lines_themed_inner(name, args_json, tool, expanded, theme);
     crate::app::render_probe::record_toolcard(probe_t0.elapsed().as_nanos() as u64);
     out
 }
 
-/// [`tool_lines_themed`] 的实现体（外层只做临时分段计时，任务 1.1）。
+/// [`tool_lines_themed`] 的实现体（外层只做分段计时归因）。
 ///
 /// 输入/输出: 同 [`tool_lines_themed`]
 fn tool_lines_themed_inner(

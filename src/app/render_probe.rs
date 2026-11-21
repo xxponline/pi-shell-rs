@@ -1,11 +1,13 @@
-//! 临时渲染分段探针（任务 1.1 二次分解用；任务 3.2 拆除或门控）。
+//! 渲染分段计时与门控诊断输出（常驻基准归因 + `PI_RENDER_PROBE` 门控）。
 //!
-//! 把 `view::render` 一帧内部按布局/高亮/wrap/paint 四段计时，并记录布局
-//! 缓存失效重排范围（条目下标与条目/逻辑行数），供诊断基准归因暖帧基础
-//! 成本与冷帧重排范围。线程局部累加、[`take`] 一次性取走清零——与
-//! `virtual_terminal::probe_take` 同风格；不影响渲染输出。
+//! 把 `view::render` 一帧内部按布局/高亮/工具卡/wrap 计数/wrap/paint 分段
+//! 计时，并记录布局缓存重排范围：计数为常驻基准（`bench_warm_frame_cells1`
+//! 等）的分段归因基础设施；`[draw-probe]`/`[draw-cost]`/`[draw-seg]` 诊断
+//! 打印由 [`enabled`] 门控（环境变量 `PI_RENDER_PROBE=1` 开启，默认关闭
+//! 零日志噪音）。线程局部累加、[`take`] 一次性取走清零；不影响渲染输出。
 
 use std::cell::RefCell;
+use std::sync::OnceLock;
 
 /// 分段计时与重排范围快照（[`take`] 产物）。
 #[derive(Debug, Default, Clone, Copy)]
@@ -118,4 +120,14 @@ pub fn take() -> SegProbe {
             },
         )
     })
+}
+
+/// 诊断输出门控：环境变量 `PI_RENDER_PROBE` 存在即开启（读一次缓存）。
+///
+/// 输入: 无
+/// 输出: true = 打印 `[draw-probe]`/`[draw-cost]`/`[draw-seg]` 诊断并累计
+///       backend 分解统计；false = 全部旁路（默认）
+pub fn enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PI_RENDER_PROBE").is_some())
 }

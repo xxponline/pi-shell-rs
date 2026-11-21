@@ -376,8 +376,8 @@ fn render_chat(
     let overrides = tool_expanded.unwrap_or(&empty);
     let empty_t = std::collections::HashMap::new();
     let thinking = thinking_overrides.unwrap_or(&empty_t);
-    // 临时探针（任务 1.1）：布局/wrap/paint 分段计时（高亮段由 markdown
-    // 内部计入，落在布局段内），量完即拆。
+    // 分段计量（render_probe）：布局/wrap/paint 分段（高亮/工具卡/wrap 计数
+    // 段由各模块内部计入，均落在布局段内）。
     let seg_t0 = std::time::Instant::now();
     // 条目级布局缓存（design D1/D2/D7）：增量重排 + 易失尾常新。
     cache.refresh(state, flags, overrides, thinking, theme, area.width);

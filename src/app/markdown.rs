@@ -153,14 +153,14 @@ pub(crate) fn parse_to_lines_with(
     theme: &crate::app::theme::TuiTheme,
     style0: Style,
 ) -> Vec<Line<'static>> {
-    // 临时探针（任务 1.1）：整段解析/语法高亮计入高亮段，量完即拆。
+    // 分段计量（render_probe）：整段解析/语法高亮计入高亮段。
     let probe_t0 = std::time::Instant::now();
     let out = parse_to_lines_with_inner(text, theme, style0);
     crate::app::render_probe::record_highlight(probe_t0.elapsed().as_nanos() as u64);
     out
 }
 
-/// [`parse_to_lines_with`] 的实现体（外层只做临时分段计时，任务 1.1）。
+/// [`parse_to_lines_with`] 的实现体（外层只做分段计时归因）。
 ///
 /// 输入/输出: 同 [`parse_to_lines_with`]
 fn parse_to_lines_with_inner(

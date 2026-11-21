@@ -52,9 +52,32 @@
 
 ## 3. 验收
 
-- [ ] 3.1 宿主复测（balabala-agent-gui 2k 最大化流式打字）：`[term-rate]
+- [x] 3.1 宿主复测（balabala-agent-gui 2k 最大化流式打字）：`[term-rate]
   输入→帧` ≤20ms 量级（对照 220–500ms）；`[draw-cost]` ui 段回落。
   **验证**：数值注记于本任务，并回写宿主 change 4.1 对照表
-- [ ] 3.2 全量 `cargo test --lib` + bench 全绿、0 warnings；`[draw-probe]`/
+
+  > **注记（宿主复测 2026-11-22，release 档）**：2k 最大化 + 流式回答中
+  > 打字，体感顺畅。`[term-rate]`：闲置打字 输入→帧 avg=13ms max=18ms；
+  > 流式中打字 avg=11–18ms max=18–26ms（feed/s 5–20、帧KB max 20KB、
+  > miss=0）——达标 ≤20ms 量级（对照 220–500ms）✅。`[draw-cost]`：回显
+  > ui=0.8–0.9ms（对照 8.9ms）、流式大帧（cells=6333/11.5KB）ui=0.9ms
+  > （对照 8.5–9.3ms）、全程无冷帧尖峰（对照 533ms）✅。
+  > **附带定案**：前期“卡顿感”主因是宿主跑 debug 档（`cargo run`）——
+  > 同场景 debug 档 paint 6–8ms/帧、输入→帧 144–248ms（render/s 3–5
+  > 宿主重绘节奏拖累）；release 档整链消失。遗留一次性热点：会话载入
+  > 首建 212ms（174 条目/2977 行，toolcard 203ms = 96%）——O(全文) 一次
+  > （design 预期），可作后续工具卡渲染/缓存治理 follow-up。
+- [x] 3.2 全量 `cargo test --lib` + bench 全绿、0 warnings；`[draw-probe]`/
   `[draw-cost]` 临时探针处置（拆除或门控）。
   **验证**：命令输出对账
+
+  > **注记（对账 2026-11-22）**：`cargo test --lib` debug/release 均 **398
+  > 全绿**（392 基线 + 4 parity/一致性 + 2 常驻基准；临时诊断
+  > `diag_render_segments` 已拆除）；`cargo clippy --all-targets` **0 告警**。
+  > 4 基准双档全绿：`bench_layout_cache_invalidation` 冷失效 6.9ms/30ms、
+  > `bench_warm_frame_cells1` 1.11ms/3ms（release；debug 19.8/8.39 vs ×6=180/18），
+  > 既有流式尾条基准顺带受益（land 帧 113ms→19ms）。**探针处置（门控）**：
+  > `[draw-probe]`/`[draw-cost]`/`[draw-seg]` 与 backend 分解统计统一由
+  > `PI_RENDER_PROBE=1` 开启（默认零开销旁路/零日志；`render_probe::enabled`）；
+  > `render_probe` 分段计量保留为常驻基准归因基础设施。清点：
+  > `rg '"\[draw' src/` = 3 处输出点，全部在 `enabled()` 门控内。
