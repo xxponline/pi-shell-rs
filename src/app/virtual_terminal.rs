@@ -6,7 +6,24 @@
 //! 全部由宿主设置，因此可在无 tty 的 GUI 进程内运行。
 
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+// 探针（临时，change 2026-11-20-streaming-input-echo-latency 定位 A）：
+// draw 耗时分解 — backend.draw 自身（CSI/SGR 生成）/ cells / 字节量。
+// 与 App::draw 的 ui 段计时相减即得 ratatui diff 余量。量完即拆。
+static PROBE_ANSI_NS: AtomicU64 = AtomicU64::new(0);
+static PROBE_CELLS: AtomicU64 = AtomicU64::new(0);
+static PROBE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// 取走并清零 draw 分解统计：(cells, ansi_ns, bytes)
+pub fn probe_take() -> (u64, u64, u64) {
+    (
+        PROBE_CELLS.swap(0, Ordering::Relaxed),
+        PROBE_ANSI_NS.swap(0, Ordering::Relaxed),
+        PROBE_BYTES.swap(0, Ordering::Relaxed),
+    )
+}
 
 use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
 use ratatui::layout::{Position, Size};
@@ -34,6 +51,7 @@ impl AnsiBuffer {
 
 impl Write for AnsiBuffer {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        PROBE_BYTES.fetch_add(buf.len() as u64, Ordering::Relaxed);
         self.0.lock().unwrap().extend_from_slice(buf);
         Ok(buf.len())
     }
@@ -93,7 +111,13 @@ impl Backend for VirtualBackend {
     where
         I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
     {
-        self.inner.draw(content)
+        // 探针（临时）：backend.draw 自身耗时（CSI/SGR 生成）+ cells 计数
+        let probe_t0 = std::time::Instant::now();
+        let mut probe_cells = 0u64;
+        let r = self.inner.draw(content.inspect(|_| probe_cells += 1));
+        PROBE_CELLS.fetch_add(probe_cells, Ordering::Relaxed);
+        PROBE_ANSI_NS.fetch_add(probe_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        r
     }
 
     fn append_lines(&mut self, n: u16) -> Result<(), Self::Error> {

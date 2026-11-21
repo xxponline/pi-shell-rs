@@ -404,6 +404,10 @@ impl App {
         // design D3：运行中工具的计时刷新（Elapsed 走字）——Timeout 分支按
         // 1s 粒度条件重绘；正常事件重绘不重置该窗口（多画一帧无害）。
         let mut last_tick_draw = std::time::Instant::now();
+        // 探针（临时，change 2026-11-20-streaming-input-echo-latency 复核）：
+        // batch/draw 节奏 — 验证回显延迟是否来自「输入混入大流式 batch、
+        // 整批只 draw 一次」。量完即拆。
+        let mut last_draw_at = std::time::Instant::now();
 
         while !self.should_quit {
             // design D4：首个事件阻塞等待，随后 drain 积压逐个处理，整批只
@@ -421,8 +425,46 @@ impl App {
                     }
                 }
             }
+            // 探针（临时）：本批组成 — input=输入类(Key/Wheel/Click/Pointer)、
+            // rpc=流式 UiEvent::Rpc；大 rpc 批里含 input = 回显被合并进大帧。
+            let probe_len = batch.len();
+            let probe_input = batch
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        Ok(UiEvent::Key(_))
+                            | Ok(UiEvent::Wheel(_))
+                            | Ok(UiEvent::Click { .. })
+                            | Ok(UiEvent::PointerMove { .. })
+                            | Ok(UiEvent::PointerDrag { .. })
+                            | Ok(UiEvent::PointerUp)
+                    )
+                })
+                .count();
+            let probe_rpc = batch
+                .iter()
+                .filter(|e| matches!(e, Ok(UiEvent::Rpc(_))))
+                .count();
+            // H5 修复（change 2026-11-20-streaming-input-echo-latency）：输入类
+            // 事件优先 —— 稳定前置到 batch 头部（同组相对序不变），先处理 +
+            // 先 draw，回显不等流式大 batch（原 D4「整批只 draw 一次」会把输入
+            // 回显绑进大流式帧、跟着整批 draw，输入延迟 = 等下一次大 draw）。
+            let is_input = |ev: &Result<UiEvent, mpsc::RecvTimeoutError>| {
+                matches!(
+                    ev,
+                    Ok(UiEvent::Key(_))
+                        | Ok(UiEvent::Wheel(_))
+                        | Ok(UiEvent::Click { .. })
+                        | Ok(UiEvent::PointerMove { .. })
+                        | Ok(UiEvent::PointerDrag { .. })
+                        | Ok(UiEvent::PointerUp)
+                )
+            };
+            batch.sort_by_key(|e| if is_input(e) { 0 } else { 1 });
             let mut need_draw = false;
             for ev in batch {
+                let input_ev = is_input(&ev);
                 match ev {
                     Ok(UiEvent::Key(key)) => {
                         self.log_event("key", &format!("{key:?}"));
@@ -582,12 +624,28 @@ impl App {
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => self.should_quit = true,
                 }
+                // H5 修复：输入类事件处理完立即 draw（优先回显），不等流式尾部
+                if input_ev && need_draw {
+                    self.draw(terminal)?;
+                    need_draw = false;
+                }
                 if self.should_quit {
                     break;
                 }
             }
             if need_draw {
+                let probe_gap = last_draw_at.elapsed();
+                let probe_t0 = std::time::Instant::now();
                 self.draw(terminal)?;
+                eprintln!(
+                    "[draw-probe] batch={} input={} rpc={} gap={:.0}ms draw_cost={:.1}ms",
+                    probe_len,
+                    probe_input,
+                    probe_rpc,
+                    probe_gap.as_secs_f64() * 1000.0,
+                    probe_t0.elapsed().as_secs_f64() * 1000.0,
+                );
+                last_draw_at = std::time::Instant::now();
             }
         }
         Ok(())
@@ -4032,14 +4090,36 @@ impl App {
             .as_ref()
             .and_then(selection_exclusive_bounds)
             .map(|(s, e)| (s, e, self.scroll.top, self.chat_area));
+        // 探针（临时，定位 A）：draw 耗时分解 — ui=闭包内 render；diff=ratatui
+        // diff 余量(total−ui−ansi)；ansi=backend CSI 生成。定位卡顿段，量完即拆。
+        let probe_t0 = std::time::Instant::now();
+        let probe_ui_ns = std::cell::Cell::new(0u64);
         terminal.draw(|frame| {
+            let ui_t0 = std::time::Instant::now();
             fb.set(view::render(frame, &mut self.state, &ui, &mut self.layout_cache));
             // 选区反视频（add-select-to-copy design D3：paint 后 buffer
             // 后处理——pi ANSI [7m 等价，样式保留仅 fg/bg 互换）。
             if let Some((s, e, top, area)) = paint_sel {
                 view::paint_selection(frame.buffer_mut(), s, e, top, area);
             }
+            probe_ui_ns.set(ui_t0.elapsed().as_nanos() as u64);
         })?;
+        // 探针输出（临时，定位 A）
+        {
+            let total_ns = probe_t0.elapsed().as_nanos() as u64;
+            let (cells, ansi_ns, bytes) = crate::app::virtual_terminal::probe_take();
+            let ui_ns = probe_ui_ns.get();
+            let diff_ns = total_ns.saturating_sub(ui_ns).saturating_sub(ansi_ns);
+            eprintln!(
+                "[draw-cost] total={:.1}ms ui={:.1}ms diff={:.1}ms ansi={:.1}ms | cells={} bytes={}B",
+                total_ns as f64 / 1e6,
+                ui_ns as f64 / 1e6,
+                diff_ns as f64 / 1e6,
+                ansi_ns as f64 / 1e6,
+                cells,
+                bytes,
+            );
+        }
         // 漏标对账提示（design D7）：refresh 已降级全量重建，此处断言告警
         // （直接改 transcript 不经 handle 不 bump rev，不在此路径）。
         debug_assert_eq!(
@@ -8453,5 +8533,146 @@ done
             );
         }
         let _ = std::fs::remove_dir_all(&cdir);
+    }
+}
+
+/// 探针测试（临时，change 2026-11-20-streaming-input-echo-latency 复核）：
+/// 验证 D4 batch-draw 合并 —— 一批 `[Rpc×N, Key]` 只触发**一次** draw，
+/// 回显帧与流式帧合并。这是「输入回显被大流式 batch 拖慢」的机制根因。
+#[cfg(test)]
+mod draw_batch_probe {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use ratatui::backend::{Backend, ClearType, WindowSize};
+    use ratatui::layout::{Position, Size};
+
+    use crate::app::virtual_terminal::VirtualBackend;
+    use crate::rpc::RpcClient;
+
+    /// 包住 `VirtualBackend`，只数 `draw` 调用次数（其余委托）。
+    struct CountingBackend {
+        inner: VirtualBackend,
+        draws: Rc<Cell<usize>>,
+    }
+
+    impl Backend for CountingBackend {
+        type Error = std::io::Error;
+
+        fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            self.draws.set(self.draws.get() + 1);
+            self.inner.draw(content)
+        }
+        fn append_lines(&mut self, n: u16) -> Result<(), Self::Error> {
+            self.inner.append_lines(n)
+        }
+        fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+            self.inner.hide_cursor()
+        }
+        fn show_cursor(&mut self) -> Result<(), Self::Error> {
+            self.inner.show_cursor()
+        }
+        fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
+            self.inner.get_cursor_position()
+        }
+        fn set_cursor_position<P: Into<Position>>(
+            &mut self,
+            position: P,
+        ) -> Result<(), Self::Error> {
+            self.inner.set_cursor_position(position)
+        }
+        fn clear(&mut self) -> Result<(), Self::Error> {
+            self.inner.clear()
+        }
+        fn clear_region(&mut self, clear_type: ClearType) -> Result<(), Self::Error> {
+            self.inner.clear_region(clear_type)
+        }
+        fn size(&self) -> Result<Size, Self::Error> {
+            self.inner.size()
+        }
+        fn window_size(&mut self) -> Result<WindowSize, Self::Error> {
+            self.inner.window_size()
+        }
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.inner.flush()
+        }
+    }
+
+    /// 只应答不动作的假 pi（同 commands.rs 范式；此处事件不碰 commander）。
+    fn stub_pi(dir: &std::path::Path) -> std::path::PathBuf {
+        let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  printf '{"type":"response","id":"%s","success":true}\n' "$id"
+done
+"#;
+        let path = dir.join("pi.sh");
+        std::fs::write(&path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    /// H5 修复验证：一批 `[Rpc×N, Key]` 中输入类事件应**独立 draw**、流式 Rpc
+    /// 组内仍合并 —— 共 3 次 draw（首帧 + 输入回显 + 流式合并），而非修复前的
+    /// 2 次（整批合并）或逐事件的 N+2 次。证明输入回显不再被大流式 batch 拖慢。
+    #[test]
+    fn input_echo_draws_independently_of_stream_batch() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("draw-batch-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = stub_pi(&dir);
+        let client = RpcClient::spawn(stub.to_str().unwrap(), &[]).unwrap();
+        let commander = client.command_sender();
+
+        let mut app = App::new();
+        let draws = Rc::new(Cell::new(0usize));
+        let backend = CountingBackend {
+            inner: VirtualBackend::new(80, 24),
+            draws: draws.clone(),
+        };
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<UiEvent>();
+        let (report_tx, _report_rx) = std::sync::mpsc::channel::<UiEvent>();
+
+        // 灌一批：N 个流式 Rpc + 1 个输入 Key + Shutdown（让 event_loop 退出）。
+        // 事件先全部入队，event_loop 的 recv_timeout + try_recv drain 会把它们
+        // 收成**同一批**，整批处理后只 draw 一次 —— 精确复现 D4 batch 合并。
+        const N: usize = 30;
+        for _ in 0..N {
+            tx.send(UiEvent::Rpc(serde_json::json!({ "type": "turn_start" })))
+                .unwrap();
+        }
+        tx.send(UiEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('汉'),
+            crossterm::event::KeyModifiers::NONE,
+        )))
+        .unwrap();
+        tx.send(UiEvent::Shutdown).unwrap();
+
+        app.event_loop(&mut terminal, &rx, &commander, &report_tx)
+            .unwrap();
+
+        // 首帧 1 + 输入回显 1 + 流式合并 1 = 3；修复前（整批合并）= 2，
+        // 逐事件 = N + 2。3 证输入独立 draw + 流式仍合并（修复生效）。
+        assert_eq!(
+            draws.get(),
+            3,
+            "输入应独立 draw（不与流式合并），实际 draw {} 次",
+            draws.get()
+        );
+
+        client.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
