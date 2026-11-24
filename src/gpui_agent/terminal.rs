@@ -20,6 +20,7 @@ use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerStat
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::text::TextView;
 use gpui_kit::*;
+use gpui_kit::prelude::FluentBuilder as _; // 容器链上条件边框用 `.map`（spec: 输入区简约边框）
 use ratatui::style::{Color, Modifier, Style};
 
 use crate::app::theme::TuiTheme;
@@ -50,8 +51,8 @@ mod palette {
     pub(super) const CHAT_BG: Rgba = hex(0xffffff);
     /// 状态行底。
     pub(super) const STATUS_BG: Rgba = hex(0xf0f0f2);
-    /// 输入区底（微灰，与消息区区分）。
-    pub(super) const INPUT_BG: Rgba = hex(0xf7f8fa);
+    /// 输入区边框（spec: 输入区简约边框——lighting 纯黑）。
+    pub(super) const INPUT_BORDER: Rgba = hex(0x000000);
     /// 补全选中行底。
     pub(super) const COMP_SELECTED_BG: Rgba = hex(0xd8e6fb);
 
@@ -128,6 +129,9 @@ pub struct GPUIAgentTerminal {
     _interceptor: Subscription,
     /// 编辑器变更订阅（镜像进 App + 重算补全；RAII 反注册，task 4.3）。
     _change_sub: Subscription,
+    /// 输入框焦点进出订阅（边框加粗重绘，spec: 输入区简约边框；RAII 反注册）。
+    _focus_in_sub: Subscription,
+    _focus_out_sub: Subscription,
     /// app 退出钩子订阅（RAII：实体销毁即反注册，防悬垂）。
     _quit: Subscription,
     /// 归约泵任务（持有至实体销毁；实体释放后泵自动退出）。
@@ -234,6 +238,10 @@ impl GPUIAgentTerminal {
         // 上限 6（与 ratatui editor_height 的内容行 clamp(1,6) 同源）。
         let textarea = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 6));
         let focus = textarea.focus_handle(cx);
+        // 焦点进出 → 实体重绘（spec: 输入区简约边框）：render 时读
+        // is_focused 切换 border_1/2；焦点变化不自动重绘实体，故显式 notify。
+        let focus_in_sub = cx.on_focus_in(&focus, window, |_, _, cx| cx.notify());
+        let focus_out_sub = cx.on_focus_out(&focus, window, |_, _, _, cx| cx.notify());
         // 文本变更 → 镜像进 App.editor + 重算补全（task 4.3：补全随输入刷新；
         // push 回写用 set_value，不发 Change，不会形成回环）。
         let change_sub = cx.subscribe(&textarea, |this, _ta, event: &InputEvent, cx| {
@@ -381,6 +389,8 @@ impl GPUIAgentTerminal {
             _quit: quit,
             _interceptor: interceptor,
             _change_sub: change_sub,
+            _focus_in_sub: focus_in_sub,
+            _focus_out_sub: focus_out_sub,
             #[cfg(not(test))]
             _reduce_task: reduce_task,
         }
@@ -746,6 +756,9 @@ impl Render for GPUIAgentTerminal {
                     .id("gpui-status")
                     .h(line_h)
                     .bg(palette::STATUS_BG)
+                    // 验收反馈（task 1.4）：状态行再上拉 10px，与输入区留隙
+                    // 消除重叠。
+                    .mb(px(10.))
                     .test_support()
                     .child({
                         let bar = StatusBar::new().left(
@@ -764,16 +777,25 @@ impl Render for GPUIAgentTerminal {
                     }),
             )
             .child(
-                // 输入区（task 5.4）：内建 Textarea（auto_grow 1..6 行、内建
-                // 光标/撤销/换行）；全局键位经拦截层进共享语义层（task 4.3）。
+                // 输入区（spec: 输入区简约边框）：白底（随根）、纯黑直角边框
+                // 常态 1px / 聚焦 2px（render 读焦点，焦点监听触发重绘）；
+                // Textarea appearance(false) 剥 kit 底色/圆角/边框/聚焦光环；
+                // 编辑语义仍由内建编辑器自理（task 5.4）。
                 div()
                     .id("gpui-input")
                     .flex()
                     .flex_col()
                     .px_2()
-                    .bg(palette::INPUT_BG)
+                    .map(|b| {
+                        if self.focus.is_focused(window) {
+                            b.border_2()
+                        } else {
+                            b.border_1()
+                        }
+                    })
+                    .border_color(palette::INPUT_BORDER)
                     .test_support()
-                    .child(Textarea::new(&self.textarea)),
+                    .child(Textarea::new(&self.textarea).appearance(false)),
             )
             .child(
                 // 补全菜单（输入区正下方，task 4.3）。
@@ -782,6 +804,10 @@ impl Render for GPUIAgentTerminal {
                     .flex()
                     .flex_col()
                     .bg(palette::CHAT_BG)
+                    // 验收反馈（task 1.4）：底部留 10px——空菜单时把输入框
+                    // 整体上拉离底边；放 completion 而非根容器，避免影响
+                    // 浮层 absolute 锚定。
+                    .mb(px(10.))
                     .test_support()
                     .children(completion_pane),
             );

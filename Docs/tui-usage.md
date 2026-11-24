@@ -243,6 +243,9 @@ PI_GPUI_RENDER_PROBE=1 cargo run --bin pi-shell-gpui --features gpui-support
 - 独立窗口固定浅色模式（`add-gpui-overlays`）：启动即
   `Theme::change(ThemeMode::Light)`、不订阅系统外观；面板/文字色收拢于
   `gpui_agent` 的调色板常量（完整主题系统为后续 change）。
+- 输入区形态（`simplify-gpui-input-chrome`）：白底（与消息区同底）+ 纯黑
+  直角边框——常态 1px、聚焦加粗 2px；`Textarea` 加 `appearance(false)`
+  剥除 kit 内建底色/圆角/聚焦光环，编辑语义仍由内建编辑器自理。
 - 渲染优先用 gpui-kit 内建控件：消息区 = 内建虚拟滚动 + 内建 markdown
   （代码高亮随 kit 特性），输入区 = 内建 TextArea（auto_grow 1..6 行、
   内建光标/撤销），状态行 = 内建 status_bar（phase/model/用量 + 提示右段）。
