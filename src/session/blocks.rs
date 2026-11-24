@@ -1,7 +1,13 @@
 //! Assistant content blocks accumulated from streaming deltas.
 
 /// One assistant content block, indexed by the wire `contentIndex`.
+///
+/// `allow(large_enum_variant)`：`gpui-support` 特性下 gpui-kit 传递统一了
+/// `serde_json` 的 `preserve_order`/`raw_value`，`Value` 布局变大把 ToolCall
+/// 变体推过 clippy 阈值（默认特性下不告警）。装箱会改动共享 API 构造点，
+/// 违反 design D6「共享代码仅加法」，故以属性抑制（行为零变化）。
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum Block {
     Text { text: String },
     Thinking { text: String },

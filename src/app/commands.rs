@@ -71,6 +71,43 @@ pub fn is_known(name: &str) -> bool {
     COMMANDS.iter().any(|c| c.name == name)
 }
 
+/// GPUI P0 查询型斜杠子集（task 6.3）：结果走 notice/会话区展示，不开任何
+/// 浮层（P0 无浮层渲染——浮层会吞键，design D6）；子集外的已知命令由
+/// `App::dispatch_slash` 给未支持提示桩，model/thinking 空参（选择器入口）
+/// 另有用法提示分支。
+///
+/// 注意: `/cost`、`/help` 不在 pi 内置命令表（单源见 [`COMMANDS`]），
+///       子集按实际表选型。
+pub const GPUI_QUERY_SUBSET: &[&str] = &["changelog", "model", "thinking", "quit"];
+
+/// GPUI 可开浮层型斜杠命令（spec: 斜杠命令查讯型子集 v1 —— 支持集 =
+/// 查讯型 ∪ 可开浮层型；逐个对应 TUI 分发中打开浮层的入口）。
+///
+/// 注意: 无参语义以 TUI 分发为准（如 `/import` 无参给用法提示、带参
+///       走二次确认浮层）；不在两子集内的已知命令仍走“暂不支持”桩。
+pub const GPUI_OVERLAY_SUBSET: &[&str] = &[
+    "model",
+    "thinking",
+    "resume",
+    "session",
+    "tree",
+    "fork",
+    "hotkeys",
+    "trust",
+    "settings",
+    "scoped-models",
+    "import",
+];
+
+/// GPUI 斜杠分发放行判定（task 7.1；spec: 斜杠命令查讯型子集 v1）。
+///
+/// 功能: 查讯型 ∪ 可开浮层型 = 走全量分发的命令集合；
+/// 输入: name — 不含 `/` 的命令名；
+/// 输出: true = 放行走 TUI 分发；false = 已知桩 / 未知走普通文本（由调用方分流）。
+pub fn gpui_slash_supported(name: &str) -> bool {
+    GPUI_QUERY_SUBSET.contains(&name) || GPUI_OVERLAY_SUBSET.contains(&name)
+}
+
 /// 按命令名取元数据（补全候选与参数补全用）。
 ///
 /// 输入: name — 不含 `/` 的命令名
@@ -320,6 +357,79 @@ done
     fn unknown_slash_returns_false_for_normal_send() {
         let (mut app, cmd, tx, dir) = ctx();
         assert!(!dispatch(&mut app, &cmd, &tx, "/some-unknown-command"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// GPUI 斜杠支持子集闸门（task 6.3 + 7.1/7.2）：查讯型放行、可开浮层型
+    /// 真开浮层（无参 /model 开选择器）、其余已知命令给未支持桩、未知仍交
+    /// 普通文本；默认模式全量分发行为不变。
+    ///
+    /// 功能: 锁定 `App::dispatch_slash` 双模式行为；
+    /// 输入: 构造的提交文本 + 假 pi 通道；输出: 断言通过。
+    #[test]
+    fn gpui_subset_gates_query_and_stubs_rest() {
+        let (mut app, cmd, tx, dir) = ctx();
+        app.slash_subset_only = true;
+
+        // 查询型放行：/changelog 走全量分发（非「暂不支持」桩）。
+        app.editor.replace("/changelog");
+        assert!(app.dispatch_slash("/changelog", &cmd, &tx));
+        let (text, _) = app.notice.clone().expect("changelog 应有提示");
+        assert!(!text.contains("暂不支持"), "changelog 应执行而非桩: {text}");
+        assert!(app.editor.is_empty(), "命令后输入清空");
+
+        // 可开浮层型放行（task 7.1）：/session → Info 浮层，不给桩。
+        app.notice = None;
+        app.editor.replace("/session");
+        assert!(app.dispatch_slash("/session", &cmd, &tx));
+        assert!(app.overlay.is_some(), "session 应开 Info 浮层");
+        assert!(
+            app.notice
+                .as_ref()
+                .map(|(t, _)| !t.contains("暂不支持"))
+                .unwrap_or(true),
+            "不应给未支持桩"
+        );
+        assert!(app.editor.is_empty(), "命令后输入清空");
+        app.overlay = None; // 清场
+
+        // model 空参 = 选择器入口：真开选择器（task 7.2，与 TUI 同语义）。
+        app.notice = None;
+        app.editor.replace("/model");
+        assert!(app.dispatch_slash("/model", &cmd, &tx));
+        assert!(
+            matches!(
+                app.overlay,
+                Some(crate::app::overlay::Overlay::ModelSelect { .. })
+            ),
+            "空参 model 应开选择器，实际: {:?}",
+            app.overlay.is_some()
+        );
+        assert!(app.notice.is_none(), "不应有提示桩/用法");
+        assert!(app.editor.is_empty());
+        app.overlay = None; // 清场
+
+        // 两子集之外的已知命令仍给未支持桩（如 /copy）。
+        app.notice = None;
+        app.editor.replace("/copy");
+        assert!(app.dispatch_slash("/copy", &cmd, &tx));
+        let (text, _) = app.notice.clone().expect("copy 应给桩");
+        assert!(text.contains("暂不支持"), "应为未支持桩: {text}");
+        assert!(app.overlay.is_none(), "桩不得开浮层");
+        assert!(app.editor.is_empty());
+
+        // 未知斜杠 → 不拦截（按普通文本发送）。
+        assert!(
+            !app.dispatch_slash("/no-such-command", &cmd, &tx),
+            "未知斜杠交普通发送"
+        );
+
+        // 默认（ratatui）模式：全量分发，/trust 开浮层行为不变。
+        app.slash_subset_only = false;
+        app.editor.replace("/trust");
+        assert!(app.dispatch_slash("/trust", &cmd, &tx));
+        assert!(app.overlay.is_some(), "ratatui 模式保持全量行为");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

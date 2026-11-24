@@ -162,7 +162,7 @@ pub fn wrap_for_viewport_chunks(
     let width = width.max(1) as usize;
     let height = height.max(1) as usize;
 
-    let mut wrapped: Vec<Line<'static>> = Vec::new();
+    let mut wrapped: Vec<GridLine> = Vec::new();
     // 逐屏行的命中标记组：一条逻辑行的全部子行继承同一组（logical→
     // screen 传播）。
     let mut screen_meta: Vec<Vec<HitKind>> = Vec::new();
@@ -173,7 +173,8 @@ pub fn wrap_for_viewport_chunks(
             let style = line.style;
             let mark = chunk_meta.get(i).cloned().unwrap_or_default();
             let start = wrapped.len();
-            for sub in split_on_newlines(line) {
+            let logical = GridLine::from(line);
+            for sub in split_on_newlines(&logical) {
                 wrap_one(&sub, width, &mut wrapped);
             }
             for l in &mut wrapped[start..] {
@@ -186,6 +187,10 @@ pub fn wrap_for_viewport_chunks(
 
     // 全量屏行空间扫出点击命中区间（drain 窗口之前，绝对号，design D2）。
     let hits = collect_hits(&screen_meta);
+
+    // 抽核边界（task 5.1）：断行在中性类型上完成后转回 ratatui，走既有
+    // 背景补齐/窗口化/滚动条管线——原导出行为不变。
+    let mut wrapped: Vec<Line<'static>> = wrapped.into_iter().map(Line::from).collect();
 
     // 带 bg 的行补齐到视口宽（整行面板着色，否则行尾露底色）。
     for l in &mut wrapped {
@@ -390,6 +395,101 @@ fn collect_runs_counted(
     }
 }
 
+/// 中性样式段（cell 布局核的载体，task 5.1）：拥有所有权的 cell 文本 +
+/// 样式值——样式只是数据，ratatui 面转 `Span`、GPUI 面转 Hsla，两侧各自
+/// 翻译；断行算法只认本类型，两侧渲染面共享同一断行结果。
+#[derive(Debug, Clone, PartialEq)]
+pub struct GridSeg {
+    /// 段文本（拥有所有权；`\n` 已由拆行核分离）。
+    pub text: String,
+    /// 段样式（fg/粗体等 token 级样式）。
+    pub style: Style,
+}
+
+/// 中性逻辑行/屏行（cell 布局核的输出载体，task 5.1）。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GridLine {
+    /// 行内样式段序列（空 = 空行）。
+    pub segs: Vec<GridSeg>,
+    /// 行级样式（工具卡面板 bg 等整行传播样式）。
+    pub style: Style,
+}
+
+impl GridLine {
+    /// 显示宽度（cell 数；CJK/全角按 2 计）。
+    pub fn width(&self) -> usize {
+        self.segs.iter().map(|s| s.text.width()).sum()
+    }
+}
+
+impl From<&Line<'static>> for GridLine {
+    /// 输入: ratatui 逻辑行（借用）；输出: 等值中性行（段文本拷贝、行级/
+    /// 段级样式原样；仅支持默认对齐行——现有渲染面不设 alignment）。
+    fn from(line: &Line<'static>) -> Self {
+        Self {
+            segs: line
+                .spans
+                .iter()
+                .map(|s| GridSeg {
+                    text: s.content.to_string(),
+                    style: s.style,
+                })
+                .collect(),
+            style: line.style,
+        }
+    }
+}
+
+impl From<GridLine> for Line<'static> {
+    /// 输入: 中性行；输出: 等值 ratatui 行（段文本移入 `Cow::Owned`、样式
+    /// 原样）——与 `GridLine::from` 互为逆变换（无 alignment 行）。
+    fn from(line: GridLine) -> Self {
+        let spans: Vec<Span<'static>> = line
+            .segs
+            .into_iter()
+            .map(|s| Span::styled(s.text, s.style))
+            .collect();
+        let mut out = Line::from(spans);
+        out.style = line.style;
+        out
+    }
+}
+
+/// 中性断行入口（task 5.1 抽核：cell 布局核对 GPUI 前端的完整入口——
+/// 拆行 + 贪心断行 + 父行样式传播 + 面板 bg 补齐；不含窗口化/滚动条
+/// （P0 GPUI 不做滚动条，窗口化由各前端按 `ChatScroll` 自行组装）。
+///
+/// 输入: logical — 中性逻辑行序列；width — 视口宽度（单元格，`max(1)` 归一）
+/// 输出: 中性屏行序列（与 ratatui 路径同一断行核；spec: 网格布局一致）
+#[allow(dead_code)] // GPUI 渲染面（5.2）接入前由双跑测试覆盖
+pub fn wrap_grid(logical: &[GridLine], width: u16) -> Vec<GridLine> {
+    let width = width.max(1) as usize;
+    let mut out: Vec<GridLine> = Vec::new();
+    for line in logical {
+        let start = out.len();
+        for sub in split_on_newlines(line) {
+            wrap_one(&sub, width, &mut out);
+        }
+        // 父行 style（面板 bg）传播到子行（design D5，同 ratatui 路径）。
+        for l in &mut out[start..] {
+            l.style = line.style;
+        }
+    }
+    // 带 bg 的行补齐到视口宽（整行面板着色，同 ratatui 路径）。
+    for l in &mut out {
+        if l.style.bg.is_some() {
+            let cur = l.width();
+            if cur < width {
+                l.segs.push(GridSeg {
+                    text: " ".repeat(width - cur),
+                    style: l.style,
+                });
+            }
+        }
+    }
+    out
+}
+
 /// 分块视口换行（design D3：只排版落在窗口内的逻辑行，成本 O(窗口行)）。
 ///
 /// 输入:
@@ -443,14 +543,16 @@ pub fn wrap_for_viewport_windowed(
                 if wrapped.len() >= height {
                     break 'collect;
                 }
-                let mut rows: Vec<Line<'static>> = Vec::new();
-                for sub in split_on_newlines(line) {
+                let logical = GridLine::from(line);
+                let mut rows: Vec<GridLine> = Vec::new();
+                for sub in split_on_newlines(&logical) {
                     wrap_one(&sub, width, &mut rows);
                 }
                 // 父行 style（面板 bg）传播到子行（design D5），同全文路径。
                 for r in &mut rows {
                     r.style = line.style;
                 }
+                let rows: Vec<Line<'static>> = rows.into_iter().map(Line::from).collect();
                 let skip = if ci == ci0 && i == li0 { offset } else { 0 };
                 for r in rows.into_iter().skip(skip) {
                     if wrapped.len() >= height {
@@ -538,12 +640,58 @@ fn collect_runs(
     }
 }
 
+/// 按显示宽度截断中性行（cell 感知，task 5.3——宽字符不越界，超宽
+/// 段从边界整字丢弃，与 ratatui Paragraph 的视口裁剪同口径）。
+///
+/// 输入: line — 待截断中性行（原地修改）；max_w — 最大宽度（单元格）；
+/// 输出: 无返回值；副作用为裁剪 segs 文本（空段剔除）。
+#[allow(dead_code)] // 默认构建无调用方（GPUI 状态行截断，task 5.3）
+pub(crate) fn truncate_grid_width(line: &mut GridLine, max_w: usize) {
+    let mut remain = max_w;
+    let mut cut = false;
+    for seg in &mut line.segs {
+        if cut {
+            seg.text.clear();
+            continue;
+        }
+        let seg_w = seg.text.width();
+        if seg_w <= remain {
+            remain -= seg_w;
+            continue;
+        }
+        // 部分截断：按字符累积，宽字符不越过 remain。
+        let mut used = 0usize;
+        let mut end = 0usize;
+        for (i, ch) in seg.text.char_indices() {
+            let cw = ch.width().unwrap_or(0);
+            if used + cw > remain {
+                break;
+            }
+            used += cw;
+            end = i + ch.len_utf8();
+        }
+        seg.text.truncate(end);
+        cut = true;
+    }
+    line.segs.retain(|s| !s.text.is_empty());
+}
+
 /// 计算单个逻辑行按视口宽度换行后的屏行数（design D3 前缀和原料）。
 ///
 /// 输入: line — 逻辑行（span 内可含 `\n`）；width — 视口宽度（单元格）
 /// 输出: 屏行数（≥1；空行/仅换行均保留至少一行）；与
 ///       `wrap_for_viewport*` 对该行的产出行数一致（回归由 5.2 保证）
 pub(crate) fn count_wrapped_rows(line: &Line<'static>, width: usize) -> u32 {
+    count_grid_rows(&GridLine::from(line), width)
+}
+
+/// 中性版行计数（cell 布局核，task 5.1；与 [`count_wrapped_rows`] 同一
+/// 实现——layout_cache 前缀和与 GPUI 前缀和不漂移，双跑由抽核测试锁定）。
+///
+/// 输入: line — 中性逻辑行（段内可含 `\n`）；width — 视口宽度（单元格）
+/// 输出: 屏行数（≥1；空行/仅换行均保留至少一行）
+#[allow(dead_code)] // GPUI 渲染面（5.3）接入前由双跑测试覆盖
+pub fn count_grid_rows(line: &GridLine, width: usize) -> u32 {
     let width = width.max(1);
     let mut out = Vec::new();
     for sub in split_on_newlines(line) {
@@ -556,10 +704,10 @@ pub(crate) fn count_wrapped_rows(line: &Line<'static>, width: usize) -> u32 {
 ///
 /// 输入: 一个逻辑行
 /// 输出: 非空的子行序列；无 `\n` 时原样返回一个元素
-fn split_on_newlines(line: &Line<'static>) -> Vec<Vec<Span<'static>>> {
-    let mut subs: Vec<Vec<Span<'static>>> = vec![Vec::new()];
-    for span in &line.spans {
-        let parts: Vec<&str> = span.content.as_ref().split('\n').collect();
+fn split_on_newlines(line: &GridLine) -> Vec<Vec<GridSeg>> {
+    let mut subs: Vec<Vec<GridSeg>> = vec![Vec::new()];
+    for seg in &line.segs {
+        let parts: Vec<&str> = seg.text.split('\n').collect();
         for (i, part) in parts.into_iter().enumerate() {
             if i > 0 {
                 subs.push(Vec::new());
@@ -567,7 +715,10 @@ fn split_on_newlines(line: &Line<'static>) -> Vec<Vec<Span<'static>>> {
             if !part.is_empty() {
                 subs.last_mut()
                     .expect("sub lines non-empty")
-                    .push(Span::styled(part.to_string(), span.style));
+                    .push(GridSeg {
+                        text: part.to_string(),
+                        style: seg.style,
+                    });
             }
         }
     }
@@ -581,18 +732,18 @@ fn split_on_newlines(line: &Line<'static>) -> Vec<Vec<Span<'static>>> {
 ///   width — 目标宽度
 ///   out   — 结果收集器（换行后的行追加到尾部）
 /// 输出: 无返回值；副作用为向 out 追加 ≥1 行
-fn wrap_one(sub: &[Span<'static>], width: usize, out: &mut Vec<Line<'static>>) {
+fn wrap_one(sub: &[GridSeg], width: usize, out: &mut Vec<GridLine>) {
     // 空子行 → 保留一个空行。
-    if sub.iter().all(|s| s.content.as_ref().is_empty()) {
-        out.push(Line::default());
+    if sub.iter().all(|s| s.text.is_empty()) {
+        out.push(GridLine::default());
         return;
     }
 
-    let mut cur: Vec<Span<'static>> = Vec::new();
+    let mut cur: Vec<GridSeg> = Vec::new();
     let mut cur_w: usize = 0;
 
-    for span in sub {
-        for (token, style) in tokenize(span) {
+    for seg in sub {
+        for (token, style) in tokenize(seg) {
             let tw = token.width();
 
             if tw > width {
@@ -602,9 +753,12 @@ fn wrap_one(sub: &[Span<'static>], width: usize, out: &mut Vec<Line<'static>>) {
                 let last = chunks.len().saturating_sub(1);
                 for (i, chunk) in chunks.into_iter().enumerate() {
                     if i < last {
-                        out.push(Line::from(Span::styled(chunk, style)));
+                        out.push(GridLine {
+                            segs: vec![GridSeg { text: chunk, style }],
+                            style: Style::default(),
+                        });
                     } else {
-                        cur.push(Span::styled(chunk, style));
+                        cur.push(GridSeg { text: chunk, style });
                         cur_w = token_width_last(&cur);
                     }
                 }
@@ -619,7 +773,7 @@ fn wrap_one(sub: &[Span<'static>], width: usize, out: &mut Vec<Line<'static>>) {
                 }
             }
             cur_w += tw;
-            cur.push(Span::styled(token, style));
+            cur.push(GridSeg { text: token, style });
         }
     }
     flush(&mut cur, &mut cur_w, out);
@@ -629,16 +783,19 @@ fn wrap_one(sub: &[Span<'static>], width: usize, out: &mut Vec<Line<'static>>) {
 ///
 /// 输入: 当前 span 列表
 /// 输出: 显示宽度总和
-fn token_width_last(cur: &[Span<'static>]) -> usize {
-    cur.iter().map(|s| s.content.as_ref().width()).sum()
+fn token_width_last(cur: &[GridSeg]) -> usize {
+    cur.iter().map(|s| s.text.width()).sum()
 }
 
 /// 冲刷当前行为一行（空行也产出，避免丢失结构）。
 ///
 /// 输入/输出: 通过 &mut 修改 cur/cur_w/out
-fn flush(cur: &mut Vec<Span<'static>>, cur_w: &mut usize, out: &mut Vec<Line<'static>>) {
+fn flush(cur: &mut Vec<GridSeg>, cur_w: &mut usize, out: &mut Vec<GridLine>) {
     if !cur.is_empty() {
-        out.push(Line::from(std::mem::take(cur)));
+        out.push(GridLine {
+            segs: std::mem::take(cur),
+            style: Style::default(),
+        });
     }
     *cur_w = 0;
 }
@@ -673,21 +830,21 @@ fn hard_split(token: &str, width: usize) -> Vec<String> {
 ///
 /// 输入: 一个 span
 /// 输出: (token 文本, 样式) 序列；非空白词与空白 run 分开返回
-fn tokenize(span: &Span<'static>) -> Vec<(String, ratatui::style::Style)> {
-    let text = span.content.as_ref();
+fn tokenize(seg: &GridSeg) -> Vec<(String, ratatui::style::Style)> {
+    let text = &seg.text;
     let mut tokens = Vec::new();
     let mut buf = String::new();
     let mut is_ws: Option<bool> = None;
     for ch in text.chars() {
         let ws = ch.is_whitespace() && ch != '\n';
         if is_ws.is_some() && Some(ws) != is_ws {
-            tokens.push((std::mem::take(&mut buf), span.style));
+            tokens.push((std::mem::take(&mut buf), seg.style));
         }
         is_ws = Some(ws);
         buf.push(ch);
     }
     if !buf.is_empty() {
-        tokens.push((buf, span.style));
+        tokens.push((buf, seg.style));
     }
     tokens
 }
@@ -1233,5 +1390,95 @@ mod tests {
             (hits[1].start, hits[1].end, hits[1].kind.clone()),
             (81, 82, HitKind::Thinking(7)),
         );
+    }
+
+    /// 抽核双跑（task 5.1）：同一输入经 ratatui 原导出路径与中性
+    /// [`wrap_grid`] 路径，断行结果（屏行数、行列划分、行级/段级样式）
+    /// 必须全等——spec「网格布局一致」的抽核级锁定（存量 wrap 单测另锁
+    /// ratatui 路径自身行为不变）。
+    ///
+    /// 功能: 以多类易漂移输入（CJK 双格/超宽硬切/多样式段/内嵌换行/空行/
+    ///       面板 bg 补齐）双跑两路径并逐屏行比对；
+    /// 输入: 无（构造的逻辑行 + 宽度 8，高度给足不窗口截断）；
+    /// 输出: 断言通过（两路径屏行序列全等）。
+    #[test]
+    fn grid_path_matches_ratatui_path_on_breaks() {
+        let red = Style::default().fg(ratatui::style::Color::Red);
+        let panel = Style::default().bg(ratatui::style::Color::Rgb(40, 44, 52));
+        let cases: Vec<Line<'static>> = vec![
+            plain("hello world"),            // 空格断行
+            plain(&"中".repeat(10)),          // CJK 双格
+            plain(&"x".repeat(45)),           // 超宽硬切
+            plain("line1\nline2\nline3"),     // 内嵌换行
+            plain(""),                        // 空行
+            Line::from(vec![                 // 多样式段
+                Span::styled("aa ", red),
+                Span::raw("bb cc dd ee ff gg hh ii jj"),
+            ]),
+            {
+                // 面板 bg（补齐到视口宽）
+                let mut l = Line::from("panel text");
+                l.style = panel;
+                l
+            },
+        ];
+        let width = 8u16;
+
+        // ratatui 原导出路径（全量 oracle；高度 64 给足 → 无窗口截断）。
+        let meta = vec![vec![]; cases.len()];
+        let (rat, _, _) = wrap_for_viewport(
+            &cases,
+            width,
+            64,
+            &ChatScroll::default(),
+            &meta,
+            None,
+            &TuiTheme::default(),
+        );
+        // 中性抽核路径。
+        let grid_in: Vec<GridLine> = cases.iter().map(GridLine::from).collect();
+        let grid = wrap_grid(&grid_in, width);
+
+        // 逐屏行归一到中性类型后全等比对（文本 + 行级样式 + 段序列）。
+        let rat_norm: Vec<GridLine> = rat.iter().map(GridLine::from).collect();
+        assert_eq!(rat_norm.len(), grid.len(), "屏行数不一致");
+        assert_eq!(rat_norm, grid, "断行位置与样式必须全等");
+    }
+
+    /// 行计数双跑（task 5.1）：`count_wrapped_rows`（layout_cache 用的
+    /// ratatui 入口）与中性 [`count_grid_rows`] 同一结果——前缀和原料与
+    /// 实际断行不漂移。
+    ///
+    /// 功能: 对多类输入断言两入口行数相等；输入: 构造的逻辑行与宽度对；
+    /// 输出: 断言通过。
+    #[test]
+    fn row_count_matches_between_paths() {
+        for (line, w) in [
+            (plain("hello world"), 5usize),
+            (plain(&"中".repeat(10)), 10),
+            (plain(&"x".repeat(45)), 10),
+            (plain("a\nb\nc"), 4),
+            (plain(""), 3),
+        ] {
+            assert_eq!(
+                count_wrapped_rows(&line, w),
+                count_grid_rows(&GridLine::from(&line), w),
+                "断行数不一致 w={w}"
+            );
+        }
+    }
+
+    /// 中性 ⇄ ratatui 转换无损（无 alignment 行）：往返后文本与样式全等。
+    ///
+    /// 功能: 构造带行级/段级样式的行，Line → GridLine → Line 往返；
+    /// 输入: 构造行；输出: 断言与原行全等。
+    #[test]
+    fn grid_conversion_roundtrips_losslessly() {
+        let red = Style::default().fg(ratatui::style::Color::Red);
+        let panel = Style::default().bg(ratatui::style::Color::Rgb(1, 2, 3));
+        let mut line = Line::from(vec![Span::styled("ab ", red), Span::raw("cd")]);
+        line.style = panel;
+        let back = Line::from(GridLine::from(&line));
+        assert_eq!(back, line, "往返应无损");
     }
 }

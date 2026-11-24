@@ -85,6 +85,16 @@ impl EditorBuffer {
         self.col
     }
 
+    /// 直接定位光标到 (row, col)（GPUI 文本桥接等程序化路径；行列夹取到
+    /// 缓冲边界，不入 undo）。
+    ///
+    /// 输入: row — 目标行号（越界夹到末行）；col — 目标字符列（越界夹到行尾）；
+    /// 输出: 无返回值；副作用为移动 row/col。
+    pub fn set_cursor(&mut self, row: usize, col: usize) {
+        self.row = row.min(self.lines.len().saturating_sub(1));
+        self.col = col.min(self.lines[self.row].chars().count());
+    }
+
     // ---------- 程序化修改（不入 undo） ----------
 
     /// 整体替换内容，光标移到末尾（set_editor_text 等程序化路径）。

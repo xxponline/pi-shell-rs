@@ -12,6 +12,12 @@
 - 通过拉起 **`pi --mode rpc`**（无头核心）做控制与定制；pi 核心零改动。
 - **目标是"体验级一致"，不是"像素级一致"**：功能一致、布局一致、用起来基本无差别即可。不追求换行/着色/编辑器逐字符行为 100% 相同。
 - 我们是**可控宿主**：在保持 pi 现有使用体验的前提下，做自己的定制（权限、会话限制、工具策略、自动化等）。
+- **原生窗口形态（`add-gpui-support` 新增，与形态 B 并存）**：编译期特性
+  `gpui-support`（默认关闭）门控的 `GPUIAgentTerminal`——kameo 薄层 RPC 路由 +
+  gpui-kit 内建控件渲染（虚拟滚动消息区 + 内建 markdown / TextArea 输入区 /
+  status_bar 状态行），独立窗口 bin `pi-shell-gpui` 先自证，为后续宿主直嵌
+  （替代 ANSI 管线）留门；**功能语义对齐 TUI 的 P0 子集，不做 cell/像素级一致**，
+  ratatui 路径与 embed 管线完全不动。
 
 ### 明确不做
 
@@ -112,7 +118,7 @@ bracketed paste 粘贴、发送 / esc 中断 / ctrl+c 清空 / alt+enter follow_
 
 二期才补：kill-ring、undo 树、自动补全、外部 $EDITOR、图片粘贴。
 
-## 5. 工程结构（lib + 两个 bin）
+## 5. 工程结构（lib + 三个 bin：probe / 主 TUI / pi-shell-gpui）
 
 关键决策：抽出一个 lib crate，让 `probe`、未来的主 TUI、离线测试共享 rpc/session 层。
 
@@ -123,7 +129,8 @@ pi-shell-rs/
 │   ├── lib.rs                    # pi_shell_rs 库入口
 │   ├── bin/
 │   │   ├── probe/                # 已有探针 → 迁移为 use pi_shell_rs
-│   │   └── tui.rs                # 最终主程序
+│   │   ├── tui.rs                # 最终主程序
+│   │   └── gpui_window.rs        # GPUI 独立窗口（gpui-support 门控）
 │   ├── rpc/                      # 连接层（从 probe 提炼，强类型化）
 │   │   ├── process.rs            #   spawn pi --mode rpc / 三线程
 │   │   ├── jsonl.rs              #   wire 类型 / id 注入

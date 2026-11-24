@@ -397,7 +397,7 @@ fn effective_result(tool: &ToolExecution) -> Option<&serde_json::Value> {
 ///
 /// 输入: tool — 执行结果（result 可能为 None，运行中回落 partial）
 /// 输出: Some(正文)；无内容返回 None
-fn result_text(tool: &ToolExecution) -> Option<String> {
+pub(crate) fn result_text(tool: &ToolExecution) -> Option<String> {
     let result = effective_result(tool)?;
     let items = result.get("content")?.as_array()?;
     let parts: Vec<&str> = items

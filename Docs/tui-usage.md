@@ -215,6 +215,53 @@ label（条目名；`/` 菜单中 value==label 视觉不变）。
 - 输入区超长单行按水平滚动显示（不视觉换行）；无输入历史
   （pi 的历史键默认也未绑定）；Tab 纯路径补全已落地（`add-path-tab-completion`）。
 
+## GPUI 构建模式（可选特性 `gpui-support`）
+
+默认构建不依赖 gpui-kit/kameo、行为与既往逐字节同源。双矩阵验证命令：
+
+```bash
+# 列 A（现状，必须始终全绿）
+cargo test
+cargo clippy --all-targets
+
+# 列 B（GPUI 路径）
+cargo test --features gpui-support
+cargo clippy --all-targets --features gpui-support
+
+# 独立窗口（仅特性构建存在；PI_BIN 可指定 pi 二进制）
+PI_BIN=/path/to/pi cargo run --bin pi-shell-gpui --features gpui-support
+
+# 渲染探针：打印每帧构帧耗时与行数（定位卡顿）
+PI_GPUI_RENDER_PROBE=1 cargo run --bin pi-shell-gpui --features gpui-support
+```
+
+注：Cargo.lock 会记录 gpui-kit/kameo 条目（Cargo 锁全特性图，无法避免），
+但列 A 不下载、不编译、不链接它们（`cargo tree -e normal` 无该两系条目）。
+
+窗口形态要点（`add-gpui-support`，与 ratatui 路径并存）：
+
+- 独立窗口固定浅色模式（`add-gpui-overlays`）：启动即
+  `Theme::change(ThemeMode::Light)`、不订阅系统外观；面板/文字色收拢于
+  `gpui_agent` 的调色板常量（完整主题系统为后续 change）。
+- 渲染优先用 gpui-kit 内建控件：消息区 = 内建虚拟滚动 + 内建 markdown
+  （代码高亮随 kit 特性），输入区 = 内建 TextArea（auto_grow 1..6 行、
+  内建光标/撤销），状态行 = 内建 status_bar（phase/model/用量 + 提示右段）。
+- 全局键位与 TUI 语义一致：enter 提交（流式带 `steeringBehavior:"steer"`）、
+  alt+enter 排队、esc 流式中断/空闲无操作、ctrl+c 清空；shift+enter 换行；
+  编辑键（撤销 cmd-z/ctrl-z、kill、词移等）由内建编辑器自理，不逐键对齐 TUI。
+- 悬浮层/选择器（`add-gpui-overlays`）：14 个变体从共享 `App.overlay`
+  直绘（全窗遮罩 + 居中面板，样式取主题 token）；浮层打开时全部按键进
+  共享分发（esc 关闭 / enter 应用 / ↑↓ 导航，Tree 搜索中 esc 先清查询，
+  ctrl+c 仍全局清空）、滚轮被遮罩忽略（不滚被遮住的消息区）；打开键
+  alt+t（thinking 选择器）、ctrl+l（model 选择器，与 `key_intent` 同源）。
+- 斜杠命令支持集 = 查讯型 ∪ 可开浮层型（`gpui_slash_supported`）：
+  `/changelog`、`/model [id]`、`/thinking [lvl]`、`/quit`，以及
+  `/tree /fork /session /resume /settings /hotkeys /trust /scoped-models
+  /import`（真开对应浮层，无参 `/model`、`/thinking` 开选择器）；两子集
+  之外的已知命令仍给“暂不支持”桩；未知 `/xxx` 按普通文本发送；
+  `/mo` 补全 Tab 应用回写内建编辑器。
+- 流式事件经泵攒批合并为单帧重绘；空帧构帧实测 ~0.1ms（字体族进程级缓存）。
+
 ## 排查
 
 - **启动报"无法启动 pi"**：检查 `which pi` / `PI_BIN`，或先用原生 pi 登录。

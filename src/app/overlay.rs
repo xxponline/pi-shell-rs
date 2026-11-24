@@ -631,7 +631,7 @@ fn editor_key(
 ///
 /// 输入: s — 行文本；char_idx — 字符序号（越界取末尾）
 /// 输出: 可用于 insert/split_at 的字节偏移
-fn char_byte_idx(s: &str, char_idx: usize) -> usize {
+pub(crate) fn char_byte_idx(s: &str, char_idx: usize) -> usize {
     s.char_indices()
         .nth(char_idx)
         .map(|(i, _)| i)
@@ -1369,7 +1369,7 @@ pub fn render_overlay(frame: &mut Frame, overlay: &Overlay, current_session: Opt
 ///
 /// 输入: text — 原文；max — 最大字符数
 /// 输出: 截断串（超长以 … 结尾）
-fn truncate_text(text: &str, max: usize) -> String {
+pub(crate) fn truncate_text(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         text.to_string()
     } else {

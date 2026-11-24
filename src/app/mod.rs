@@ -4,29 +4,29 @@
 //! channel, reduces RPC events into a [`SessionState`], and renders a three-
 //! region layout: header / scrollable chat / input editor.
 
-mod autocomplete;
+pub mod autocomplete; // GPUI 前端复用补全纯函数（add-gpui-support D6：additive 导出）
 mod chat;
 mod clipboard;
-mod commands;
-mod editor;
+pub mod commands; // GPUI 前端复用斜杠命令表与分发（同上）
+pub mod editor; // GPUI 前端复用编辑缓冲 EditorBuffer（同上）
 mod external_editor;
 mod event;
 mod markdown;
 mod md_stream;
 mod layout_cache;
 mod render_probe; // 渲染分段计量（常驻基准归因 + PI_RENDER_PROBE 门控诊断）
-mod overlay;
+pub(crate) mod overlay; // GPUI 浮层渲染只读访问（add-gpui-overlays D4：仅加法放宽）
 pub mod scroll; // 宿主（GUI）引 ALT_WHEEL_MULTIPLIER — terminal-pointer-and-scroll-input D1
 mod selection;
-mod sessions;
+pub(crate) mod sessions; // GPUI 浮层渲染只读访问（rel_time；add-gpui-overlays D4）
 mod settings_io;
-mod tree;
+pub(crate) mod tree; // GPUI 浮层渲染只读访问（TreeRow/FilterMode；add-gpui-overlays D4）
 mod terminal;
 pub mod embed;
 pub mod theme;
 pub mod virtual_terminal;
 mod tools;
-mod view;
+pub(crate) mod view; // GPUI 复用补全窗口常量等（add-gpui-overlays D4：仅加法）
 mod wrap;
 
 use std::io;
@@ -42,7 +42,17 @@ use ratatui::text::Line;
 use std::collections::{HashMap, VecDeque};
 
 use crate::app::editor::EditorBuffer;
-use crate::app::event::{AsyncKind, UiEvent};
+use crate::app::event::AsyncKind;
+/// 核心事件回报通道载荷（GPUI 前端接 `handle_key` 回报，additive 导出）。
+pub use crate::app::event::UiEvent;
+/// 中性 cell 布局行/段（wrap 抽核产物，GPUI 渲染面直绘用，additive 导出）。
+pub use crate::app::wrap::{GridLine, GridSeg};
+/// GPUI 条目渲染的偏好类型（additive 导出；chat 模块本身保持私有）。
+#[cfg(feature = "gpui-support")]
+pub(crate) use chat::RenderFlags;
+/// GPUI 工具卡结果正文抽取（与 TUI 同源，additive 导出）。
+#[cfg(feature = "gpui-support")]
+pub(crate) use tools::result_text;
 use crate::app::overlay::{overlay_key, Overlay, OverlayOutcome};
 use crate::app::terminal::{TerminalGuard, TerminalSinks};
 
@@ -134,9 +144,9 @@ fn is_slash_cmd_context(text_before: &str) -> bool {
 
 /// 应用顶层状态（输入缓冲、会话状态、瞬时提示、退出标志）。
 pub struct App {
-    state: SessionState,
+    pub(crate) state: SessionState,
     /// 消息区滚动状态（design D1；渲染端经 draw 回写，D2）。
-    scroll: ChatScroll,
+    pub(crate) scroll: ChatScroll,
     /// 单卡工具展开覆盖表（toolCallId → 是否展开；Ctrl+O 全局切换时清空，
     /// design D1——≡ pi setToolsExpanded 遍历广播）。
     user_tool_expanded: HashMap<String, bool>,
@@ -164,16 +174,16 @@ pub struct App {
     /// design D1/D2；点击分发用）。
     card_hits: Vec<wrap::Hit>,
     /// 多行编辑器缓冲（行数组+光标+kill-ring+undo）。
-    editor: EditorBuffer,
+    pub(crate) editor: EditorBuffer,
     /// 瞬时提示与颜色（error 红 / warning 黄 / info 默认色）。
-    notice: Option<(String, Color)>,
-    should_quit: bool,
+    pub(crate) notice: Option<(String, Color)>,
+    pub(crate) should_quit: bool,
     /// setStatus 的状态行附加文本。
     status_text: Option<String>,
     /// setWidget 的编辑器上方行（空 = 隐藏）。
     widget_lines: Vec<String>,
     /// 当前浮层。
-    overlay: Option<Overlay>,
+    pub(crate) overlay: Option<Overlay>,
     /// 排队的扩展对话浮层（串行处理）。
     pending_overlays: VecDeque<Overlay>,
     /// 选择器异步数据序号（丢弃过期响应）。
@@ -181,11 +191,15 @@ pub struct App {
     /// 上一次 ctrl+c 的时刻（双击退出判定）。
     last_ctrl_c: Option<std::time::Instant>,
     /// 当前会话文件路径（get_state 刷新；选择器标记/删除校验用）。
-    session_file: Option<String>,
+    pub(crate) session_file: Option<String>,
     /// compaction 进行中本地排队的提交文本（压缩结束按序补发）。
     compact_queue: Vec<String>,
     /// 斜杠补全菜单状态（spec：斜杠命令候选触发与过滤）。
-    completion: autocomplete::CompletionState,
+    pub(crate) completion: autocomplete::CompletionState,
+    /// 斜杠命令子集模式（GPUI P0，task 6.3）：false（默认 = ratatui）走全量
+    /// `commands::dispatch`；true 只放行查询型子集，其余已知命令给未支持
+    /// 提示桩（不开浮层——P0 无浮层渲染，浮层会吞键，design D6）。
+    pub(crate) slash_subset_only: bool,
     /// /model 参数补全的可用模型缓存（`provider/id`；惰性拉取一次）。
     models_cache: Vec<String>,
     /// /thinking 参数补全的可用级别缓存（惰性拉取一次）。
@@ -264,6 +278,7 @@ impl App {
             session_file: None,
             compact_queue: Vec::new(),
             completion: autocomplete::CompletionState::default(),
+            slash_subset_only: false,
             models_cache: Vec::new(),
             levels_cache: Vec::new(),
             models_requested: false,
@@ -659,7 +674,7 @@ impl App {
     ///       加速与 Alt 倍率已在事件源线程算好）
     /// 输出: true = 视口变化需重绘；false = 浮层打开被忽略（或行数为 0，
     ///       不改 scroll、不触发重绘）；副作用为翻转 scroll 状态
-    fn handle_wheel(&mut self, lines: i16) -> bool {
+    pub(crate) fn handle_wheel(&mut self, lines: i16) -> bool {
         // 浮层遮挡时忽略（design D4：不滚被遮住的消息区）；补全菜单
         // 打开不受影响（菜单非浮层、非滚视图）。
         if self.overlay.is_some() || lines == 0 {
@@ -1552,7 +1567,7 @@ impl App {
     ///
     /// 输入: commander/report_tx — 发送与回报通道
     /// 输出: 无返回值；副作用为清空 compact_queue 并异步发送
-    fn flush_compact_queue(&mut self, commander: &CommandSender, report_tx: &Sender<UiEvent>) {
+    pub(crate) fn flush_compact_queue(&mut self, commander: &CommandSender, report_tx: &Sender<UiEvent>) {
         if self.compact_queue.is_empty() {
             return;
         }
@@ -1823,7 +1838,7 @@ impl App {
     ///
     /// 输入: data — {commands:[{name,description,source}], skillEnabled}
     /// 输出: 无返回值；副作用为回填 dynamic_commands 与开关
-    fn apply_commands_fetched(&mut self, data: &serde_json::Value) {
+    pub(crate) fn apply_commands_fetched(&mut self, data: &serde_json::Value) {
         let list = data
             .get("commands")
             .and_then(|c| c.as_array())
@@ -2377,11 +2392,66 @@ impl App {
         key.kind != KeyEventKind::Release
     }
 
+    /// 应用一条核心会话事件（事件循环 `UiEvent::Rpc` 分支的等价入口）。
+    ///
+    /// 功能: `extension_ui_request` → App 层分发（4 对话入浮层队列）；
+    ///       非扩展请求 → session 归约；`compaction_end` 边沿 → 补发压缩期
+    ///       排队提交（与 ratatui `UiEvent::Rpc` 分支同源）；
+    /// 输入: raw — pi 推送的事件 JSON；commander/report_tx — 排队补发通道；
+    /// 输出: 无返回值；副作用为状态推进、浮层入队、可能的异步补发。
+    #[cfg(feature = "gpui-support")] // 仅 GPUI 前端入口；默认构建不引入死代码
+    pub(crate) fn apply_core_event(
+        &mut self,
+        raw: &serde_json::Value,
+        commander: &CommandSender,
+        report_tx: &Sender<UiEvent>,
+    ) {
+        if raw.get("type").and_then(|t| t.as_str()) == Some("extension_ui_request") {
+            // 扩展 UI 请求走 App 层分发，不进 session 归约（浮层渲染已
+            // 落地——add-gpui-overlays D5：不再跳过，否则扩展对话无入口）。
+            self.handle_extension_request(raw);
+            return;
+        }
+        self.state.handle(raw);
+        if raw.get("type").and_then(|t| t.as_str()) == Some("compaction_end") {
+            self.flush_compact_queue(commander, report_tx);
+        }
+    }
+
+    /// 渲染偏好（thinking/工具展开；GPUI 条目渲染读取，task 5.2）。
+    ///
+    /// 输入: 无（读 self 两个开关字段）；
+    /// 输出: 当前 [`RenderFlags`]（与 ratatui render_chat 同源构造）。
+    #[cfg(feature = "gpui-support")] // 仅 GPUI 前端入口；默认构建不引入死代码
+    pub(crate) fn render_flags(&self) -> RenderFlags {
+        RenderFlags {
+            show_thinking: self.show_thinking,
+            expand_tools: self.expand_tools,
+        }
+    }
+
+    /// 状态行左段内容（GPUI 前端渲染入口，task 5.3）：与 ratatui
+    /// `render_header` 同源的 `view::header_line` 装配 → 中性行 → 按列
+    /// cell 截断（与 ratatui 视口裁剪同口径）；瞬时提示不入左段（由
+    /// status_bar 右槽单独渲染）。
+    ///
+    /// 输入: width — 视口列数（cell）；
+    /// 输出: 单条中性屏行（phase · 会话名 · thinking · model · 用量/费用 ·
+    ///       状态文本，超出 width 按 cell 截断）。
+    #[cfg(feature = "gpui-support")] // 仅 GPUI 前端入口；默认构建不引入死代码
+    pub(crate) fn status_grid_line(&self, width: u16) -> wrap::GridLine {
+        let line =
+            crate::app::view::header_line(&self.state, None, self.status_text.as_deref(), width);
+        let mut grid = wrap::GridLine::from(&line);
+        wrap::truncate_grid_width(&mut grid, width as usize);
+        grid
+    }
+
     /// 处理一个按键：先做纯意图映射，再应用状态，最后按需走命令通道。
     ///
     /// 输入: key — 原始按键；commander/report_tx — 发送 prompt/abort 所需
     /// 输出: 无返回值；副作用为更新输入/标志/退出或异步发命令
-    fn handle_key(
+    pub(crate) fn handle_key(
         &mut self,
         key: KeyEvent,
         commander: &CommandSender,
@@ -2707,7 +2777,7 @@ impl App {
     ///
     /// 输入: self — 应用状态（读编辑器与缓存）
     /// 输出: 无返回值；副作用为更新 completion（浮层打开时强制关闭）
-    fn refresh_completion(&mut self) {
+    pub(crate) fn refresh_completion(&mut self) {
         if self.overlay.is_some() {
             self.completion.close();
             return;
@@ -2796,7 +2866,7 @@ impl App {
     ///
     /// 输入: commander/report_tx — 发送与回报通道
     /// 输出: 无返回值；副作用为可能异步发起 get_available_* 请求
-    fn update_completion(&mut self, commander: &CommandSender, report_tx: &Sender<UiEvent>) {
+    pub(crate) fn update_completion(&mut self, commander: &CommandSender, report_tx: &Sender<UiEvent>) {
         self.refresh_completion();
         // 从光标文本判定数据需求（缓存为空时菜单尚未打开，kind 不可用）
         let row = self.editor.row();
@@ -3293,6 +3363,49 @@ impl App {
     ///
     /// 输入: commander — RPC 命令句柄；report_tx — 失败回报通道
     /// 输出: 无返回值；副作用为清空输入、记录日志、异步发送 prompt
+    /// 斜杠命令分发闸门（task 6.3 + 7.1/7.2：ratatui 全量 / GPUI 支持子集双模式）。
+    ///
+    /// 功能: 子集模式（`slash_subset_only`）下——查讯型 ∪ 可开浮层型
+    ///       （`commands::gpui_slash_supported`）放行 `commands::dispatch`
+    ///       （无参 /model、/thinking 由此真开选择器，spec: 斜杠子集 v1）；
+    ///       其余已知命令给未支持提示桩（`cmd_stub`，不静默）；未知斜杠
+    ///       仍交普通文本；全量模式（默认）直接分发，行为与现状一致；
+    /// 输入: text — trim 后的完整提交文本；commander/report_tx — 发送与回报；
+    /// 输出: true = 已本地处理（不再发送、输入已清空）；
+    ///       false = 按普通 prompt 发送。
+    pub(crate) fn dispatch_slash(
+        &mut self,
+        text: &str,
+        commander: &CommandSender,
+        report_tx: &Sender<UiEvent>,
+    ) -> bool {
+        if !self.slash_subset_only {
+            return crate::app::commands::dispatch(self, commander, report_tx, text);
+        }
+        let Some(rest) = text.strip_prefix('/') else {
+            return false;
+        };
+        if rest.is_empty() {
+            return false;
+        }
+        let (name, _) = match rest.find(char::is_whitespace) {
+            Some(i) => (&rest[..i], rest[i..].trim()),
+            None => (rest, ""),
+        };
+        if !crate::app::commands::is_known(name) {
+            return false; // 未知斜杠 → 普通文本发送（与 pi 一致）
+        }
+        if !crate::app::commands::gpui_slash_supported(name) {
+            // 已知但不在支持子集：未支持提示桩（同 cmd_stub 口径，不开浮层）。
+            self.editor.replace("");
+            self.cmd_stub(name);
+            return true;
+        }
+        // 支持子集（查讯型 + 可开浮层型）走全量分发：无参 /model、/thinking
+        // 由此真开选择器（task 7.2，与 TUI 同语义）。
+        crate::app::commands::dispatch(self, commander, report_tx, text)
+    }
+
     /// 把当前输入作为指定命令（prompt/follow_up）发出；空输入忽略。
     ///
     /// 输入: commander — RPC 命令句柄；report_tx — 失败回报通道；
@@ -3307,9 +3420,7 @@ impl App {
         let message = message.trim().to_string();
         // 1) 斜杠分发（pi 次序：斜杠先于 ! 与压缩队列——压缩期也立即执行，
         //    斜杠非 prompt 不受压缩拒绝约束；dispatch 命中即清空输入）
-        if command == "prompt"
-            && crate::app::commands::dispatch(self, commander, report_tx, &message)
-        {
+        if command == "prompt" && self.dispatch_slash(&message, commander, report_tx) {
             self.log_event("submit", &format!("local command: {message}"));
             return;
         }
@@ -3396,7 +3507,7 @@ impl App {
     ///
     /// 输入: data — clear_queue 响应 {steering:[..], followUp:[..]}
     /// 输出: 无返回值；副作用为更新 input
-    fn restore_queued(&mut self, data: &serde_json::Value) {
+    pub(crate) fn restore_queued(&mut self, data: &serde_json::Value) {
         let mut restored: Vec<String> = Vec::new();
         for key in ["steering", "followUp"] {
             if let Some(arr) = data.get(key).and_then(|v| v.as_array()) {
@@ -3743,7 +3854,7 @@ impl App {
     /// 输入: kind — 数据类别；seq — 选择器序号（用于丢弃过期响应）；
     ///       data — 载荷
     /// 输出: 无返回值；副作用为更新 overlay/state/notice
-    fn handle_async_data(&mut self, kind: AsyncKind, seq: u64, data: &serde_json::Value) {
+    pub(crate) fn handle_async_data(&mut self, kind: AsyncKind, seq: u64, data: &serde_json::Value) {
         match kind {
             AsyncKind::Models => {
                 if let Some(Overlay::ModelSelect {
@@ -5408,8 +5519,14 @@ mod input_tests {
             &tx,
         );
         let content = read_log_until(&log, "stream msg", 2000).expect("应收到 follow_up");
-        let tail = content.rfind("stream msg").map(|i| &content[i..]).unwrap_or("");
-        assert!(tail.contains(r#""type":"follow_up""#), "流式 alt+enter=follow_up: {tail}");
+        // 取含 stream msg 的最后一行整行断言：JSON 键序随 serde_json 特性
+        // （gpui 列启用 preserve_order）而变，不能依赖 type/message 先后。
+        let line = content
+            .lines()
+            .rev()
+            .find(|l| l.contains("stream msg"))
+            .unwrap_or("");
+        assert!(line.contains(r#""type":"follow_up""#), "流式 alt+enter=follow_up: {line}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -294,13 +294,18 @@ fn usage_spans(usage: &Usage) -> Vec<Span<'static>> {
     spans
 }
 
-/// 状态行渲染：phase · 会话名 · 模型 · thinking · 用量/费用 · 瞬时提示。
+/// 状态行内容装配（纯函数，task 5.3——ratatui 与 GPUI 双前端共源）。
 ///
-/// 输入: frame — ratatui 帧；area — 状态行区域；state — 会话状态；
-///       notice — 瞬时提示（可空）
-/// 输出: 无返回值；副作用为向帧写入状态行
-fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, state: &SessionState, ui: &ViewUi<'_>) {
-    let notice = ui.notice;
+/// 输入: state — 会话状态；notice — 瞬时提示（可空）；status_text —
+///       setStatus 附加文本（可空）；width — 区域宽度（提示截断用）；
+/// 输出: 单条 ratatui 逻辑行（phase · 会话名 · thinking · model · 用量/
+///       费用 · 状态文本 · 提示；提示按 width 截断，整体由渲染端裁剪）。
+pub(crate) fn header_line(
+    state: &SessionState,
+    notice: Option<(&str, Color)>,
+    status_text: Option<&str>,
+    width: u16,
+) -> Line<'static> {
     let (phase_label, color) = match state.phase {
         Phase::Streaming => ("● streaming", Color::Yellow),
         Phase::Idle => ("○ idle", Color::Green),
@@ -328,7 +333,7 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, state: &Session
         spans.extend(usage_spans(usage));
         spans.push(Span::raw("  "));
     }
-    if let Some(text) = ui.status_text {
+    if let Some(text) = status_text {
         spans.push(Span::styled(
             format!(" {text} "),
             Style::default().fg(Color::Magenta),
@@ -336,11 +341,21 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, state: &Session
     }
     if let Some((text, color)) = notice {
         spans.push(Span::styled(
-            truncate(text, area.width as usize),
+            truncate(text, width as usize),
             Style::default().fg(color),
         ));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    Line::from(spans)
+}
+
+/// 状态行渲染：phase · 会话名 · 模型 · thinking · 用量/费用 · 瞬时提示。
+///
+/// 输入: frame — ratatui 帧；area — 状态行区域；state — 会话状态；
+///       notice — 瞬时提示（可空）
+/// 输出: 无返回值；副作用为向帧写入状态行（内容由 [`header_line`] 装配）
+fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, state: &SessionState, ui: &ViewUi<'_>) {
+    let line = header_line(state, ui.notice, ui.status_text, area.width);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 /// 渲染消息区（滚动窗口）。
@@ -405,22 +420,33 @@ fn render_chat(
     (next, hits)
 }
 
-/// 输入区高度：clamp(逻辑行数 + 2 边框, 3, 8)——随行数增长但不挤压消息区。
+/// 输入区标题提示（按会话相位；ratatui/GPUI 双前端共源，task 5.4）。
 ///
-/// 输入: lines — 逻辑行数（至少 1）
-/// 输出: 输入框总高度（含上下边框）
-fn editor_height(lines: usize) -> u16 {
+/// 输入: phase — 会话相位；输出: 边框标题中的键位提示文本。
+pub(crate) fn editor_hint(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Streaming => "esc: abort",
+        Phase::Idle => "enter: send · ctrl+d: quit",
+    }
+}
+
+/// 输入区总高（含上下边框；随行数增长、上限 8——ratatui/GPUI 双前端共源，
+/// task 5.4）。
+///
+/// 输入: lines — 编辑器逻辑行数（0 视为 1）；
+/// 输出: 总行数（3..=8；`(行数+2).clamp(3,8)`）。
+pub(crate) fn editor_height(lines: usize) -> u16 {
     (lines as u16 + 2).clamp(3, 8)
 }
 
 /// 补全菜单同时可见上限（对齐 pi autocompleteMaxVisible 默认 5）。
-const COMPLETION_MAX_VISIBLE: usize = 5;
+pub(crate) const COMPLETION_MAX_VISIBLE: usize = 5;
 
 /// 补全菜单占高：可见条目 + 超限时的 `(i/n)` 计数行。
 ///
 /// 输入: comp — 补全状态（打开时有候选）
 /// 输出: 菜单行数（关闭/空候选为 0）
-fn completion_height(comp: &crate::app::autocomplete::CompletionState) -> u16 {
+pub(crate) fn completion_height(comp: &crate::app::autocomplete::CompletionState) -> u16 {
     if !comp.open || comp.items.is_empty() {
         return 0;
     }
@@ -486,7 +512,7 @@ fn render_completion(frame: &mut Frame, area: ratatui::layout::Rect, comp: &crat
 ///       字符，跨偏移点的宽字符整字保留（起始列可能小于 skip_w）；截取按
 ///       累计显示宽 ≤ take_w 停止，不会留下半个宽字符；纯 ASCII 下退化为
 ///       原来的 skip/take 字符数语义
-fn slice_display(line: &str, skip_w: usize, take_w: usize) -> (String, usize) {
+pub(crate) fn slice_display(line: &str, skip_w: usize, take_w: usize) -> (String, usize) {
     let mut out = String::new();
     let mut start = 0usize; // 片段实际起始显示列（跨偏移宽字符时 < skip_w）
     let mut pos = 0usize; // 当前字符起始显示列
@@ -518,10 +544,7 @@ fn slice_display(line: &str, skip_w: usize, take_w: usize) -> (String, usize) {
 ///       phase — 会话状态（决定边框提示）
 /// 输出: 无返回值；副作用为绘制输入框与（光标未隐藏时）设置终端光标
 fn render_editor(frame: &mut Frame, area: ratatui::layout::Rect, ui: &ViewUi<'_>, phase: Phase) {
-    let hint = match phase {
-        Phase::Streaming => "esc: abort",
-        Phase::Idle => "enter: send · ctrl+d: quit",
-    };
+    let hint = editor_hint(phase);
     // bash 模式提示：输入以 ! 起始时边框变黄（对齐 pi getBashModeBorderColor 语义）
     let bash_mode = ui.input.trim_start().starts_with('!');
     let block = Block::default()
