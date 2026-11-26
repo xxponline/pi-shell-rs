@@ -54,7 +54,7 @@ pub(crate) use chat::{bash_entry_model, notice_model, thinking_seqs, thinking_vi
 #[cfg(feature = "gpui-support")]
 pub(crate) use tools::{Seg, SegRole, tool_card_model};
 use crate::app::overlay::{overlay_key, Overlay, OverlayOutcome};
-use crate::app::terminal::{TerminalGuard, TerminalSinks};
+pub(crate) use crate::app::terminal::{TerminalGuard, TerminalSinks};
 
 /// 消息区滚动状态（design D1；view/wrap/App 共用）。
 pub use crate::app::scroll::ChatScroll;
@@ -196,10 +196,6 @@ pub struct App {
     compact_queue: Vec<String>,
     /// 斜杠补全菜单状态（spec：斜杠命令候选触发与过滤）。
     pub(crate) completion: autocomplete::CompletionState,
-    /// 斜杠命令子集模式（GPUI P0，task 6.3）：false（默认 = ratatui）走全量
-    /// `commands::dispatch`；true 只放行查询型子集，其余已知命令给未支持
-    /// 提示桩（不开浮层——P0 无浮层渲染，浮层会吞键，design D6）。
-    pub(crate) slash_subset_only: bool,
     /// /model 参数补全的可用模型缓存（`provider/id`；惰性拉取一次）。
     models_cache: Vec<String>,
     /// /thinking 参数补全的可用级别缓存（惰性拉取一次）。
@@ -278,7 +274,6 @@ impl App {
             session_file: None,
             compact_queue: Vec::new(),
             completion: autocomplete::CompletionState::default(),
-            slash_subset_only: false,
             models_cache: Vec::new(),
             levels_cache: Vec::new(),
             models_requested: false,
@@ -3412,17 +3407,10 @@ impl App {
         !self.editor.text().trim().is_empty()
     }
 
-    /// 把当前输入作为 prompt 发出（空消息直接忽略）。
+    /// 斜杠命令分发（task 5.1 拆除子集闸门：恒全量分发，spec: 斜杠命令
+    /// 全集分发——查讯型展示结果、可开浮层型开浮层、本地执行型执行共享
+    /// 语义、桩型同款提示，未知斜杠交普通文本）。
     ///
-    /// 输入: commander — RPC 命令句柄；report_tx — 失败回报通道
-    /// 输出: 无返回值；副作用为清空输入、记录日志、异步发送 prompt
-    /// 斜杠命令分发闸门（task 6.3 + 7.1/7.2：ratatui 全量 / GPUI 支持子集双模式）。
-    ///
-    /// 功能: 子集模式（`slash_subset_only`）下——查讯型 ∪ 可开浮层型
-    ///       （`commands::gpui_slash_supported`）放行 `commands::dispatch`
-    ///       （无参 /model、/thinking 由此真开选择器，spec: 斜杠子集 v1）；
-    ///       其余已知命令给未支持提示桩（`cmd_stub`，不静默）；未知斜杠
-    ///       仍交普通文本；全量模式（默认）直接分发，行为与现状一致；
     /// 输入: text — trim 后的完整提交文本；commander/report_tx — 发送与回报；
     /// 输出: true = 已本地处理（不再发送、输入已清空）；
     ///       false = 按普通 prompt 发送。
@@ -3432,30 +3420,6 @@ impl App {
         commander: &CommandSender,
         report_tx: &Sender<UiEvent>,
     ) -> bool {
-        if !self.slash_subset_only {
-            return crate::app::commands::dispatch(self, commander, report_tx, text);
-        }
-        let Some(rest) = text.strip_prefix('/') else {
-            return false;
-        };
-        if rest.is_empty() {
-            return false;
-        }
-        let (name, _) = match rest.find(char::is_whitespace) {
-            Some(i) => (&rest[..i], rest[i..].trim()),
-            None => (rest, ""),
-        };
-        if !crate::app::commands::is_known(name) {
-            return false; // 未知斜杠 → 普通文本发送（与 pi 一致）
-        }
-        if !crate::app::commands::gpui_slash_supported(name) {
-            // 已知但不在支持子集：未支持提示桩（同 cmd_stub 口径，不开浮层）。
-            self.editor.replace("");
-            self.cmd_stub(name);
-            return true;
-        }
-        // 支持子集（查讯型 + 可开浮层型）走全量分发：无参 /model、/thinking
-        // 由此真开选择器（task 7.2，与 TUI 同语义）。
         crate::app::commands::dispatch(self, commander, report_tx, text)
     }
 

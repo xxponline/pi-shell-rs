@@ -10,5 +10,6 @@
 pub mod actor;
 pub mod input;
 pub mod overlay;
+pub mod scroll;
 pub mod terminal;
 pub mod window;

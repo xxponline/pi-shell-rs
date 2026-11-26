@@ -254,6 +254,31 @@ PI_GPUI_RENDER_PROBE=1 cargo run --bin pi-shell-gpui --features gpui-support
   **ctrl+t / ctrl+o 切换 thinking / 工具卡全局展开**（与 `key_intent` 同源
   经三区路由进共享分发，不落入输入框，切换时同 TUI 清单块/单卡覆盖）；
   编辑键（撤销 cmd-z/ctrl-z、kill、词移等）由内建编辑器自理，不逐键对齐 TUI。
+- P1 键位补线（`align-gpui-input-scroll`）：`alt+up` 取回排队消息到输入框、
+  `ctrl+p` / `ctrl+shift+p` 循环切换模型（下一个/上一个）、`shift+tab` 循环
+  thinking 级别、菜单关闭时 `tab` 强制路径补全、`ctrl+x` 复制最后回复
+  （注入 sink 优先、否则 OSC52 写启动终端，与 `/copy` 同通路）、`ctrl+v`
+  文本粘贴（内建编辑器 Paste 行为，光标处插入）；补全菜单打开时这些键
+  保持菜单语义、`ctrl+↑/↓` 照常跳消息区。
+- GPUI 对 TUI 的键位差异：`ctrl+j` 内建无换行绑定（实测记录，**不桥接**
+  `App.editor`——文本所有权留内建编辑器）；`ctrl+v` **图片粘贴链不做**
+  （文本粘贴正常）；外部编辑器 `ctrl+g` 未接（窗口形态单拎）、`ctrl+d`
+  退出语义不映射（窗口走关闭键）。
+- 消息区滚动（`align-gpui-input-scroll`；滚动真相 = 内建虚拟滚动状态，
+  不经共享 `App.scroll`、不碰输入区）：`PageUp`/`PageDown` 整页回看、
+  `shift+PageUp/Down` 半页、`ctrl+home`/`ctrl+end` 绝对顶 / 底（底 = 恢复
+  贴底跟随）、`ctrl+↑`/`ctrl+↓`（`ctrl+shift` 同义）按消息边界跳转——消息 =
+  用户与 assistant 条目，通知与 `!` bash 不构成跳转点，到端点归顶/贴底。
+  补全菜单打开时 `PageUp/Down` 归菜单翻页、`ctrl+↑/↓` 照常跳消息区；
+  浮层打开时不滚动。**页粒度差异（已知）**：GPUI 为条目粒度估算步进
+  （段落拼接 + 容量定律 760px/64 字符，spike 实测落点误差 ≪ 1/3 视口，
+  见 change tasks 1.1 结论），与 TUI 行级页长存在粒度差，方向/端点语义一致。
+- 消息区滚动条（`align-gpui-input-scroll`）：内建滚动条显式启用——内容
+  超视口时消息区右缘轨道（16px）可见、点/拖改变视口，不足一屏不显示，
+  浮层遮罩下不可交互；**与 TUI 瞬态语义差异（已知）**：显示时机/淡入淡出/
+  悬停手感以宿主内建组件为准（滚动后短暂驻留 + 悬停显示），不做 TUI 的
+  “滚动即显、1 秒无操作即隐、悬停加粗常显”逐语义对齐（绘制与连续拖动手感
+  由组件自身套件覆盖）。
 - 卡片/通知/bash/thinking 语义与 TUI 同源（`align-gpui-card-rendering`）：
   消息区条目全部消费共享中性模型——工具卡（头行参数/折叠策略/计时/红绿
   diff runs/受保护尾部，面板底色三态）、thinking（空块不占行、折叠
@@ -272,12 +297,12 @@ PI_GPUI_RENDER_PROBE=1 cargo run --bin pi-shell-gpui --features gpui-support
   共享分发（esc 关闭 / enter 应用 / ↑↓ 导航，Tree 搜索中 esc 先清查询，
   ctrl+c 仍全局清空）、滚轮被遮罩忽略（不滚被遮住的消息区）；打开键
   alt+t（thinking 选择器）、ctrl+l（model 选择器，与 `key_intent` 同源）。
-- 斜杠命令支持集 = 查讯型 ∪ 可开浮层型（`gpui_slash_supported`）：
-  `/changelog`、`/model [id]`、`/thinking [lvl]`、`/quit`，以及
-  `/tree /fork /session /resume /settings /hotkeys /trust /scoped-models
-  /import`（真开对应浮层，无参 `/model`、`/thinking` 开选择器）；两子集
-  之外的已知命令仍给“暂不支持”桩；未知 `/xxx` 按普通文本发送；
-  `/mo` 补全 Tab 应用回写内建编辑器。
+- 斜杠命令全集分发（`align-gpui-input-scroll` 拆除子集闸门）：全部已知
+  命令与终端 TUI 同分发——查讯型展示结果、可开浮层型开浮层（无参
+  `/model`、`/thinking` 开选择器）、本地执行型执行共享语义（`/new /clone
+  /name /export /reload /compact /copy …`）、桩型同款提示（`/share /bug
+  /login /logout`）；未知 `/xxx` 按普通文本发送；`/mo` 补全 Tab 应用回写
+  内建编辑器。
 - 流式事件经泵攒批合并为单帧重绘；空帧构帧实测 ~0.1ms（字体族进程级缓存）。
 
 ## 排查

@@ -29,6 +29,7 @@ use crate::app::{
     thinking_seqs, thinking_visible, tool_card_model,
 };
 use crate::gpui_agent::actor::RpcSession;
+use crate::gpui_agent::scroll::{ScrollMetrics, jump_target, page_down_target, page_up_target};
 use crate::gpui_agent::input::keystroke_to_keyevents;
 use crate::rpc::{ClientEvent, CommandSender};
 use crate::session::{Block, Entry, SessionState, ToolExecution, ToolStatus};
@@ -256,9 +257,6 @@ impl GPUIAgentTerminal {
         // sessionName——状态行 model 显示依赖，task 5.3）。
         let mut state = TerminalState::new();
         state.app.state.apply_get_state(&session.probe);
-        // 斜杠命令 P0 查询子集（task 6.3）：其余已知命令给未支持提示桩。
-        state.app.slash_subset_only = true;
-
         // 内建虚拟滚动（task 5.2）：初始行数 = 打开时条目数（fresh 会话为 0，
         // 随后由渲染点对账 append/reset 追平）。
         let scroller = cx.new(|cx| {
@@ -340,8 +338,17 @@ impl GPUIAgentTerminal {
                         term.state.app.completion.open,
                         &keystroke,
                     );
-                    if route == Route::ToEditor {
-                        return; // 编辑键交内建编辑器
+                    match route {
+                        Route::ToEditor => return, // 编辑键交内建编辑器
+                        Route::ToScroller => {
+                            // 滚动键（task 3.1）：直达 scroller，不碰编辑器镜像
+                            // （spec：滚动键 MUST NOT 改动输入编辑器内容）。
+                            term.handle_scroller_key(&keystroke, window, cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                            return;
+                        }
+                        Route::ToApp => {}
                     }
                     // 先同步镜像：Change 订阅投递可能延迟到 flush，语义键
                     //（提交/清空/回填）不能依赖它（task 4.3 桥接时序）。
@@ -527,6 +534,82 @@ impl GPUIAgentTerminal {
         }
     }
 
+    /// 消息区滚动键处理（task 3.1/3.2/3.3：`Route::ToScroller` 执行端）。
+    ///
+    /// 功能: ctrl+home/end → 绝对顶 / 贴底恢复跟随；pageup/pagedown → S1 估算
+    ///       整页（shift 为反向半页）；ctrl+↑/↓ → 消息边界跳转（镜像 TUI
+    ///       `prompt_jump_target`：prev = 严格低于顶的最后消息起点、顶在消息
+    ///       中部 → 该消息起点、无 → 归顶；next = 严格高于顶的第一个、无 →
+    ///       贴底恢复跟随）；滚动真相 = `MessageScrollerState`（design D1）；
+    /// 输入: ks — 键击（路由已保证为滚动键）；window — 视口观测 bounds 与
+    ///       网格度量来源；cx — 实体上下文；
+    /// 输出: 无返回值；副作用为 scroller 滚动 + notify 重绘；输入编辑器不动；
+    ///       视口观测缺失或无内容时静默返回（不硬猜页长）。
+    fn handle_scroller_key(
+        &mut self,
+        ks: &Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ctrl = ks.modifiers.control;
+        let shift = ks.modifiers.shift;
+        let key = ks.key.as_str();
+        let is_scroll = matches!(key, "pageup" | "pagedown")
+            || (ctrl && matches!(key, "up" | "down" | "home" | "end"));
+        if !is_scroll {
+            return;
+        }
+        let entries = self.state.session().entries().to_vec();
+        if entries.is_empty() {
+            return;
+        }
+        let Some(vp) = gpui_kit::base::test_support::find(
+            window,
+            &[],
+            &ElementId::from("gpui-messages"),
+        )
+        .map(|s| s.bounds()) else {
+            return; // 视口不可得：不硬猜页长/端点
+        };
+        let vp_w = f32::from(vp.size.width);
+        let vp_h = f32::from(vp.size.height);
+        let (_, grid_px) = grid_metrics(window);
+        let grid = f32::from(grid_px);
+        let metrics = ScrollMetrics::production(vp_w, grid);
+        let page_rows = ((vp_h / grid).floor() - 4.0).max(1.0); // TUI 页 = 视口−4 行
+        let page_px = page_rows * grid;
+        let top = self.scroller.read(cx).logical_scroll_top();
+        let from_ix = top.item_ix.min(entries.len().saturating_sub(1));
+        let from_off = f32::from(top.offset_in_item);
+        let app = &self.state.app;
+        // 目标：Some(ix) = 对齐条目顶；None = 贴底恢复跟随（end 与 next 端点）。
+        let target: Option<usize> = match key {
+            "home" if ctrl => Some(0),
+            "end" if ctrl => None,
+            "pageup" if shift => {
+                let half = (page_rows / 2.0).max(1.0) * grid;
+                Some(page_up_target(&entries, app, from_ix, from_off, half, &metrics))
+            }
+            "pageup" => Some(page_up_target(&entries, app, from_ix, from_off, page_px, &metrics)),
+            "pagedown" if shift => {
+                let half = (page_rows / 2.0).max(1.0) * grid;
+                Some(page_down_target(&entries, app, from_ix, from_off, half, &metrics))
+            }
+            "pagedown" => Some(page_down_target(&entries, app, from_ix, from_off, page_px, &metrics)),
+            "up" if ctrl => jump_target(&entries, from_ix, from_off, -1),
+            "down" if ctrl => jump_target(&entries, from_ix, from_off, 1),
+            _ => return,
+        };
+        let scroller = self.scroller.clone();
+        scroller.update(cx, |s, cx| match target {
+            Some(ix) => {
+                s.scroll_to_item(ix, cx);
+            }
+            None => s.scroll_to_end(cx),
+        });
+        cx.notify();
+    }
+
     /// 计时走字任务对账（task 4.2）：有运行中工具且无任务 → 起 1s interval
     /// （每 tick notify 重绘，实体销毁即退）；无运行中工具且有任务 → Drop
     /// 取消——与 ratatui `timer_redraw_due` 同门控（仅 Running 走字）。
@@ -644,44 +727,61 @@ impl GPUIAgentTerminal {
     }
 }
 
-/// 键击路由结果（task 6.1：三区模型）。
+/// 键击路由结果（task 6.1：三区模型；task 3.1 增第三态）。
+/// `To*` 同前缀为刻意的分层命名（进共享/进编辑器/进滚动器）。
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Route {
     /// 交共享语义层（`App::handle_key`）并停止传播。
     ToApp,
     /// 放行给内建编辑器（Textarea 自理）。
     ToEditor,
+    /// 消息区滚动键直达内建虚拟滚动状态（design D1：滚动真相归 scroller，
+    /// 不经共享 `App::scroll`，不碰输入编辑器）。
+    ToScroller,
 }
 
-/// 键击路由判定（task 6.1：三区模型纯函数，可无 TTY 单测）。
+/// 键击路由判定（task 6.1 三区模型 + task 2.1/3.1 全键位表，纯函数可单测）。
 ///
-/// 功能: 决定一次键击交共享语义层还是放行编辑器；
-/// 输入: overlay_open — 浮层打开（A 区：全量接管；ctrl+c/浮层/意图分发的
-///       优先级由 `App::handle_key` 内部保证，与 TUI 分支序一致）；
-///       completion_open — 补全菜单打开（B 区：导航/应用键）；
+/// 功能: 按 design D1 优先序分派——浮层 → 共享语义键 → 补全菜单键（不吞
+///       ctrl 组合）→ 滚动键 → 编辑器；
+/// 输入: overlay_open — 浮层打开（A 区全量接管）；completion_open — 补全菜单；
 ///       ks — gpui 键击；
-/// 输出: [`Route::ToApp`] / [`Route::ToEditor`]。
+/// 输出: [`Route::ToApp`] / [`Route::ToEditor`] / [`Route::ToScroller`]。
 pub(crate) fn route_keystroke(overlay_open: bool, completion_open: bool, ks: &Keystroke) -> Route {
     if overlay_open {
         return Route::ToApp;
     }
-    let to_app = match ks.key.as_str() {
-        "enter" => !ks.modifiers.shift, // shift+enter = 换行（编辑器自理）
-        "escape" => true,               // 菜单关闭 / 流式中断 / 空闲无操作
-        "c" if ks.modifiers.control => true, // ctrl+c 清空
+    let ctrl = ks.modifiers.control;
+    let alt = ks.modifiers.alt;
+    let shift = ks.modifiers.shift;
+    match ks.key.as_str() {
+        "enter" if !shift => Route::ToApp, // shift+enter = 换行（编辑器自理）
+        "escape" => Route::ToApp,          // 菜单关闭 / 流式中断 / 空闲无操作
+        "c" if ctrl => Route::ToApp,       // ctrl+c 清空
         // 打开键（task 6.3）：镜像 `app::key_intent` —— ctrl+l → model、
         // alt+t → thinking（不门控菜单状态，与 TUI 意图分发同层）。
-        "l" if ks.modifiers.control && !ks.modifiers.shift => true,
-        "t" if ks.modifiers.alt => true,
-        // 全局折叠开关（task 4.1）：镜像 `app::key_intent` —— ctrl+t →
-        // thinking 全局展开、ctrl+o → 工具卡全局展开（两者均无 shift 门，
-        // 与 key_intent 同），不落入 Textarea。
-        "t" if ks.modifiers.control => true,
-        "o" if ks.modifiers.control => true,
-        "up" | "down" | "pageup" | "pagedown" | "tab" if completion_open => true,
-        _ => false,
-    };
-    if to_app { Route::ToApp } else { Route::ToEditor }
+        "l" if ctrl && !shift => Route::ToApp,
+        "t" if alt => Route::ToApp,
+        // 全局折叠开关（task 4.1）：ctrl+t → thinking、ctrl+o → 工具卡。
+        "t" if ctrl => Route::ToApp,
+        "o" if ctrl => Route::ToApp,
+        // —— 共享键臂（task 2.1，镜像 key_intent）——
+        "x" if ctrl && !shift => Route::ToApp, // ctrl+x 复制最后回复
+        "p" if ctrl => Route::ToApp,          // ctrl+p / ctrl+shift+p 模型循环
+        "up" if alt => Route::ToApp,          // alt+up 取回排队
+        "tab" if shift => Route::ToApp,       // shift+tab thinking 循环（gpui: tab+shift）
+        // —— 补全菜单（B 区）：导航/翻页/应用，不吞 ctrl 组合（task 2.1 收紧，
+        // 使 ctrl+↑/↓ 在菜单开着时仍进滚动层，对齐 TUI「菜单不消费 ctrl+↑」）——
+        "up" | "down" | "pageup" | "pagedown" | "tab" if completion_open && !ctrl => Route::ToApp,
+        "tab" => Route::ToApp, // 菜单关闭：强制路径补全
+        // —— 消息区滚动（task 3.1 → ToScroller；菜单开着的 plain 页键已被上臂
+        // 接管为菜单翻页，此处剩 ctrl+页键与菜单外全部页键）——
+        "pageup" | "pagedown" => Route::ToScroller,
+        "home" | "end" if ctrl => Route::ToScroller, // 绝对顶/底
+        "up" | "down" if ctrl => Route::ToScroller,  // 消息边界跳转（±shift 同义）
+        _ => Route::ToEditor,
+    }
 }
 
 impl Render for GPUIAgentTerminal {
@@ -772,7 +872,8 @@ impl Render for GPUIAgentTerminal {
                     empty
                 }
             },
-        );
+        )
+        .scrollbar(true); // 内建滚动条显式启用（task 4.1；默认即 true，自文档化防上游默认变化）
         // 补全菜单行（task 4.3 + 9.1：候选/选中态来自 App.completion，
         // 与 ratatui 同源的上限常量 + 滚动窗口 + 计数行）。
         let comp = &self.state.app.completion;
@@ -1845,6 +1946,730 @@ done
         assert_eq!(
             route_keystroke(false, false, &k("l", false, false, false)),
             Route::ToEditor
+        );
+
+        // —— 共享键臂（task 2.1，镜像 key_intent）——
+        assert_eq!(
+            route_keystroke(false, false, &k("x", true, false, false)),
+            Route::ToApp,
+            "ctrl+x 复制"
+        );
+        assert_eq!(
+            route_keystroke(false, false, &k("p", true, false, false)),
+            Route::ToApp,
+            "ctrl+p 模型循环"
+        );
+        assert_eq!(
+            route_keystroke(false, false, &k("p", true, true, false)),
+            Route::ToApp,
+            "ctrl+shift+p 上一个模型"
+        );
+        assert_eq!(
+            route_keystroke(false, false, &k("up", false, false, true)),
+            Route::ToApp,
+            "alt+up 取回排队"
+        );
+        assert_eq!(
+            route_keystroke(false, false, &k("tab", false, true, false)),
+            Route::ToApp,
+            "shift+tab thinking 循环（gpui: tab+shift）"
+        );
+        assert_eq!(
+            route_keystroke(false, false, &k("tab", false, false, false)),
+            Route::ToApp,
+            "菜单关闭 tab = 强制路径补全"
+        );
+
+        // —— 补全臂收紧（task 2.1）：不吞 ctrl 组合 ——
+        assert_eq!(
+            route_keystroke(false, true, &k("tab", false, false, false)),
+            Route::ToApp,
+            "菜单开 tab 应用候选"
+        );
+        assert_eq!(
+            route_keystroke(false, true, &k("pageup", false, false, false)),
+            Route::ToApp,
+            "菜单开 plain pageup = 菜单翻页"
+        );
+        assert_eq!(
+            route_keystroke(false, true, &k("down", true, false, false)),
+            Route::ToScroller,
+            "菜单开 ctrl+↓ 不进菜单臂（D1 关键收紧）"
+        );
+        assert_eq!(
+            route_keystroke(false, true, &k("up", true, false, false)),
+            Route::ToScroller,
+            "菜单开 ctrl+↑ 照常跳消息区（TUI 同语义）"
+        );
+        assert_eq!(
+            route_keystroke(false, true, &k("pageup", true, false, false)),
+            Route::ToScroller,
+            "菜单开 ctrl+pageup 仍滚动消息区"
+        );
+
+        // —— 滚动键臂（task 3.1 → ToScroller）——
+        for key in ["pageup", "pagedown"] {
+            assert_eq!(
+                route_keystroke(false, false, &k(key, false, false, false)),
+                Route::ToScroller,
+                "{key} 整页"
+            );
+            assert_eq!(
+                route_keystroke(false, false, &k(key, false, true, false)),
+                Route::ToScroller,
+                "{key} shift 半页"
+            );
+        }
+        assert_eq!(
+            route_keystroke(false, false, &k("home", true, false, false)),
+            Route::ToScroller,
+            "ctrl+home 归顶"
+        );
+        assert_eq!(
+            route_keystroke(false, false, &k("end", true, false, false)),
+            Route::ToScroller,
+            "ctrl+end 贴底"
+        );
+        assert_eq!(
+            route_keystroke(false, false, &k("home", false, false, false)),
+            Route::ToEditor,
+            "裸 home 仍是编辑键"
+        );
+        assert_eq!(
+            route_keystroke(false, false, &k("up", true, false, false)),
+            Route::ToScroller,
+            "ctrl+↑ 消息跳转"
+        );
+        assert_eq!(
+            route_keystroke(false, false, &k("down", true, true, false)),
+            Route::ToScroller,
+            "ctrl+shift+↓ 同义"
+        );
+        assert_eq!(
+            route_keystroke(false, false, &k("up", false, false, false)),
+            Route::ToEditor,
+            "裸 up 仍归编辑器"
+        );
+    }
+
+    /// 共享键端到端（task 2.2；spec: 全局键位补全 P1）：逐键断言进共享分发
+    /// 且不落输入编辑器——ctrl+p 换模型（命令入日志、输入不变）、shift+tab
+    /// 换 thinking、alt+up 取回排队回填输入、tab 打开路径补全菜单。
+    ///
+    /// 功能: 录制桩窗口逐键验证四个 P1 共享键的可观测效果；
+    /// 输入: cx — 测试上下文；
+    /// 输出: 断言通过（四键全部经共享层生效且输入区不被误改）。
+    #[gpui_kit::test]
+    fn p1_shared_keys_route_to_shared_dispatch(cx: &mut TestAppContext) {
+        let (path, log) = write_recording_stub("p1-keys");
+        let session = RpcSession::spawn(&path, &[], None).expect("spawn 应成功");
+        let (handle, term) = open_with_session(cx, session);
+        let render = |cx: &mut TestAppContext| {
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .expect("render");
+            cx.run_until_parked();
+        };
+        let press = |cx: &mut TestAppContext, key: &str| {
+            cx.update_window(handle, |_, window, cx| window.press(key, cx))
+                .unwrap_or_else(|e| panic!("press {key}: {e}"));
+            cx.run_until_parked();
+        };
+        let input_value = |cx: &mut TestAppContext| {
+            cx.update(|cx| term.read(cx).textarea.read(cx).value().to_string())
+        };
+        render(cx);
+
+        // 1) ctrl+p 模型循环：cycle_model 入日志，输入区文本不被改动。
+        cx.update_window(handle, |_, window, cx| window.input("keep-me", cx))
+            .expect("input");
+        render(cx);
+        press(cx, "ctrl-p");
+        assert_eq!(input_value(cx), "keep-me", "ctrl+p 不应改动输入区");
+        assert!(
+            wait_log(cx, &log, "cycle_model", 2000),
+            "模型循环命令入日志: {:?}",
+            fs::read_to_string(&log).unwrap_or_default()
+        );
+
+        // 2) shift+tab thinking 级别循环（cycle_thinking_level 入日志）。
+        press(cx, "shift-tab");
+        assert!(
+            wait_log(cx, &log, "cycle_thinking_level", 2000),
+            "thinking 级别命令入日志: {:?}",
+            fs::read_to_string(&log).unwrap_or_default()
+        );
+
+        // 3) alt+up 取回排队 → 输入框回填。
+        cx.update(|cx| {
+            term.update(cx, |term, _| {
+                term.state.reduce(
+                    &ClientEvent::Event(serde_json::json!({
+                        "type":"queue_update","steering":[],"followUp":["queued-msg"]
+                    })),
+                    &term.commander,
+                    &term.ui_tx,
+                );
+            });
+        });
+        render(cx);
+        press(cx, "alt-up");
+        // 等 clear_queue 落盘（请求门控已过）→ 显式拉回报泵（测试调度器
+        // 不靠后台线程唤醒）→ 假 pi 应答回填固定文案「queued msg」。
+        assert!(
+            wait_log(cx, &log, "clear_queue", 2000),
+            "dequeue 应发 clear_queue: {:?}",
+            fs::read_to_string(&log).unwrap_or_default()
+        );
+        // 应答 → UiEvent → ui_rx 是异步链：轮询拉回报泵直到回填（≤2s）。
+        let mut restored = String::new();
+        for _ in 0..80 {
+            cx.update(|cx| term.update(cx, |term, cx| term.pump_ui_events(cx)));
+            restored = input_value(cx);
+            if restored.contains("queued msg") {
+                break;
+            }
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(
+            restored.contains("queued msg"),
+            "alt+up 取回排队到输入框: {restored:?}"
+        );
+
+        // 4) tab（菜单关闭）→ 路径补全菜单开（共享层状态，非文本插入）。
+        //    ctrl+c 仅此一次（500ms 内双击 = 退出，会关窗）。
+        press(cx, "ctrl-c");
+        assert_eq!(input_value(cx), "", "ctrl+c 清空输入");
+        press(cx, "tab");
+        let (open, n) = cx.update(|cx| {
+            let a = &term.read(cx).state.app.completion;
+            (a.open, a.items.len())
+        });
+        assert!(open && n > 0, "tab 打开路径补全: open={open} items={n}");
+    }
+
+    /// 写应答 `get_last_assistant_text` 带文本的假 pi（task 2.3 ctrl+x 正例）。
+    ///
+    /// 功能: 落盘可执行脚本（取回复命令回填 data.text，其余通用 success）；
+    /// 输入: name — 目录区分名；
+    /// 输出: (脚本路径, 命令日志路径)（unix chmod 755）。
+    fn write_text_stub(name: &str) -> (String, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("gpui-copy-{name}-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("commands.log");
+        let body = r#"#!/bin/sh
+LOG='@@LOG@@'
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$LOG"
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"type":"get_last_assistant_text"'*)
+      printf '{"type":"response","id":"%s","success":true,"data":{"text":"hello from assistant"}}\n' "$id" ;;
+    *)
+      printf '{"type":"response","id":"%s","success":true}\n' "$id" ;;
+  esac
+done
+"#
+        .replace("@@LOG@@", &log.display().to_string());
+        let path = dir.join("fake-pi.sh");
+        fs::write(&path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        (path.to_string_lossy().into_owned(), log)
+    }
+
+    /// ctrl+x 复制最后回复（task 2.3；spec: 窗口形态剪贴板复制正例）：
+    /// 注入 `copy_text` sink → ctrl+x → `get_last_assistant_text` 应答回填 →
+    /// sink 收到文本（与 /copy 同通路；出口 sink 优先、stdout 落回）。
+    ///
+    /// 功能: 录制窗口逐键验证复制链；
+    /// 输入: cx — 测试上下文；
+    /// 输出: 断言通过（sink 收到应答文本）。
+    #[gpui_kit::test]
+    fn ctrl_x_copies_last_reply_via_sink(cx: &mut TestAppContext) {
+        use crate::app::TerminalSinks;
+        use std::sync::{Arc, Mutex};
+        let (path, log) = write_text_stub("ctrlx");
+        let session = RpcSession::spawn(&path, &[], None).expect("spawn 应成功");
+        let (handle, term) = open_with_session(cx, session);
+        let got = Arc::new(Mutex::new(String::new()));
+        cx.update(|cx| {
+            term.update(cx, |term, _| {
+                let g = got.clone();
+                term.state.app.set_terminal_sinks(TerminalSinks {
+                    copy_text: Some(Box::new(move |t| *g.lock().unwrap() = t)),
+                    ..Default::default()
+                });
+            });
+        });
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render");
+        cx.run_until_parked();
+
+        cx.update_window(handle, |_, window, cx| window.press("ctrl-x", cx))
+            .expect("ctrl-x");
+        assert!(
+            wait_log(cx, &log, "get_last_assistant_text", 2000),
+            "ctrl+x 应发取回复命令: {:?}",
+            fs::read_to_string(&log).unwrap_or_default()
+        );
+        // 应答 → AsyncData → 回报泵（测试需显式拉）→ sink 落文本。
+        let mut copied = String::new();
+        for _ in 0..80 {
+            cx.update(|cx| term.update(cx, |term, cx| term.pump_ui_events(cx)));
+            copied = got.lock().unwrap().clone();
+            if !copied.is_empty() {
+                break;
+            }
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert_eq!(copied, "hello from assistant", "sink 收到最后回复文本");
+    }
+
+    /// ctrl+x 无回复 → 红条（task 2.3；spec: 复制最后回复场景的无内容分支）。
+    ///
+    /// 功能: 通用桩（应答无 data）→ ctrl+x → 拉泵 → notice 红条；
+    /// 输入: cx — 测试上下文；
+    /// 输出: 断言通过（"暂无可复制" 红色通知）。
+    #[gpui_kit::test]
+    fn ctrl_x_without_reply_is_red_notice(cx: &mut TestAppContext) {
+        let (path, log) = write_recording_stub("ctrlx-empty");
+        let session = RpcSession::spawn(&path, &[], None).expect("spawn 应成功");
+        let (handle, term) = open_with_session(cx, session);
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render");
+        cx.run_until_parked();
+
+        cx.update_window(handle, |_, window, cx| window.press("ctrl-x", cx))
+            .expect("ctrl-x");
+        assert!(
+            wait_log(cx, &log, "get_last_assistant_text", 2000),
+            "ctrl+x 应发取回复命令: {:?}",
+            fs::read_to_string(&log).unwrap_or_default()
+        );
+        let mut notice = None;
+        for _ in 0..80 {
+            cx.update(|cx| term.update(cx, |term, cx| term.pump_ui_events(cx)));
+            notice = cx.update(|cx| term.read(cx).state.app.notice.clone());
+            if notice.is_some() {
+                break;
+            }
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let (text, color) = notice.expect("应有通知");
+        assert!(text.contains("暂无可复制"), "红条文案: {text}");
+        assert!(
+            matches!(color, ratatui::style::Color::Red),
+            "应为红色: {color:?}"
+        );
+    }
+
+    /// ctrl+v 文本粘贴（task 2.3；spec: 文本粘贴场景）：写测试剪贴板 →
+    /// 派发宿主 `Paste` 动作（与平台 Cmd+V 同路径，内建编辑器自理）→
+    /// 光标处插入文本。
+    ///
+    /// 功能: 剪贴板文本经内建粘贴行为入输入区；
+    /// 输入: cx — 测试上下文；
+    /// 输出: 断言通过（文本插入；不通则停下回看——spec 契约依赖内建行为）。
+    #[gpui_kit::test]
+    fn ctrl_v_pastes_clipboard_text(cx: &mut TestAppContext) {
+        let (handle, term) = open_focused(cx, "paste-text");
+        cx.update(|cx| {
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("pasted text".into()))
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.dispatch_action(Box::new(gpui_kit::base::input::Paste), cx)
+        })
+        .expect("dispatch paste");
+        cx.run_until_parked();
+        let mut v = String::new();
+        for _ in 0..40 {
+            v = cx.update(|cx| term.read(cx).textarea.read(cx).value().to_string());
+            if v.contains("pasted text") {
+                break;
+            }
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .ok();
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(v.contains("pasted text"), "剪贴板文本插入光标处: {v:?}");
+    }
+
+    /// 被闸命令逐个验证（task 5.2；spec: 斜杠命令全集分发）：原子集外命令
+    /// 全部真执行——RPC 入日志 / 执行提示非桩 / 桩同款 / 未知交普通文本。
+    ///
+    /// 功能: 录制桩窗口逐条输入命令 + 回车，断言各自可观测效果；
+    /// 输入: cx — 测试上下文；
+    /// 输出: 断言通过（全集矩阵；/export 走本地会话文件分支故断言提示非桩）。
+    #[gpui_kit::test]
+    fn gpui_slash_full_set_e2e(cx: &mut TestAppContext) {
+        let (path, log) = write_recording_stub("slash-full");
+        let session = RpcSession::spawn(&path, &[], None).expect("spawn 应成功");
+        let (handle, term) = open_with_session(cx, session);
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render");
+        cx.run_until_parked();
+        let submit = |cx: &mut TestAppContext, text: &str| {
+            cx.update_window(handle, |_, window, cx| window.input(text, cx))
+                .unwrap_or_else(|e| panic!("input {text}: {e}"));
+            cx.update_window(handle, |_, window, cx| window.press("enter", cx))
+                .expect("enter");
+            cx.run_until_parked();
+        };
+        // RPC 型：命令入日志即证真执行（桩不发 RPC）。
+        for (text, needle) in [
+            ("/new", "new_session"),
+            ("/clone", "clone"),
+            ("/name renamed", "set_session_name"),
+            ("/reload", "get_commands"),
+            ("/copy", "get_last_assistant_text"),
+        ] {
+            submit(cx, text);
+            assert!(
+                wait_log(cx, &log, needle, 2000),
+                "{text} 应发 {needle}: {:?}",
+                fs::read_to_string(&log).unwrap_or_default()
+            );
+        }
+
+        // /export：无会话文件时走本地红条分支（仍非桩、不开浮层）。
+        submit(cx, "/export");
+        let notice = cx
+            .update(|cx| term.read(cx).state.app.notice.clone())
+            .expect("/export 应有执行提示");
+        assert!(
+            !notice.0.contains("暂不支持"),
+            "/export 应执行而非桩: {}",
+            notice.0
+        );
+
+        // 桩型：/share 与 TUI 同款网络上报桩（同步提示，不发 RPC）。
+        submit(cx, "/share");
+        let notice = cx
+            .update(|cx| term.read(cx).state.app.notice.clone())
+            .expect("/share 应给桩");
+        assert!(notice.0.contains("暂不支持"), "/share 桩同 TUI: {}", notice.0);
+
+        // 未知命令：按普通 prompt 发送（消息体含原文）。
+        submit(cx, "/definitely-not-a-cmd");
+        assert!(
+            wait_log(cx, &log, "definitely-not-a-cmd", 2000),
+            "未知斜杠交普通发送: {:?}",
+            fs::read_to_string(&log).unwrap_or_default()
+        );
+    }
+
+    /// ctrl+j 换行验证（task 2.4；design D5）：内建键位表无 ctrl-j 绑定，
+    /// 实测原生行为并记录结论——**不桥接 App.editor**（GPUI 文本所有权留
+    /// Textarea 是既定边界）；若 kit 未来加绑定则翻转断言并补路由。
+    ///
+    /// 功能: 输入 → 按 ctrl+j → 续输入 → 断言是否产生换行；
+    /// 输入: cx — 测试上下文；
+    /// 输出: 断言通过（原生不换行 = 已知差异）或失败翻转（原生换行则改路由断言）。
+    #[gpui_kit::test]
+    fn ctrl_j_newline_native_behavior(cx: &mut TestAppContext) {
+        let (handle, term) = open_focused(cx, "ctrl-j");
+        cx.update_window(handle, |_, window, cx| window.input("line1", cx))
+            .expect("input");
+        cx.update_window(handle, |_, window, cx| window.press("ctrl-j", cx))
+            .expect("ctrl-j");
+        cx.update_window(handle, |_, window, cx| window.input("line2", cx))
+            .expect("input2");
+        cx.run_until_parked();
+        let v = cx.update(|cx| term.read(cx).textarea.read(cx).value().to_string());
+        eprintln!("[ctrl+j] value={v:?}");
+        assert!(
+            !v.contains('\n'),
+            "kit 原生无 ctrl+j 换行（已知差异，记 Docs；若此断言失败 = kit 已支持，改补路由断言）: {v:?}"
+        );
+    }
+
+    /// 滚动键端到端（task 3.2/3.3；spec: 消息区滚动命令对齐）：顶/底、
+    /// 整页/半页、消息跳转的落点与端点、输入区不变、菜单与浮层下不滚。
+    ///
+    /// 功能: 长会话 + 预填输入 → 逐键断言 `logical_scroll_top`/跟随态；
+    ///       菜单开时页键归菜单（滚动不动）；浮层开时滚动键不生效；
+    /// 输入: cx — 测试上下文；
+    /// 输出: 断言通过（滚动真相 = scroller，输入全程不变）。
+    #[gpui_kit::test]
+    fn scroller_keys_scroll_and_leave_input_alone(cx: &mut TestAppContext) {
+        let (handle, term) = open_focused(cx, "scroll-keys");
+        cx.update(|cx| {
+            term.update(cx, |term, _| {
+                for _ in 0..12 {
+                    feed_user_lines(term, 60);
+                }
+            });
+        });
+        let render = |cx: &mut TestAppContext| {
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .expect("render");
+            cx.run_until_parked();
+        };
+        let press = |cx: &mut TestAppContext, key: &str| {
+            cx.update_window(handle, |_, window, cx| window.press(key, cx))
+                .unwrap_or_else(|e| panic!("press {key}: {e}"));
+            cx.run_until_parked();
+        };
+        let top = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                let s = term.read(cx).scroller.read(cx);
+                (s.is_following_tail(), s.logical_scroll_top())
+            })
+        };
+        render(cx);
+        // 预填输入：全程断言滚动键不碰输入区。
+        cx.update_window(handle, |_, window, cx| window.input("keep", cx))
+            .expect("input");
+        render(cx);
+        let value = |cx: &mut TestAppContext| {
+            cx.update(|cx| term.read(cx).textarea.read(cx).value().to_string())
+        };
+
+        // 顶：ctrl+home → 首条、离开跟随。
+        press(cx, "ctrl-home");
+        let (follow, t) = top(cx);
+        assert_eq!(t.item_ix, 0, "ctrl+home 归顶");
+        assert!(!follow, "顶点不跟随");
+
+        // 整页向下/向上：item_ix 增/减（条目粒度估算步进，S1 结论）。
+        press(cx, "pagedown");
+        let (_, t_down) = top(cx);
+        assert!(t_down.item_ix > 0, "pagedown 向后: {:?}", t_down.item_ix);
+        press(cx, "pageup");
+        let (_, t_up) = top(cx);
+        assert!(t_up.item_ix < t_down.item_ix, "pageup 向前");
+
+        // 半页（shift+pagedown 反向语义：从 pageup 落点再向后，确有移动）。
+        press(cx, "shift-pagedown");
+        let (_, t_half) = top(cx);
+        assert!(t_half.item_ix >= t_up.item_ix, "shift+pagedown 向后移动");
+
+        // 消息跳转（全 user 条目 = 每条都是消息起点）：ctrl+↓ 下一条、ctrl+↑ 回。
+        press(cx, "ctrl-down");
+        let (_, t_j1) = top(cx);
+        assert_eq!(t_j1.item_ix, t_half.item_ix + 1, "ctrl+↓ 下一条消息");
+        press(cx, "ctrl-up");
+        let (_, t_j2) = top(cx);
+        assert_eq!(t_j2.item_ix, t_half.item_ix, "ctrl+↑ 回原消息");
+
+        // 底：ctrl+end → 贴底恢复跟随。
+        press(cx, "ctrl-end");
+        let (follow_end, _) = top(cx);
+        assert!(follow_end, "ctrl+end 贴底恢复跟随");
+
+        // 输入全程不变（滚动不碰编辑器）。
+        assert_eq!(value(cx), "keep", "滚动键不应改动输入区");
+
+        // 菜单下：pageup 归菜单整页翻页，滚动不动。
+        press(cx, "ctrl-c"); // 单次清空（双击会关窗）
+        assert_eq!(value(cx), "", "清空输入");
+        press(cx, "tab");
+        let (open, n) = cx.update(|cx| {
+            let a = &term.read(cx).state.app.completion;
+            (a.open, a.items.len())
+        });
+        assert!(open && n > 0, "菜单开: {open}/{n}");
+        // 从贴底位起测（若页键漏进 scroller 会明显回退 → 可检测）。
+        let (_, before_menu) = top(cx);
+        press(cx, "pageup");
+        let (_, after_menu) = top(cx);
+        assert_eq!(
+            before_menu.item_ix, after_menu.item_ix,
+            "菜单开时页键不滚消息区"
+        );
+        press(cx, "escape"); // 关菜单
+
+        // 浮层下：滚动键不生效（浮层消费焦点键），浮层保持打开。
+        // 造一个可检测态：顶点且非跟随（若 ctrl+end 漏生效会变贴底跟随）。
+        press(cx, "ctrl-home");
+        let (follow_before, before_overlay) = top(cx);
+        assert_eq!(before_overlay.item_ix, 0, "已到顶");
+        assert!(!follow_before, "顶点非跟随");
+        cx.update(|cx| {
+            term.update(cx, |term, _| {
+                term.state.app.overlay = Some(crate::app::overlay::Overlay::Info {
+                    title: "S".into(),
+                    lines: vec!["x".into()],
+                    loading: false,
+                    seq: 1,
+                });
+            });
+        });
+        render(cx);
+        press(cx, "ctrl-end");
+        let (follow_after, after_overlay) = top(cx);
+        assert_eq!(
+            (before_overlay.item_ix, follow_before),
+            (after_overlay.item_ix, follow_after),
+            "浮层下滚动键不滚消息区"
+        );
+        assert!(
+            cx.update(|cx| term.read(cx).state.app.overlay.is_some()),
+            "浮层保持打开"
+        );
+    }
+
+    /// 滚动条（task 4.1；spec: 消息区滚动条三场景）：内建滚动条默认启用
+    /// （MessageScroller `scrollbar: true`）——验证我方边界：不足一屏拖动
+    /// 无效果、超视口拖动改变视口、浮层遮罩下拖动无效果；绘制/淡入淡出/
+    /// 连续拖动手感为宿主内建行为（design D3，组件自身套件覆盖）。
+    ///
+    /// 功能: 手工分发 hover→down→move→up 事件序列于消息区右缘；
+    /// 输入: cx — 测试上下文；
+    /// 输出: 断言通过（存在性命中 + 溢出才可拖 + 遮罩阻断）。
+    #[gpui_kit::test]
+    fn scrollbar_drag_only_when_overflow_and_unoccluded(cx: &mut TestAppContext) {
+        use gpui_kit::{MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput};
+        let (handle, term) = open_focused(cx, "scrollbar");
+        let render = |cx: &mut TestAppContext| {
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .expect("render");
+            cx.run_until_parked();
+        };
+        let top = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                let s = term.read(cx).scroller.read(cx);
+                (s.is_following_tail(), s.logical_scroll_top())
+            })
+        };
+        let press_key = |cx: &mut TestAppContext, key: &str| {
+            cx.update_window(handle, |_, window, cx| window.press(key, cx))
+                .unwrap_or_else(|e| panic!("press {key}: {e}"));
+            cx.run_until_parked();
+        };
+        // 右缘拖动：hover → down → move×2 → up（hover-to-show 先手）。
+        let drag = |cx: &mut TestAppContext, x: f32, y: f32, dy: f32| {
+            let mods = Modifiers::default();
+            let at = |yy: f32| point(px(x), px(yy));
+            cx.update_window(handle, |_, window, cx| {
+                let _ = window.dispatch_event(
+                    PlatformInput::MouseMove(MouseMoveEvent {
+                        position: at(y),
+                        pressed_button: None,
+                        modifiers: mods,
+                    }),
+                    cx,
+                );
+            })
+            .expect("hover");
+            // hover-to-show 入场动画按真实时间推进：多帧 + 短睡让命中区就位。
+            for _ in 0..6 {
+                cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                    .ok();
+                cx.run_until_parked();
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+            cx.update_window(handle, |_, window, cx| {
+                let _ = window.dispatch_event(
+                    PlatformInput::MouseDown(MouseDownEvent {
+                        button: MouseButton::Left,
+                        position: at(y),
+                        modifiers: mods,
+                        click_count: 1,
+                        first_mouse: true,
+                    }),
+                    cx,
+                );
+                for k in [1.0f32, 2.0] {
+                    let _ = window.dispatch_event(
+                        PlatformInput::MouseMove(MouseMoveEvent {
+                            position: at(y + dy * k),
+                            pressed_button: Some(MouseButton::Left),
+                            modifiers: mods,
+                        }),
+                        cx,
+                    );
+                }
+                let _ = window.dispatch_event(
+                    PlatformInput::MouseUp(MouseUpEvent {
+                        button: MouseButton::Left,
+                        position: at(y + dy * 2.0),
+                        modifiers: mods,
+                        click_count: 1,
+                    }),
+                    cx,
+                );
+            })
+            .expect("dispatch mouse");
+            cx.run_until_parked();
+        };
+        let vp_bounds = |cx: &mut TestAppContext| {
+            cx.update_window(handle, |_, window, _| {
+                gpui_kit::base::test_support::find(window, &[], &ElementId::from("gpui-messages"))
+                    .expect("视口观测")
+                    .bounds()
+            })
+            .expect("vp")
+        };
+
+        // 1) 不足一屏：右缘拖动无效果（无滚动条命中）。
+        cx.update(|cx| {
+            term.update(cx, |term, _| feed_user_lines(term, 3));
+        });
+        render(cx);
+        let vp1 = vp_bounds(cx);
+        let (f1, t1) = top(cx);
+        drag(
+            cx,
+            f32::from(vp1.origin.x + vp1.size.width) - 6.0,
+            f32::from(vp1.origin.y) + 6.0,
+            120.0,
+        );
+        let (f1b, t1b) = top(cx);
+        assert_eq!((f1, t1), (f1b, t1b), "不足一屏拖动不滚消息区");
+
+        // 2) 超视口：拖动改变视口（从顶起，拇指在顶部区域）。
+        cx.update(|cx| {
+            term.update(cx, |term, _| {
+                for _ in 0..9 {
+                    feed_user_lines(term, 60);
+                }
+            });
+        });
+        render(cx);
+        press_key(cx, "ctrl-home");
+        let (_, t2) = top(cx);
+        assert_eq!(t2.item_ix, 0, "到顶");
+        let vp2 = vp_bounds(cx);
+        let right = f32::from(vp2.origin.x + vp2.size.width);
+        let vtop = f32::from(vp2.origin.y);
+        // 滚动条列 = 右缘内 16px 轨道（WIDTH=4*2+8），thumb 中心 ≈ 右缘−6；
+        // 顶部内容时 thumb 起于 +inset4 → +6 在 thumb 上（扫掠实测定点）。
+        drag(cx, right - 6.0, vtop + 6.0, 200.0);
+        let (_, t2b) = top(cx);
+        assert!(t2b.item_ix > 0, "超视口拖动改变视口: {:?}", t2b.item_ix);
+
+        // 3) 浮层遮罩下：同拖无效，浮层保持打开。
+        cx.update(|cx| {
+            term.update(cx, |term, _| {
+                term.state.app.overlay = Some(crate::app::overlay::Overlay::Info {
+                    title: "S".into(),
+                    lines: vec!["x".into()],
+                    loading: false,
+                    seq: 1,
+                });
+            });
+        });
+        render(cx);
+        let (_, t3) = top(cx);
+        drag(
+            cx,
+            f32::from(vp2.origin.x + vp2.size.width) - 6.0,
+            f32::from(vp2.origin.y) + 6.0,
+            200.0,
+        );
+        let (_, t3b) = top(cx);
+        assert_eq!(t3, t3b, "浮层下滚动条拖动无效");
+        assert!(
+            cx.update(|cx| term.read(cx).state.app.overlay.is_some()),
+            "浮层保持打开"
         );
     }
 
@@ -4392,6 +5217,343 @@ done
             1,
             "落盘条目数"
         );
+    }
+
+    /// 生成带唯一行标记的 user 条目（spike 测量用；行 = `{tag}L{jj}`）。
+    ///
+    /// 功能: 经 reduce 投递 message_start 落一条 user 条目；
+    /// 输入: term — 组件；tag — 条目标识前缀；lines — 正文行数；
+    /// 输出: 无返回值；副作用为 transcript 追加条目。
+    fn feed_tagged(term: &mut GPUIAgentTerminal, tag: &str, lines: usize) {
+        use serde_json::json;
+        let body = (0..lines)
+            .map(|i| format!("{tag}L{i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        term.state.reduce(
+            &ClientEvent::Event(json!({
+                "type":"message_start",
+                "message":{"role":"user","content":[{"type":"text","text":body}]}
+            })),
+            &term.commander,
+            &term.ui_tx,
+        );
+    }
+
+    /// 可见标记文本的窗口 y 坐标（未绘制/不可见 → None）。
+    ///
+    /// 功能: 从上一帧文本快照中按前缀定位标记；多行条目优先取含 `\n` 的
+    ///       逻辑块快照（test_text 容器，跨帧一致），单行回退首个匹配；
+    /// 输入: cx/handle — 测试上下文与窗口；prefix — 标记前缀；
+    /// 输出: Some(文本原点 y px) / None。
+    fn marker_y(
+        cx: &mut TestAppContext,
+        handle: gpui_kit::AnyWindowHandle,
+        prefix: &str,
+    ) -> Option<f32> {
+        cx.update_window(handle, |_, window, _| {
+            let all: Vec<_> = gpui_kit::base::test_support::texts(window)
+                .iter()
+                .filter(|t| t.visible() && t.text().starts_with(prefix))
+                .cloned()
+                .collect();
+            all.iter()
+                .find(|t| t.text().contains('\n'))
+                .or_else(|| all.first())
+                .map(|t| f32::from(t.bounds().origin.y))
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// 条目首行标记（user 条目：首行原文；取前缀避免长行快照差异）。
+    ///
+    /// 功能: 取条目正文首行作为 marker 前缀；
+    /// 输入: term — 组件（只读）；ix — 条目下标；
+    /// 输出: 首行前 24 字符（不足则全部）。
+    fn entry_marker(term: &GPUIAgentTerminal, ix: usize) -> String {
+        match &term.state.session().entries()[ix] {
+            Entry::User { text } => text
+                .split('\n')
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .take(24)
+                .collect(),
+            _ => String::new(),
+        }
+    }
+
+    /// spike 1.2：`scroll_to_item(ix)` 后视口顶对齐条目顶
+    /// （`logical_scroll_top == {ix, 0}`——跳转 spec「视口顶移到消息起始行」
+    /// 的能力前提；非顶对齐需停下回看）。
+    ///
+    /// 功能: 灌内容 → 滚到条目 3 → 断言 ListOffset 顶对齐；
+    /// 输入: cx — 测试上下文；
+    /// 输出: 断言通过（顶对齐）。
+    #[gpui_kit::test]
+    fn scroll_to_item_aligns_to_item_top(cx: &mut TestAppContext) {
+        let (handle, term) = open_focused(cx, "align-top");
+        cx.update(|cx| {
+            term.update(cx, |term, _| {
+                for i in 0..10 {
+                    feed_tagged(term, &format!("T{i:02}"), 5);
+                }
+            });
+        });
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render");
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            term.update(cx, |term, cx| {
+                let _ = term.scroller.update(cx, |s, cx| s.scroll_to_item(3, cx));
+            });
+        });
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render");
+        cx.run_until_parked();
+
+        let top = cx.update(|cx| {
+            let s = term.read(cx).scroller.read(cx);
+            s.logical_scroll_top()
+        });
+        assert_eq!(top.item_ix, 3, "视口顶应落在条目 3");
+        assert!(
+            f32::from(top.offset_in_item).abs() < 0.5,
+            "应顶对齐（offset=0），实测 {:?}",
+            top.offset_in_item
+        );
+    }
+
+    /// spike 1.1：S1 内容估算步进的落点容差（design D2 门槛）。
+    ///
+    /// 功能: 三段式——①帧@0 标定（文本行高/字符宽/折叠高度/文本宽）；
+    ///       ②折行模型校验（WRAP 长行实际行数 vs 估算，±1 行）；
+    ///       ③落点门槛：代表内容跨度落点位移距真一页 ≤ 1/3 视口，
+    ///       跨 WRAP 跨度测量位移误差（eprintln 供 S1/S2 结论）；
+    /// 输入: cx — 测试上下文；
+    /// 输出: 断言通过（标定合理 + 模型校验 + 代表内容门槛 + 结构断言）。
+    #[gpui_kit::test]
+    fn page_step_lands_within_tolerance(cx: &mut TestAppContext) {
+        use crate::gpui_agent::scroll::{ScrollMetrics, page_down_target};
+        let (handle, term) = open_focused(cx, "page-spike");
+        // 内容：A(8×5行) + WRAP(单行400字符) + C(10×10行，标定第二点)。
+        cx.update(|cx| {
+            term.update(cx, |term, _| {
+                for i in 0..8 {
+                    feed_tagged(term, &format!("A{i:02}"), 5);
+                }
+                term.state.reduce(
+                    &ClientEvent::Event(serde_json::json!({
+                        "type":"message_start",
+                        "message":{"role":"user","content":[{"type":"text","text":format!("{}{}", "WRAP-MARKER-", "abcdefghij1234567890".repeat(20))}]}
+                    })),
+                    &term.commander,
+                    &term.ui_tx,
+                );
+                for i in 0..10 {
+                    feed_tagged(term, &format!("C{i:02}"), 10);
+                }
+                // 容量探针：单 token 70/140/280 字符 + 带空格 140 对照 + 锚点。
+                for (tag, n) in [("D1", 70), ("D2", 140), ("D3", 280)] {
+                    term.state.reduce(
+                        &ClientEvent::Event(serde_json::json!({
+                            "type":"message_start",
+                            "message":{"role":"user","content":[{"type":"text","text":format!("{}{}{}", tag, "-MARKER-", "x".repeat(n))}]}
+                        })),
+                        &term.commander,
+                        &term.ui_tx,
+                    );
+                }
+                term.state.reduce(
+                    &ClientEvent::Event(serde_json::json!({
+                        "type":"message_start",
+                        "message":{"role":"user","content":[{"type":"text","text":"E1-MARKER- word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20"}]}
+                    })),
+                    &term.commander,
+                    &term.ui_tx,
+                );
+                feed_tagged(term, "ANCHOR", 3);
+            });
+        });
+        let render = |cx: &mut TestAppContext| {
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .expect("render");
+            cx.run_until_parked();
+        };
+        render(cx);
+
+        // 视口宽高与页长（TUI 页 = 视口行数−4 行）。
+        let (view_h, vp_w, page_px) = cx
+            .update_window(handle, |_, window, _| {
+                let snap = gpui_kit::base::test_support::find(
+                    window,
+                    &[],
+                    &ElementId::from("gpui-messages"),
+                )
+                .expect("消息区观测在场");
+                let (_, line_h) = grid_metrics(window);
+                let vh = f32::from(snap.bounds().size.height);
+                let vw = f32::from(snap.bounds().size.width);
+                let rows = (vh / f32::from(line_h)).floor();
+                (vh, vw, (rows - 4.0).max(1.0) * f32::from(line_h))
+            })
+            .expect("viewport");
+
+        let scroll_to = |cx: &mut TestAppContext, ix: usize| {
+            cx.update(|cx| {
+                term.update(cx, |term, cx| {
+                    let _ = term.scroller.update(cx, |s, cx| s.scroll_to_item(ix, cx));
+                });
+            });
+            render(cx);
+        };
+
+        // —— ① 帧@0 标定（常数回填 scroll.rs 生产值的依据）——
+        scroll_to(cx, 0);
+        let ya0 = marker_y(cx, handle, "A00L00").expect("A00 可见");
+        let ya1 = marker_y(cx, handle, "A01L00").expect("A01 可见");
+        let h_entry = ya1 - ya0;
+        let calib = cx
+            .update_window(handle, |_, window, _| {
+                let vp = gpui_kit::base::test_support::find(
+                    window,
+                    &[],
+                    &ElementId::from("gpui-messages"),
+                )
+                .expect("视口");
+                let vpb = vp.bounds();
+                let mut label = (0.0f32, 0.0f32); // (y, h)
+                let mut body = (0.0f32, 0.0f32, 0.0f32, 0usize); // (y, h, w, chars)
+                let mut painted = (0.0f32, 0usize); // (w, chars) 单行渲染版
+                for t in gpui_kit::base::test_support::texts(window) {
+                    let s = t.text();
+                    if s == "You:" && label.1 == 0.0 {
+                        label = (f32::from(t.bounds().origin.y), f32::from(t.bounds().size.height));
+                    } else if s.starts_with("A00L00") && s.contains('\n') {
+                        body = (
+                            f32::from(t.bounds().origin.y),
+                            f32::from(t.bounds().size.height),
+                            f32::from(t.bounds().size.width),
+                            s.chars().count(),
+                        );
+                    } else if s.starts_with("A00L00") && !s.contains('\n') {
+                        painted = (f32::from(t.bounds().size.width), s.chars().count());
+                    }
+                }
+                (label, body, painted, f32::from(vpb.origin.x))
+            })
+            .expect("calib@0");
+        let (label, body, _painted, _vp_x) = calib;
+        let text_line = body.1;
+        // 推进宽用经验常数（spike 容量定律：760px 下 64 字符，见 CHAR_ADVANCE_PX）。
+        let char_w = crate::gpui_agent::scroll::CHAR_ADVANCE_PX;
+        let text_w = body.2; // 正文容器宽（w_full = 文本折行宽度）
+        let user_folded = h_entry - body.1;
+        eprintln!(
+            "[spike] ①标定 view=({view_h}x{vp_w}) page={page_px} h_entry={h_entry} label={label:?} body(y,h,w,chars)={body:?} → text_line={text_line} char_w={char_w} text_w={text_w} folded={user_folded}"
+        );
+        assert!(
+            text_line > 8.0 && (6.0..13.0).contains(&char_w) && text_w > 300.0
+                && user_folded > 10.0 && label.1 > 5.0,
+            "标定合理: text_line={text_line} char_w={char_w} text_w={text_w} folded={user_folded} label={label:?}"
+        );
+        let metrics = ScrollMetrics {
+            grid_line: f32::from(cx
+                .update_window(handle, |_, window, _| grid_metrics(window).1)
+                .expect("grid")),
+            text_line,
+            user_folded,
+            base_pad: 0.0, // 本测试内容全 user，非 user 路径不参与
+            text_w,
+            char_w,
+        };
+
+        // —— ②b 容量定律校验（帧@19：D1/D2/D3/E1 正文行数 vs 模型，±1 行）——
+        scroll_to(cx, 19);
+        for (prefix, chars) in [
+            ("D1-MARKER", 80.0),
+            ("D2-MARKER", 150.0),
+            ("D3-MARKER", 290.0),
+            ("E1-MARKER", 141.0),
+        ] {
+            let h = cx
+                .update_window(handle, |_, window, _| {
+                    gpui_kit::base::test_support::texts(window)
+                        .iter()
+                        .find(|t| t.visible() && t.text().starts_with(prefix))
+                        .map(|t| f32::from(t.bounds().size.height))
+                        .expect("探针正文可见")
+                })
+                .expect("probe19");
+            let rows_actual = h / text_line;
+            let rows_est = (chars * metrics.char_w / metrics.text_w).ceil().max(1.0);
+            eprintln!("[spike] ②b {prefix} h={h} rows_actual={rows_actual} rows_est={rows_est}");
+            assert!(
+                (rows_est - rows_actual).abs() <= 1.0,
+                "{prefix} 容量定律估算 {rows_est} 应贴近实际 {rows_actual}（±1 行）"
+            );
+        }
+
+        // —— ② 折行模型校验（帧@8：WRAP 实际行数 vs 估算，±1 行）——
+        scroll_to(cx, 8);
+        let y_wrap = marker_y(cx, handle, "WRAP-MARKER-").expect("WRAP 可见");
+        let y_c0 = marker_y(cx, handle, "C00L00").expect("C00 可见");
+        let h_wrap = y_c0 - y_wrap;
+        let wrap_text = cx.update(|cx| match &term.read(cx).state.session().entries()[8] {
+            Entry::User { text } => text.clone(),
+            _ => String::new(),
+        });
+        let rows_actual = (h_wrap - user_folded) / text_line;
+        let rows_est = crate::gpui_agent::scroll::wrapped_rows(&wrap_text, &metrics);
+        eprintln!(
+            "[spike] ②折行 h_wrap={h_wrap} rows_actual={rows_actual} rows_est={rows_est} (chars={})",
+            wrap_text.chars().count()
+        );
+        assert!(
+            (rows_est - rows_actual).abs() <= 1.0,
+            "折行估算 {rows_est} 应贴近实际 {rows_actual}（±1 行）"
+        );
+
+        // —— ③ 落点门槛 ——
+
+        // 跨度①（代表内容，A 区内）：同帧内测 from→落点标记间距 = 真位移。
+        scroll_to(cx, 2);
+        let y_from = marker_y(cx, handle, "A02L00").expect("A02 可见");
+        let t1 = cx.update(|cx| {
+            let t = term.read(cx);
+            let entries = t.state.session().entries().to_vec();
+            page_down_target(&entries, &t.state.app, 2, 0.0, page_px, &metrics)
+        });
+        let land1 = cx.update(|cx| entry_marker(term.read(cx), t1));
+        let y_t1 = marker_y(cx, handle, &land1).expect("落点标记在 from 帧内可见");
+        let err1 = ((y_t1 - y_from) - page_px).abs();
+        eprintln!("[spike] 跨度① landing={t1} disp={} err={err1}", y_t1 - y_from);
+        assert!(
+            err1 <= view_h / 3.0,
+            "代表内容落点误差 {err1} 应 ≤ 1/3 视口 {}",
+            view_h / 3.0
+        );
+
+        // 跨度②（跨 WRAP 长行条目）：同帧测量位移误差供 S1/S2 结论。
+        scroll_to(cx, 7);
+        let y_from2 = marker_y(cx, handle, "A07L00").expect("A07 可见");
+        let t2 = cx.update(|cx| {
+            let t = term.read(cx);
+            let entries = t.state.session().entries().to_vec();
+            page_down_target(&entries, &t.state.app, 7, 0.0, page_px, &metrics)
+        });
+        let land2 = cx.update(|cx| entry_marker(term.read(cx), t2));
+        let y_t2 = marker_y(cx, handle, &land2).expect("落点标记在 from 帧内可见");
+        let err2 = ((y_t2 - y_from2) - page_px).abs();
+        eprintln!(
+            "[spike] 跨度② landing={t2} disp={} err={err2} (真一页={page_px})",
+            y_t2 - y_from2
+        );
+        // 结构性断言：向后落点、未飞到末条；误差数据见 eprintln 供任务结论。
+        assert!(t2 > 7, "应向后落");
+        assert!(t2 < cx.update(|cx| term.read(cx).state.session().entries().len()), "不应停在末条");
     }
 
     /// 队列条（task 3.2）：消息区与输入区之间，`[steer]`/`[queue]` 前缀
