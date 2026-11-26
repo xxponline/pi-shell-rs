@@ -47,7 +47,9 @@ pub fn tool_lines_themed(
     out
 }
 
-/// [`tool_lines_themed`] 的实现体（外层只做分段计时归因）。
+/// [`tool_lines_themed`] 的实现体（外层只做分段计时归因）：
+/// 消费中性模型 [`tool_card_model`] 再转回 ratatui 行——TUI 侧薄适配，
+/// 不再持有任何卡片语义（design D1）。
 ///
 /// 输入/输出: 同 [`tool_lines_themed`]
 fn tool_lines_themed_inner(
@@ -57,26 +59,61 @@ fn tool_lines_themed_inner(
     expanded: bool,
     theme: &crate::app::theme::TuiTheme,
 ) -> Vec<Line<'static>> {
-    let args = serde_json::from_str::<Value>(args_json).unwrap_or(Value::Null);
-    let mut out = vec![head_line(name, &args, tool, expanded)];
-
-    let body = match name {
-        "read" => read_body(&args, tool, theme),
-        "bash" | "powershell" => bash_output(&args, tool),
-        "edit" => edit_body(&args, tool),
-        "write" => write_body(&args, tool, theme),
-        "grep" | "find" | "ls" => text_result_body(tool),
-        _ => generic_body(&args, tool, expanded),
-    };
-    if expanded {
-        out.extend(body);
-    } else {
-        out.extend(collapse(name, body));
+    let model = tool_card_model(name, args_json, tool, expanded, theme);
+    let mut out = Vec::with_capacity(model.body.len() + model.tail.len() + 2);
+    out.push(segs_to_line(&model.head));
+    for row in &model.body {
+        out.push(segs_to_line(row));
     }
-    // 受保护尾部：exit 状态行 + 截断警告——不参与折叠计数、始终可见
-    //（对照 pi：warnings 在 preview 之外渲染；也使 bash 隐藏行数只计输出行）。
-    out.extend(protected_tail(name, tool));
+    if let Some(hint) = &model.hint {
+        out.push(segs_to_line(std::slice::from_ref(hint)));
+    }
+    for row in &model.tail {
+        out.push(segs_to_line(row));
+    }
     out
+}
+
+/// 中性段序列 → ratatui 行（TUI 侧适配；role → 既有样式映射）。
+///
+/// 输入: segs — 单行的语义段（头行/正文行/提示/尾部行）
+/// 输出: 等文本的 ratatui 行（样式与历史 `head_line`/`collapse`/高亮
+///       路径逐项一致：状态黄绿红、名字粗体、计时/提示暗灰、Fg 透传）
+pub(crate) fn segs_to_line(segs: &[Seg]) -> Line<'static> {
+    Line::from(
+        segs.iter()
+            .map(|s| Span::styled(s.text.clone(), seg_style(s.role)))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// 段角色 → ratatui 样式（与历史各构建器产出逐项对齐）。
+///
+/// 输入: role — 段角色（`Fg` 携带显式前景色）
+/// 输出: 该段的 ratatui 样式
+fn seg_style(role: SegRole) -> Style {
+    match role {
+        SegRole::StatusRun | SegRole::NoticeRetry | SegRole::Warn => {
+            Style::default().fg(Color::Yellow)
+        }
+        SegRole::StatusOk | SegRole::ExitOk => Style::default().fg(Color::Green),
+        SegRole::StatusErr => Style::default().fg(Color::Red),
+        SegRole::NoticeError | SegRole::ExitBad => {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        }
+        SegRole::Name => Style::default().add_modifier(Modifier::BOLD),
+        // 命令行黄粗：HEAD 与 spec「命令行黄色加粗」同款（task1.2 段化
+        // 重构曾把黄色丢成纯粗体——chat 侧回归测试看住）。
+        SegRole::Cmd => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        SegRole::Arg | SegRole::Body => Style::default(),
+        SegRole::Timer | SegRole::Hint | SegRole::Dim => Style::default().fg(Color::DarkGray),
+        SegRole::Notice | SegRole::ThinkingText => Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+        SegRole::Fg(c) => Style::default().fg(c),
+    }
 }
 
 /// 受保护尾部（不参与折叠）：bash 的 exit 状态行 + 各工具截断警告行。
@@ -109,78 +146,7 @@ fn collapse_policy(name: &str) -> (usize, bool) {
     }
 }
 
-/// 按策略折叠结果体；实际发生截断时追加隐藏行数提示行
-/// （spec：`... (N earlier/more lines, ctrl+o to expand)`）。
-///
-/// 输入: name — 工具名（选策略）；body — 全量结果体行
-/// 输出: 折叠后的行序列（未超限时原样返回）
-fn collapse(name: &str, body: Vec<Line<'static>>) -> Vec<Line<'static>> {
-    let (keep, keep_tail) = collapse_policy(name);
-    if body.len() <= keep {
-        return body;
-    }
-    let hidden = body.len() - keep;
-    let shown: Vec<Line<'static>> = if keep_tail {
-        body[body.len() - keep..].to_vec()
-    } else {
-        body[..keep].to_vec()
-    };
-    let hint = if keep_tail {
-        format!("... ({hidden} earlier lines, ctrl+o to expand)")
-    } else if name == "write" {
-        // pi write：额外提示总行数
-        format!(
-            "... ({hidden} more lines, {} total, ctrl+o to expand)",
-            body.len()
-        )
-    } else {
-        format!("... ({hidden} more lines, ctrl+o to expand)")
-    };
-    let mut out = shown;
-    out.push(Line::from(Span::styled(
-        hint,
-        Style::default().fg(Color::DarkGray),
-    )));
-    out
-}
-
 use serde_json::Value;
-
-/// 头行：`● name · 关键参数 · 状态 · 耗时`。
-///
-/// 输入: name — 工具名；args — 已解析参数；tool — 执行状态
-/// 输出: 单行头行（状态决定颜色：成功绿/失败红/进行中黄）
-fn head_line(name: &str, args: &Value, tool: &ToolExecution, expanded: bool) -> Line<'static> {
-    let (status_text, status_color) = match tool.status {
-        ToolStatus::Pending => ("pending", Color::Yellow),
-        ToolStatus::Running => ("running", Color::Yellow),
-        ToolStatus::Ended if tool.is_error => ("error", Color::Red),
-        ToolStatus::Ended => ("done", Color::Green),
-    };
-
-    let mut spans = vec![Span::styled(
-        "● ",
-        Style::default().fg(status_color),
-    ), Span::styled(
-        name.to_string(),
-        Style::default().add_modifier(Modifier::BOLD),
-    )];
-
-    if let Some(key) = head_arg(name, args, expanded) {
-        spans.push(Span::raw(format!(" {key}")));
-    }
-    spans.push(Span::styled(
-        format!(" · {status_text}"),
-        Style::default().fg(status_color),
-    ));
-    if let Some(timer) = timer_text(tool) {
-        spans.push(Span::styled(
-            format!(" · {timer}"),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-    Line::from(spans)
-}
 
 /// 卡片计时行（design D2，对照 pi `toolTimerText`）：终态且有服务端时长 →
 /// `Took …`（服务端值单调且跨重载存活）；否则有起点 → `Elapsed …`（每帧
@@ -825,9 +791,223 @@ fn generic_body(args: &Value, tool: &ToolExecution, expanded: bool) -> Vec<Line<
     out
 }
 
+// ---------- 中性语义模型（TUI/GPUI 双端共享，design D1） ----------
+
+/// 语义段角色：模型只携带"这是什么"，样式由各渲染端自行映射
+/// （TUI → ratatui Style，GPUI → palette）。`Fg` 为前景色透传
+/// （语法高亮/diff/exit/警告等共享层既有逻辑产出的颜色，原样带给两端）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegRole {
+    /// 状态点 `●` 与 ` · <status>` 状态文字（pending/running → 黄）。
+    StatusRun,
+    /// 成功状态（done → 绿）。
+    StatusOk,
+    /// 失败状态（error → 红）。
+    StatusErr,
+    /// 工具名（粗体）。
+    Name,
+    /// 头行关键参数（默认色）。
+    Arg,
+    /// 计时（`Took`/`Elapsed`，暗灰）。
+    Timer,
+    /// 正文（默认色）。
+    Body,
+    /// 折叠提示行（暗灰）。
+    Hint,
+    /// 通知 error（红粗）。
+    NoticeError,
+    /// 通知 retry（黄）。
+    NoticeRetry,
+    /// 通知其它（暗灰斜体）。
+    Notice,
+    /// thinking 正文/占位（暗灰斜体）。
+    ThinkingText,
+    /// bash 命令行（黄粗）。
+    Cmd,
+    /// bash 运行中/取消/truncated 提示（黄）。
+    Warn,
+    /// bash `exit 0`（绿）。
+    ExitOk,
+    /// bash `exit N`（N≠0，红粗）。
+    ExitBad,
+    /// bash 输出行/标记/done（暗灰）。
+    Dim,
+    /// 显式前景色透传（语法高亮 token、diff 行、exit 行、截断警告等）。
+    Fg(Color),
+}
+
+/// 语义段：一段同角色文本（模型的最小着色单元）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Seg {
+    /// 段文本（可为空串——空行占位，保住行数）。
+    pub text: String,
+    /// 段角色。
+    pub role: SegRole,
+}
+
+impl Seg {
+    /// 构造语义段。
+    ///
+    /// 输入: text — 段文本；role — 段角色
+    /// 输出: `Seg` 实例
+    pub fn new(text: impl Into<String>, role: SegRole) -> Self {
+        Self {
+            text: text.into(),
+            role,
+        }
+    }
+}
+
+/// 工具卡中性模型：头行 + 折叠后正文 + 折叠提示 + 受保护尾部。
+///
+/// 与渲染框架无关的"该显示什么"唯一真相源（design D1）：TUI 经
+/// `tool_lines_themed` 薄适配上屏，GPUI 用内建文本 runs 消费；两端
+/// MUST NOT 另存一份卡片语义副本。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCardModel {
+    /// 头行段序列（单行：`● name · 关键参数 · 状态 · 计时`）。
+    pub head: Vec<Seg>,
+    /// 结果体（元素 = 屏行，行内多段；已按折叠策略截断，展开态为全量）。
+    pub body: Vec<Vec<Seg>>,
+    /// 折叠提示行（仅折叠且发生截断时 Some；展开态恒 None）。
+    pub hint: Option<Seg>,
+    /// 受保护尾部（exit 状态行 + 截断警告；不参与折叠计数、始终可见）。
+    pub tail: Vec<Vec<Seg>>,
+}
+
+/// 构建工具卡中性模型（语义逻辑下沉的唯一入口，design D1）。
+///
+/// 功能: 解析参数 → 头行段（head_arg/timer_text）→ 按工具取结果体
+///       → 折叠（collapse_policy）→ 受保护尾部，组装 [`ToolCardModel`]；
+/// 输入: name — 工具名（read/bash/edit/write/grep/find/ls/未知均可）；
+///       args_json — 调用参数原文（非法 JSON 降级 Value::Null，不 panic）；
+///       tool — 执行状态（status/is_error/result/partial/duration/起点）；
+///       expanded — 展开态（跳过折叠与 compact 头行分类）；
+///       theme — 注入配色（read/write 语法高亮取 syntax_theme）
+/// 输出: 语义模型；无结果时 body 为空、无提示行，不 panic
+pub fn tool_card_model(
+    name: &str,
+    args_json: &str,
+    tool: &ToolExecution,
+    expanded: bool,
+    theme: &crate::app::theme::TuiTheme,
+) -> ToolCardModel {
+    let args = serde_json::from_str::<Value>(args_json).unwrap_or(Value::Null);
+    let head = head_segs(name, &args, tool, expanded);
+
+    let body_lines = match name {
+        "read" => read_body(&args, tool, theme),
+        "bash" | "powershell" => bash_output(&args, tool),
+        "edit" => edit_body(&args, tool),
+        "write" => write_body(&args, tool, theme),
+        "grep" | "find" | "ls" => text_result_body(tool),
+        _ => generic_body(&args, tool, expanded),
+    };
+    let body = lines_to_segs(body_lines);
+
+    let (body, hint) = if expanded {
+        (body, None)
+    } else {
+        collapse_rows(name, body)
+    };
+    let tail = protected_tail_rows(name, tool);
+
+    ToolCardModel {
+        head,
+        body,
+        hint,
+        tail,
+    }
+}
+
+/// 头行段序列（镜像 `head_line` 的 span 构成，语义角色化）。
+///
+/// 输入: name/args/expanded — 同 [`tool_card_model`]；tool — 取状态与计时
+/// 输出: 单行段序列（`● ` + 名字 + 关键参数 + ` · 状态` + ` · 计时`，
+///       后三段按 head_arg/timer_text 缺省省略）
+fn head_segs(name: &str, args: &Value, tool: &ToolExecution, expanded: bool) -> Vec<Seg> {
+    let (status_text, status_role) = match tool.status {
+        ToolStatus::Pending => ("pending", SegRole::StatusRun),
+        ToolStatus::Running => ("running", SegRole::StatusRun),
+        ToolStatus::Ended if tool.is_error => ("error", SegRole::StatusErr),
+        ToolStatus::Ended => ("done", SegRole::StatusOk),
+    };
+    let mut segs = vec![
+        Seg::new("● ", status_role),
+        Seg::new(name, SegRole::Name),
+    ];
+    if let Some(key) = head_arg(name, args, expanded) {
+        segs.push(Seg::new(format!(" {key}"), SegRole::Arg));
+    }
+    segs.push(Seg::new(format!(" · {status_text}"), status_role));
+    if let Some(timer) = timer_text(tool) {
+        segs.push(Seg::new(format!(" · {timer}"), SegRole::Timer));
+    }
+    segs
+}
+
+/// ratatui 行 → 中性段行（正文/尾部桥接；行样式仅前景色与无样式两种，
+/// 逐 span 透传不丢色）。
+///
+/// 输入: lines — 共享层既有行构建器产出（语法高亮/diff/纯文本）
+/// 输出: 等行数的段行序列（span 有 fg → [`SegRole::Fg`]，无 → `Body`；
+///       空 span 行 → 空段行，行数与渲染均与原行等价）
+fn lines_to_segs(lines: Vec<Line<'static>>) -> Vec<Vec<Seg>> {
+    lines
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .into_iter()
+                .map(|s| Seg::new(s.content.to_string(), match s.style.fg {
+                    Some(c) => SegRole::Fg(c),
+                    None => SegRole::Body,
+                }))
+                .collect()
+        })
+        .collect()
+}
+
+/// 按折叠策略截断正文行并生成提示行（语义版 `collapse`，design D6）。
+///
+/// 输入: name — 工具名（选策略：bash/powershell 尾 5、grep 15、
+///       find/ls 20、write 与其余头 10）；body — 全量结果体段行
+/// 输出: `(保留行, 提示段)`——未超限原样返回且提示为 None；
+///       提示文案：bash 尾留 `earlier lines`、write 带总行数、其余 `more lines`
+fn collapse_rows(name: &str, body: Vec<Vec<Seg>>) -> (Vec<Vec<Seg>>, Option<Seg>) {
+    let (keep, keep_tail) = collapse_policy(name);
+    if body.len() <= keep {
+        return (body, None);
+    }
+    let total = body.len();
+    let hidden = total - keep;
+    let shown = if keep_tail {
+        body[total - keep..].to_vec()
+    } else {
+        body[..keep].to_vec()
+    };
+    let text = if keep_tail {
+        format!("... ({hidden} earlier lines, ctrl+o to expand)")
+    } else if name == "write" {
+        format!("... ({hidden} more lines, {total} total, ctrl+o to expand)")
+    } else {
+        format!("... ({hidden} more lines, ctrl+o to expand)")
+    };
+    (shown, Some(Seg::new(text, SegRole::Hint)))
+}
+
+/// 受保护尾部段行（语义版 `protected_tail`）：bash exit 状态行 +
+/// 各工具截断警告——不参与折叠计数、始终可见。
+///
+/// 输入: name — 工具名；tool — 执行状态（读 result/partial 详情）
+/// 输出: 行序列（无内容时为空；行内前景色经 [`SegRole::Fg`] 透传）
+fn protected_tail_rows(name: &str, tool: &ToolExecution) -> Vec<Vec<Seg>> {
+    lines_to_segs(protected_tail(name, tool))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::theme::TuiTheme;
     use pi_shell_rs::session::{replay_file, Entry};
     use std::path::PathBuf;
 
@@ -933,6 +1113,226 @@ mod tests {
             ..Default::default()
         };
         assert!(timer_text(&rebuilt).is_none(), "无起点降级为不显示");
+    }
+
+    /// 模型行文本（行内段拼接）——model 单测断言用。
+    fn row_text(row: &[Seg]) -> String {
+        row.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join("")
+    }
+
+    /// 模型全量文本（头行/正文/提示/尾部逐行拼接）。
+    fn model_text(m: &ToolCardModel) -> String {
+        let mut out = row_text(&m.head);
+        for row in &m.body {
+            out.push('\n');
+            out.push_str(&row_text(row));
+        }
+        if let Some(hint) = &m.hint {
+            out.push('\n');
+            out.push_str(&hint.text);
+        }
+        for row in &m.tail {
+            out.push('\n');
+            out.push_str(&row_text(row));
+        }
+        out
+    }
+
+    /// model 单测（task 1.1）：bash 折叠取尾 5 行 + 提示行 + exit 受保护。
+    #[test]
+    fn model_bash_collapses_tail_with_hint_and_protected_exit() {
+        let output = (1..=40).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let tool = ToolExecution {
+            status: ToolStatus::Ended,
+            is_error: false,
+            result: Some(serde_json::json!({
+                "content": [{"type":"text","text": output}],
+                "structuredContent": {"output": output, "exit_code": 0}
+            })),
+            duration_ms: Some(830),
+            ..Default::default()
+        };
+        let m = tool_card_model(
+            "bash",
+            r#"{"command":"ls -la","timeout":5}"#,
+            &tool,
+            false,
+            &TuiTheme::default(),
+        );
+
+        // 尾 5 行（keep_tail）
+        assert_eq!(m.body.len(), 5, "bash 折叠取尾 5 行");
+        assert_eq!(row_text(&m.body[0]), "line36");
+        assert_eq!(row_text(&m.body[4]), "line40");
+        // 提示行（earlier 变体）
+        assert_eq!(
+            m.hint.as_ref().map(|s| s.text.as_str()),
+            Some("... (35 earlier lines, ctrl+o to expand)")
+        );
+        // exit 状态行在受保护尾部、不参与折叠
+        assert_eq!(m.tail.len(), 1);
+        assert_eq!(row_text(&m.tail[0]), "exit 0");
+        assert_eq!(m.tail[0][0].role, SegRole::Fg(Color::Green));
+        // 头行：bash prompt + timeout + 状态 + 计时
+        let head = row_text(&m.head);
+        assert!(head.contains("$ ls -la (timeout 5s)"), "头行参数: {head}");
+        assert!(head.contains("· done"), "头行状态: {head}");
+        assert!(head.contains("Took 830ms") || head.contains("Took 0.8s"), "头行计时: {head}");
+    }
+
+    /// model 单测（task 1.1）：grep 折叠取头 15 行 + 头行 `/pat/ in path`。
+    #[test]
+    fn model_grep_collapses_head_15() {
+        let output = (1..=30).map(|i| format!("match{i}")).collect::<Vec<_>>().join("\n");
+        let tool = ToolExecution {
+            status: ToolStatus::Ended,
+            is_error: false,
+            result: Some(serde_json::json!({"content": [{"type":"text","text": output}]})),
+            ..Default::default()
+        };
+        let m = tool_card_model(
+            "grep",
+            r#"{"pattern":"foo","path":"src"}"#,
+            &tool,
+            false,
+            &TuiTheme::default(),
+        );
+
+        assert_eq!(m.body.len(), 15, "grep 折叠取头 15 行");
+        assert_eq!(row_text(&m.body[0]), "match1");
+        assert_eq!(
+            m.hint.as_ref().map(|s| s.text.as_str()),
+            Some("... (15 more lines, ctrl+o to expand)")
+        );
+        assert!(row_text(&m.head).contains("/foo/ in src"), "grep 头行");
+        assert!(m.tail.is_empty(), "grep 无受保护尾部");
+    }
+
+    /// model 单测（task 1.1）：read 折叠取头 10 行 + 行范围头行；展开态无提示。
+    #[test]
+    fn model_read_collapses_head_10_and_expanded_drops_hint() {
+        let content = (1..=20).map(|i| format!("row{i}")).collect::<Vec<_>>().join("\n");
+        let tool = ToolExecution {
+            status: ToolStatus::Ended,
+            is_error: false,
+            result: Some(serde_json::json!({"content": [{"type":"text","text": content}]})),
+            ..Default::default()
+        };
+        let args = r#"{"path":"src/main.rs","offset":1,"limit":20}"#;
+
+        let collapsed = tool_card_model("read", args, &tool, false, &TuiTheme::default());
+        assert_eq!(collapsed.body.len(), 10, "read 折叠取头 10 行");
+        assert_eq!(row_text(&collapsed.body[0]), "row1");
+        assert_eq!(
+            collapsed.hint.as_ref().map(|s| s.text.as_str()),
+            Some("... (10 more lines, ctrl+o to expand)")
+        );
+        assert!(row_text(&collapsed.head).contains("src/main.rs:1-20"), "行范围头行");
+
+        let expanded = tool_card_model("read", args, &tool, true, &TuiTheme::default());
+        assert_eq!(expanded.body.len(), 20, "展开态全量");
+        assert!(expanded.hint.is_none(), "展开态无提示行");
+    }
+
+    /// model 单测（task 1.1）：计时三态经头行 Timer 段呈现（Took/无）。
+    #[test]
+    fn model_timer_three_states_via_head() {
+        let theme = TuiTheme::default();
+        let mk = |status: ToolStatus, duration_ms: Option<u64>| ToolExecution {
+            status,
+            duration_ms,
+            ..Default::default()
+        };
+        let has_timer = |m: &ToolCardModel| m.head.iter().any(|s| s.role == SegRole::Timer);
+        let timer_text_of = |m: &ToolCardModel| -> String {
+            m.head
+                .iter()
+                .filter(|s| s.role == SegRole::Timer)
+                .map(|s| s.text.as_str())
+                .collect()
+        };
+
+        let ended = tool_card_model("bash", "{}", &mk(ToolStatus::Ended, Some(90_000)), false, &theme);
+        assert!(has_timer(&ended), "Ended+duration 应有计时段");
+        assert!(timer_text_of(&ended).contains("Took 1m 30s"), "Took 服务端值");
+
+        let no_timer = tool_card_model("bash", "{}", &mk(ToolStatus::Ended, None), false, &theme);
+        assert!(!has_timer(&no_timer), "皆无不显示计时段");
+
+        // Running + 起点 → Elapsed（共享 timer_text 同源）
+        let running_tool = ToolExecution {
+            status: ToolStatus::Running,
+            started_at: Some(std::time::Instant::now() - std::time::Duration::from_secs(5)),
+            ..Default::default()
+        };
+        let running = tool_card_model("bash", "{}", &running_tool, false, &theme);
+        assert!(timer_text_of(&running).contains("Elapsed 5."), "运行中 Elapsed");
+    }
+
+    /// model 单测（task 1.1）：状态角色映射（done→StatusOk、error→StatusErr、
+    /// 运行中→StatusRun），头行分段角色齐全。
+    #[test]
+    fn model_status_roles_and_head_segments() {
+        let theme = TuiTheme::default();
+        let mk = |status: ToolStatus, is_error: bool| ToolExecution {
+            status,
+            is_error,
+            ..Default::default()
+        };
+
+        let ok = tool_card_model("read", r#"{"path":"/x"}"#, &mk(ToolStatus::Ended, false), false, &theme);
+        assert_eq!(ok.head[0].role, SegRole::StatusOk);
+        assert_eq!(ok.head[1].role, SegRole::Name);
+        assert!(ok.head.iter().any(|s| s.role == SegRole::Arg), "应有参数段");
+
+        let err = tool_card_model("read", r#"{"path":"/x"}"#, &mk(ToolStatus::Ended, true), false, &theme);
+        assert_eq!(err.head[0].role, SegRole::StatusErr);
+
+        let run = tool_card_model("read", r#"{"path":"/x"}"#, &mk(ToolStatus::Running, false), false, &theme);
+        assert_eq!(run.head[0].role, SegRole::StatusRun);
+    }
+
+    /// model 单测（task 1.1）：无结果不 panic、body 为空；未知工具兜底。
+    #[test]
+    fn model_empty_result_and_unknown_tool() {
+        let theme = TuiTheme::default();
+        let empty = ToolExecution::default();
+        let m = tool_card_model("read", r#"{"path":"/x"}"#, &empty, false, &theme);
+        assert!(m.body.is_empty(), "无结果 body 为空");
+        assert!(m.hint.is_none(), "未超限无提示");
+
+        let unknown = tool_card_model("mystery", r#"{"foo":1}"#, &empty, true, &theme);
+        assert!(!unknown.head.is_empty(), "未知工具仍有头行");
+    }
+
+    /// model 单测（task 1.1）：与 `tool_lines_themed` 输出逐行等价（TUI 薄适配
+    /// 前提——两端同语义，行文本完全一致）。
+    #[test]
+    fn model_matches_tool_lines_text() {
+        let theme = TuiTheme::default();
+        let tool = ToolExecution {
+            status: ToolStatus::Ended,
+            is_error: false,
+            result: Some(serde_json::json!({
+                "content": [{"type":"text","text":"a\nb\nc"}],
+                "structuredContent": {"output": "a\nb\nc", "exit_code": 2}
+            })),
+            duration_ms: Some(42),
+            ..Default::default()
+        };
+        for (name, args, expanded) in [
+            ("bash", r#"{"command":"echo hi"}"#, false),
+            ("bash", r#"{"command":"echo hi"}"#, true),
+            ("grep", r#"{"pattern":"p","path":"."}"#, false),
+            ("read", r#"{"path":"/x/y.rs","offset":2,"limit":3}"#, false),
+            ("mystery", r#"{"a":1}"#, true),
+        ] {
+            let lines = tool_lines_themed(name, args, &tool, expanded, &theme);
+            let m = tool_card_model(name, args, &tool, expanded, &theme);
+            let lines_text = render(&lines);
+            let model = model_text(&m);
+            assert_eq!(lines_text, model, "同语义等价: {name} expanded={expanded}");
+        }
     }
 
     #[test]

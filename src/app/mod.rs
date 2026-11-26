@@ -49,10 +49,10 @@ pub use crate::app::event::UiEvent;
 pub use crate::app::wrap::{GridLine, GridSeg};
 /// GPUI 条目渲染的偏好类型（additive 导出；chat 模块本身保持私有）。
 #[cfg(feature = "gpui-support")]
-pub(crate) use chat::RenderFlags;
-/// GPUI 工具卡结果正文抽取（与 TUI 同源，additive 导出）。
+pub(crate) use chat::{bash_entry_model, notice_model, thinking_seqs, thinking_visible};
+/// GPUI 工具卡中性模型与段类型（与 TUI 同源，additive 导出）。
 #[cfg(feature = "gpui-support")]
-pub(crate) use tools::result_text;
+pub(crate) use tools::{Seg, SegRole, tool_card_model};
 use crate::app::overlay::{overlay_key, Overlay, OverlayOutcome};
 use crate::app::terminal::{TerminalGuard, TerminalSinks};
 
@@ -1179,28 +1179,9 @@ impl App {
             return false;
         };
         match kind {
-            wrap::HitKind::Tool(id) => {
-                // 翻转相对当前生效值（覆盖优先、否则全局，design D1/D3）。
-                let effective = *self.user_tool_expanded.get(&id).unwrap_or(&self.expand_tools);
-                self.user_tool_expanded.insert(id.clone(), !effective);
-                self.log_event("key", &format!("tool card {id} expanded -> {}", !effective));
-                // 单卡覆盖只影响该条目 → 精确失效（design D4）。
-                self.layout_cache.invalidate_tool(&id);
-            }
-            wrap::HitKind::Thinking(seq) => {
-                // 单块相对生效值翻转（覆盖优先、否则全局，design D3）。
-                let effective = *self
-                    .thinking_overrides
-                    .get(&seq)
-                    .unwrap_or(&self.show_thinking);
-                self.thinking_overrides.insert(seq, !effective);
-                self.log_event(
-                    "key",
-                    &format!("thinking block {seq} expanded -> {}", !effective),
-                );
-                // 单块覆盖只影响该条目 → 精确失效（design D4）。
-                self.layout_cache.invalidate_thinking(seq);
-            }
+            // 共享切换入口（design D4/D1）：TUI 命中与 GPUI 卡片/块点击同源。
+            wrap::HitKind::Tool(id) => self.toggle_tool_expanded(&id),
+            wrap::HitKind::Thinking(seq) => self.toggle_thinking_block(seq),
             wrap::HitKind::MessageStart(_) => {
                 // 消息起点行点击无动作（add-prompt-jump design D5，
                 // 观察等价 pi 内容行点击；该 kind 不携带状态）。
@@ -1208,6 +1189,66 @@ impl App {
             }
         }
         true
+    }
+
+    /// 翻转单卡工具展开覆盖（TUI 命中分发与 GPUI 卡片点击共用，design D4/D1）。
+    ///
+    /// 功能: 按「覆盖优先、否则全局」的当前生效值取反写回覆盖表，记录 key
+    ///       日志并精确失效该卡布局缓存（单卡覆盖只影响该条目）；
+    /// 输入: id — toolCallId；
+    /// 输出: 无返回值；副作用 = 写 `user_tool_expanded`、
+    ///       `layout_cache.invalidate_tool(id)`。
+    pub(crate) fn toggle_tool_expanded(&mut self, id: &str) {
+        let effective = self.tool_expanded_effective(id);
+        self.user_tool_expanded.insert(id.to_string(), !effective);
+        self.log_event("key", &format!("tool card {id} expanded -> {}", !effective));
+        self.layout_cache.invalidate_tool(id);
+    }
+
+    /// 单卡生效展开态（覆盖优先、否则全局；TUI 点击分发与 GPUI 渲染共用）。
+    ///
+    /// 输入: id — toolCallId；
+    /// 输出: 是否展开（覆盖表命中取覆盖值，否则取全局 `expand_tools`）。
+    pub(crate) fn tool_expanded_effective(&self, id: &str) -> bool {
+        self.user_tool_expanded
+            .get(id)
+            .copied()
+            .unwrap_or(self.expand_tools)
+    }
+
+    /// 翻转 thinking 单块展开覆盖（TUI 命中分发与 GPUI 点击共用，design D3）。
+    ///
+    /// 功能: 单块相对生效值翻转写回覆盖表，记录 key 日志并精确失效该块
+    ///       布局缓存（单块覆盖只影响该条目）；
+    /// 输入: seq — thinking 块的全局渲染序号；
+    /// 输出: 无返回值；副作用 = 写 `thinking_overrides`、
+    ///       `layout_cache.invalidate_thinking(seq)`。
+    pub(crate) fn toggle_thinking_block(&mut self, seq: usize) {
+        let effective = *self
+            .thinking_overrides
+            .get(&seq)
+            .unwrap_or(&self.show_thinking);
+        self.thinking_overrides.insert(seq, !effective);
+        self.log_event(
+            "key",
+            &format!("thinking block {seq} expanded -> {}", !effective),
+        );
+        self.layout_cache.invalidate_thinking(seq);
+    }
+
+    /// thinking 单块渲染生效值（单块覆盖优先、否则全局；OR 规则与
+    /// chat.rs `append_blocks` 同源——全局展开时无视单块折叠覆盖）。
+    ///
+    /// 输入: seq — thinking 块的全局渲染序号；
+    /// 输出: 渲染态是否展开（`show_thinking || 覆盖值`，无覆盖跟全局）。
+    #[cfg(feature = "gpui-support")] // 仅 GPUI 前端入口；默认构建不引入死代码
+    pub(crate) fn thinking_expanded_effective(&self, seq: usize) -> bool {
+        self.show_thinking
+            || self
+                .thinking_overrides
+                .get(&seq)
+                .copied()
+                .unwrap_or(false)
     }
 
     /// 坐标 → 命中对象（design D4/D2）：`y=0` 是 header，聊天区行 = `y-1`；
@@ -2418,18 +2459,6 @@ impl App {
         }
     }
 
-    /// 渲染偏好（thinking/工具展开；GPUI 条目渲染读取，task 5.2）。
-    ///
-    /// 输入: 无（读 self 两个开关字段）；
-    /// 输出: 当前 [`RenderFlags`]（与 ratatui render_chat 同源构造）。
-    #[cfg(feature = "gpui-support")] // 仅 GPUI 前端入口；默认构建不引入死代码
-    pub(crate) fn render_flags(&self) -> RenderFlags {
-        RenderFlags {
-            show_thinking: self.show_thinking,
-            expand_tools: self.expand_tools,
-        }
-    }
-
     /// 状态行左段内容（GPUI 前端渲染入口，task 5.3）：与 ratatui
     /// `render_header` 同源的 `view::header_line` 装配 → 中性行 → 按列
     /// cell 截断（与 ratatui 视口裁剪同口径）；瞬时提示不入左段（由
@@ -2445,6 +2474,30 @@ impl App {
         let mut grid = wrap::GridLine::from(&line);
         wrap::truncate_grid_width(&mut grid, width as usize);
         grid
+    }
+
+    /// 队列条中性行（GPUI 前端渲染入口，task 3.2）：复用 `view::queue_lines`
+    /// 同源输出（`[queued]`/`[steer]`/`[queue]` 前缀、最多 2 行 + `… N more`）。
+    ///
+    /// 输入: 无（读会话 steering/follow_up 队列 + 本地 compact_queue）；
+    /// 输出: 中性屏行序列；空队列给空 vec（渲染端不占位）。
+    #[cfg(feature = "gpui-support")] // 仅 GPUI 前端入口；默认构建不引入死代码
+    pub(crate) fn queue_grid_lines(&self) -> Vec<wrap::GridLine> {
+        crate::app::view::queue_lines(&self.state, &self.compact_queue)
+            .iter()
+            .map(wrap::GridLine::from)
+            .collect()
+    }
+
+    /// extension widget 行（GPUI 渲染入口，task 3.3）：`setWidget` 写入的
+    /// 编辑器上方行（空 = 隐藏；null/缺失经 `handle_extension_request`
+    /// 清空，主规格 tui-app「setWidget 显示与清除」）。
+    ///
+    /// 输入: 无（读 self.widget_lines）；
+    /// 输出: 行切片（空 = 渲染端不占位）。
+    #[cfg(feature = "gpui-support")] // 仅 GPUI 前端入口；默认构建不引入死代码
+    pub(crate) fn widget_lines(&self) -> &[String] {
+        &self.widget_lines
     }
 
     /// 处理一个按键：先做纯意图映射，再应用状态，最后按需走命令通道。

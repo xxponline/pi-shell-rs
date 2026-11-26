@@ -251,7 +251,22 @@ PI_GPUI_RENDER_PROBE=1 cargo run --bin pi-shell-gpui --features gpui-support
   内建光标/撤销），状态行 = 内建 status_bar（phase/model/用量 + 提示右段）。
 - 全局键位与 TUI 语义一致：enter 提交（流式带 `steeringBehavior:"steer"`）、
   alt+enter 排队、esc 流式中断/空闲无操作、ctrl+c 清空；shift+enter 换行；
+  **ctrl+t / ctrl+o 切换 thinking / 工具卡全局展开**（与 `key_intent` 同源
+  经三区路由进共享分发，不落入输入框，切换时同 TUI 清单块/单卡覆盖）；
   编辑键（撤销 cmd-z/ctrl-z、kill、词移等）由内建编辑器自理，不逐键对齐 TUI。
+- 卡片/通知/bash/thinking 语义与 TUI 同源（`align-gpui-card-rendering`）：
+  消息区条目全部消费共享中性模型——工具卡（头行参数/折叠策略/计时/红绿
+  diff runs/受保护尾部，面板底色三态）、thinking（空块不占行、折叠
+  `<thinking N chars>` 占位、单块点击切换）、通知（`[kind]` 前缀 + 粗/斜/色）、
+  bash 条目（**运行中尾槽** `$ cmd` + 实时输出 + `⟳ 运行中…（esc 中止）`，
+  落条目后收敛为尾部 500 行截断 + `…（已截断 N 行）` + `exit` 状态行；
+  命令行黄粗与 TUI 同，浅底用暗黄适配）；
+  **仅已有结果的卡/thinking 块点击翻转共享覆盖表**（运行中卡点击无效），
+  运行中工具每 1s 自动重绘 `Elapsed` 走字（结束即停）。
+- 消息区与输入区之间两条可选带（空则不占位）：**队列条**（复用
+  `view::queue_lines`：`[steer]`/`[queue]` 前缀、最多 2 行 + `… N more`）与
+  **扩展 widget 面板**（` widget ` 标题上边框、青色文字；`setWidget` 数据
+  写入即显、`widgetLines` 为 null 清除）。
 - 悬浮层/选择器（`add-gpui-overlays`）：14 个变体从共享 `App.overlay`
   直绘（全窗遮罩 + 居中面板，样式取主题 token）；浮层打开时全部按键进
   共享分发（esc 关闭 / enter 应用 / ↑↓ 导航，Tree 搜索中 esc 先清查询，

@@ -12,9 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 #[cfg(test)]
 use std::sync::mpsc::Receiver;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use gpui_kit::base::TestTextExt;
+use gpui_kit::base::{Collapsible, TestTextExt};
 use gpui_kit::component::input::{InputEvent, Position, Textarea, TextareaState};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::status_bar::StatusBar;
@@ -24,7 +24,10 @@ use gpui_kit::prelude::FluentBuilder as _; // 容器链上条件边框用 `.map`
 use ratatui::style::{Color, Modifier, Style};
 
 use crate::app::theme::TuiTheme;
-use crate::app::{App as AppState, GridLine, RenderFlags, UiEvent};
+use crate::app::{
+    App as AppState, GridLine, Seg, SegRole, UiEvent, bash_entry_model, notice_model,
+    thinking_seqs, thinking_visible, tool_card_model,
+};
 use crate::gpui_agent::actor::RpcSession;
 use crate::gpui_agent::input::keystroke_to_keyevents;
 use crate::rpc::{ClientEvent, CommandSender};
@@ -65,13 +68,9 @@ mod palette {
     pub(super) const COMP_COUNT_TEXT: Rgba = hex(0x707070);
     /// "You:" 标签。
     pub(super) const USER_LABEL: Rgba = hex(0x2f7fe0);
-    /// thinking 展开正文。
+    /// thinking 正文/占位（弱化斜体；占位与展开同角色，≡ TUI 单一样式）。
     pub(super) const THINKING_TEXT: Rgba = hex(0x666666);
-    /// thinking 折叠占位（弱化斜体）。
-    pub(super) const THINKING_PLACEHOLDER: Rgba = hex(0x6f6f6f);
-    /// bash 命令行。
-    pub(super) const BASH_HEAD: Rgba = hex(0x2f7f77);
-    /// bash 输出摘要。
+    /// bash 输出摘要（弱化正文）。
     pub(super) const BASH_BODY: Rgba = hex(0x606060);
     /// 通知：错误。
     pub(super) const NOTICE_ERROR: Rgba = hex(0xc62828);
@@ -79,10 +78,38 @@ mod palette {
     pub(super) const NOTICE_RETRY: Rgba = hex(0x946200);
     /// 通知：普通（弱化）。
     pub(super) const NOTICE_DEFAULT: Rgba = hex(0x666666);
+    /// bash 命令行（浅底深黄粗体，对齐 TUI 黄粗语义）。
+    pub(super) const BASH_CMD: Rgba = hex(0x8a6d00);
+    /// bash 运行中/取消/truncated 提示（浅底琥珀）。
+    pub(super) const WARN: Rgba = hex(0x946200);
+    /// bash `exit 0`（浅底深绿）。
+    pub(super) const EXIT_OK: Rgba = hex(0x1b7f2e);
+    /// bash `exit N`（N≠0，浅底深红粗体）。
+    pub(super) const EXIT_BAD: Rgba = hex(0xb71c1c);
 
     // —— 深色工具卡（底色来自 TuiTheme = pi dark）上的浅字 ——
     /// 工具卡结果预览（卡底为深色，保持浅字）。
     pub(super) const TOOL_PREVIEW_TEXT: Rgba = hex(0x9a9a9a);
+    /// 工具卡状态：运行中（深底亮琥珀，提亮保可读）。
+    pub(super) const CARD_STATUS_RUN: Rgba = hex(0xe6c14a);
+    /// 工具卡状态：成功（深底亮绿）。
+    pub(super) const CARD_STATUS_OK: Rgba = hex(0x7fd07f);
+    /// 工具卡状态：失败（深底亮红）。
+    pub(super) const CARD_STATUS_ERR: Rgba = hex(0xe07575);
+    /// 工具卡头行参数/正文（深底浅字）。
+    pub(super) const CARD_TEXT: Rgba = hex(0xd8d8d8);
+    /// 工具卡计时/折叠提示（深底灰字）。
+    pub(super) const CARD_DIM: Rgba = hex(0x9a9a9a);
+    /// 工具卡 `Fg` 段的 ANSI 红提亮（diff 删除行等，深底可读）。
+    pub(super) const CARD_FG_RED: Rgba = hex(0xe07575);
+    /// 工具卡 `Fg` 段的 ANSI 绿提亮（diff 新增行等）。
+    pub(super) const CARD_FG_GREEN: Rgba = hex(0x7fd07f);
+    /// 工具卡 `Fg` 段的 ANSI 黄提亮（截断警告等）。
+    pub(super) const CARD_FG_YELLOW: Rgba = hex(0xe6c14a);
+    /// 工具卡 `Fg` 段的 ANSI 青提亮（diff hunk 头等）。
+    pub(super) const CARD_FG_CYAN: Rgba = hex(0x6ec6c6);
+    /// 工具卡 `Fg` 段的 ANSI 暗灰提亮（深底可读）。
+    pub(super) const CARD_FG_GRAY: Rgba = hex(0x9a9a9a);
 }
 
 
@@ -138,6 +165,10 @@ pub struct GPUIAgentTerminal {
     /// 归约泵任务（仅生产态；测试态不装——见归约泵处注释）。
     #[cfg(not(test))]
     _reduce_task: Task<()>,
+    /// 计时走字任务（task 4.2）：存在运行中工具期间每 1s notify 重绘
+    /// （`Elapsed …` 走字）；渲染点按 `has_running_tool` 对账起停（Drop
+    /// 即取消），weak 实体升级失败自行退出。
+    timer_task: Option<Task<()>>,
 }
 
 /// 组件侧归约状态：`App`（内含唯一 `SessionState`）+ 连接标志（与渲染解耦，可离线回放测试）。
@@ -393,6 +424,7 @@ impl GPUIAgentTerminal {
             _focus_out_sub: focus_out_sub,
             #[cfg(not(test))]
             _reduce_task: reduce_task,
+            timer_task: None,
         }
     }
 
@@ -495,6 +527,32 @@ impl GPUIAgentTerminal {
         }
     }
 
+    /// 计时走字任务对账（task 4.2）：有运行中工具且无任务 → 起 1s interval
+    /// （每 tick notify 重绘，实体销毁即退）；无运行中工具且有任务 → Drop
+    /// 取消——与 ratatui `timer_redraw_due` 同门控（仅 Running 走字）。
+    ///
+    /// 输入: cx — 实体上下文（spawn/Drop 通道）；
+    /// 输出: 无返回值；副作用为起/停 `timer_task`（仅渲染点调用，
+    ///       归约泵不直接碰任务，防 notify 自旋）。
+    fn sync_timer_task(&mut self, cx: &mut Context<Self>) {
+        let running = self.state.session().has_running_tool();
+        if running && self.timer_task.is_none() {
+            self.timer_task = Some(cx.spawn(async move |this, cx: &mut AsyncApp| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_secs(1))
+                        .await;
+                    // weak 升级失败（实体已销毁）→ 退出；否则 notify 走字。
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            }));
+        } else if !running && self.timer_task.is_some() {
+            self.timer_task = None; // Drop 即取消后续 tick
+        }
+    }
+
     /// 虚拟滚动对账（task 5.2；渲染点与归约泵共用）。
     ///
     /// 功能: 条目数增长 → 尾部 `append`（保持回看锚点）；收缩/整体替换 →
@@ -519,14 +577,15 @@ impl GPUIAgentTerminal {
         });
     }
 
-    /// 滚动行数 = 已落条目 + 流式 in-flight 尾块（task 5.2：流式中的
-    /// assistant/thinking/工具调用也要有行，flush 后并入条目、行数自然收敛）。
+    /// 滚动行数 = 已落条目 + 流式 in-flight 尾块 + 运行中 bash 尾槽
+    /// （task 5.2 + 冒烟 B2：流式块与 `!cmd` 运行期都要有行，flush/落条目
+    /// 后行数自然收敛）。
     ///
     /// 输入: 无（读会话状态）；
-    /// 输出: 虚拟列表应有行数。
+    /// 输出: 虚拟列表应有行数（bash 尾槽占一个易失项）。
     fn scroller_rows(&self) -> usize {
         let session = self.state.session();
-        session.entries().len() + session.in_flight().len()
+        session.entries().len() + session.in_flight().len() + usize::from(session.bash_running)
     }
 
     /// 应用一条回报事件（回报泵的任务体入口，task 6.2）。
@@ -614,6 +673,11 @@ pub(crate) fn route_keystroke(overlay_open: bool, completion_open: bool, ks: &Ke
         // alt+t → thinking（不门控菜单状态，与 TUI 意图分发同层）。
         "l" if ks.modifiers.control && !ks.modifiers.shift => true,
         "t" if ks.modifiers.alt => true,
+        // 全局折叠开关（task 4.1）：镜像 `app::key_intent` —— ctrl+t →
+        // thinking 全局展开、ctrl+o → 工具卡全局展开（两者均无 shift 门，
+        // 与 key_intent 同），不落入 Textarea。
+        "t" if ks.modifiers.control => true,
+        "o" if ks.modifiers.control => true,
         "up" | "down" | "pageup" | "pagedown" | "tab" if completion_open => true,
         _ => false,
     };
@@ -634,6 +698,8 @@ impl Render for GPUIAgentTerminal {
         // 虚拟滚动行数对账（task 5.2；渲染点只对行数，归约泵才重测行高，
         // 防 notify 自旋）。
         self.sync_scroller(cx, false);
+        // 计时走字对账（task 4.2）：Running 起 1s interval、结束即停。
+        self.sync_timer_task(cx);
         let (cell_w, line_h) = grid_metrics(window);
         let line_h_px = f32::from(line_h);
         let viewport = window.viewport_size();
@@ -648,6 +714,20 @@ impl Render for GPUIAgentTerminal {
                 .child(text.clone())
         });
         // 消息区（task 5.2）：内建虚拟滚动承载条目，行渲染按索引回调。
+        // thinking 全局序号前缀（共享规则 `thinking_seqs`：空块也消耗、
+        // 跨条目穿透；每帧一次前缀扫描，行回调 O(1) 取基值，design D2）。
+        let session = self.state.session();
+        let entries = session.entries();
+        let mut seq_bases = Vec::with_capacity(entries.len() + 1);
+        let mut cursor = 0usize;
+        for entry in entries {
+            seq_bases.push(cursor);
+            if let Entry::Assistant { blocks, .. } = entry {
+                cursor = thinking_seqs(blocks, cursor).1;
+            }
+        }
+        seq_bases.push(cursor); // 流式尾块基值 = 全部条目出口
+        let in_flight_seqs = thinking_seqs(session.in_flight(), cursor).0;
         let this = cx.weak_entity();
         let scroller_el = MessageScroller::new(
             "gpui-msgs",
@@ -659,13 +739,35 @@ impl Render for GPUIAgentTerminal {
                 };
                 let term = entity.read(cx);
                 let session = term.state.session();
-                let flags = term.state.app.render_flags();
+                // 条目渲染上下文（task 2.2）：共享覆盖表生效值查询 +
+                // 点击回路弱引用（元素只持有 owned 数据，构造完即还）。
+                let ctx = EntryCtx {
+                    app: &term.state.app,
+                    this: this.clone(),
+                };
                 let entries = session.entries();
                 if let Some(entry) = entries.get(index) {
-                    entry_element(entry, index, flags)
+                    entry_element(entry, index, &ctx, seq_bases[index])
                 } else if let Some(block) = session.in_flight().get(index - entries.len()) {
                     // 流式尾块（未 message_end）：与条目同样式逐块渲染。
-                    assistant_block(block, index, index - entries.len(), flags)
+                    let seq = in_flight_seqs.get(index - entries.len()).copied().flatten();
+                    assistant_block(block, index, index - entries.len(), &ctx, seq)
+                } else if session.bash_running
+                    && index == entries.len() + session.in_flight().len()
+                {
+                    // 运行中 bash 尾槽（TUI layout_bash_tail 同源：共享
+                    // bash_entry_model(live)——命令行 + 实时输出 + 运行状态行）。
+                    bash_row(
+                        &session.bash_command,
+                        &session.bash_output,
+                        None,
+                        false,
+                        false,
+                        None,
+                        session.bash_excluded,
+                        true,
+                        index,
+                    )
                 } else {
                     empty
                 }
@@ -731,6 +833,57 @@ impl Render for GPUIAgentTerminal {
             }
         }
         let family = grid_font_family(window);
+        // 队列条（task 3.2）：消息区与输入区之间；空队列不占位（复用
+        // view::queue_lines 同源输出：前缀行 + 超 2 行 `… N more`）。
+        let queue_el = {
+            let queue_rows = self.state.app.queue_grid_lines();
+            if queue_rows.is_empty() {
+                None
+            } else {
+                let mut strip = div().id("gpui-queue").flex().flex_col().px_2();
+                for (i, row) in queue_rows.iter().enumerate() {
+                    strip = strip.child(
+                        grid_row_with_id(format!("gpui-queue-{i}"), row, line_h_px, &family)
+                            .test_text(grid_row_text(row)),
+                    );
+                }
+                Some(strip)
+            }
+        };
+        // extension widget 面板（task 3.3）：` widget ` 标题边框 + 青色文字；
+        // 数据经 RPC setWidget → handle_extension_request 写入（null → 清空），
+        // 未设置/已清除不占位（spec: extension widget 面板）。
+        let widget_el = {
+            let lines = self.state.app.widget_lines();
+            if lines.is_empty() {
+                None
+            } else {
+                let cyan = to_hsla(Color::Cyan);
+                let mut panel = div()
+                    .id("gpui-widget")
+                    .flex()
+                    .flex_col()
+                    .border_t_1()
+                    .border_color(cyan)
+                    .child(
+                        div()
+                            .px_2()
+                            .text_color(cyan)
+                            .test_text(" widget ".to_string())
+                            .child(" widget "),
+                    );
+                for line in lines {
+                    panel = panel.child(
+                        div()
+                            .px_2()
+                            .text_color(cyan)
+                            .test_text(line.clone())
+                            .child(line.clone()),
+                    );
+                }
+                Some(panel)
+            }
+        };
         let root = div()
             .size_full()
             .relative() // 浮层绝对定位的锚（task 3.2）
@@ -748,6 +901,14 @@ impl Render for GPUIAgentTerminal {
                     .test_support()
                     .child(div().size_full().child(scroller_el)),
             )
+            .map(|b| match queue_el {
+                Some(strip) => b.child(strip),
+                None => b,
+            })
+            .map(|b| match widget_el {
+                Some(panel) => b.child(panel),
+                None => b,
+            })
             .child(
                 // 状态行（task 5.3）：内建 status_bar 分段——左 = header_line
                 // 同源数据（phase/会话名/thinking/model/用量/费用/状态文本），
@@ -1070,14 +1231,29 @@ fn grid_row_text(line: &GridLine) -> String {
     line.segs.iter().map(|s| s.text.as_str()).collect()
 }
 
+/// 条目渲染上下文（task 2.2）：共享覆盖表查询 + 点击回路。
+///
+/// 功能: 把 `App` 的覆盖表生效值查询（含全局开关与两张覆盖表的共享
+///       生效规则）与组件弱引用一并带入条目/块/卡片渲染（design D1
+///       单一事实源——`render_flags()` 接线由 `&App` 承接，补传覆盖表）；
+/// 输入: 构造于 MessageScroller 行回调，仅在元素构造期间借用；
+/// 输出: 条目元素；其中点击闭包捕获 `this` 弱引用（'static，
+///       实体已销毁时静默放弃点击）。
+struct EntryCtx<'a> {
+    /// 共享 App 状态（全局开关 + 覆盖表生效值查询；仅渲染期借用，不进元素树）。
+    app: &'a AppState,
+    /// 组件弱引用（点击切换覆盖表后 notify 重绘）。
+    this: WeakEntity<GPUIAgentTerminal>,
+}
+
 /// 会话条目 → 内建元素（task 5.2：条目级渲染，虚拟滚动逐行回调）。
 ///
 /// 输入: entry — 会话条目；index — 条目序号（元素 id 稳定性）；
-///       flags — 渲染偏好（thinking 展开态）；
+///       ctx — 条目渲染上下文（渲染偏好/覆盖表查询/点击回路）；
+///       seq_base — 本条目的 thinking 全局序号基值（前缀扫描出口）；
 /// 输出: 条目行元素（User 标签+markdown / Assistant 分块 / Notice 色条 /
 ///       Bash 命令+输出摘要；未知内容不 panic）。
-fn entry_element(entry: &Entry, index: usize, flags: RenderFlags) -> Div {
-    let _ = index; // 元素 id 已去（Stateful 类型不齐）；序号仍保留在签名供后续稳定 id 恢复
+fn entry_element(entry: &Entry, index: usize, ctx: &EntryCtx, seq_base: usize) -> Div {
     match entry {
         Entry::User { text } => div()
             .flex()
@@ -1098,9 +1274,11 @@ fn entry_element(entry: &Entry, index: usize, flags: RenderFlags) -> Div {
                     .child(TextView::markdown(format!("md-u-{index}"), text.clone())),
             ),
         Entry::Assistant { blocks, .. } => {
+            // thinking 全局序号（共享规则：空块也占号，design D2）。
+            let (seqs, _) = thinking_seqs(blocks, seq_base);
             let mut col = div().flex().flex_col().px_2().py_1();
             for (bi, block) in blocks.iter().enumerate() {
-                col = col.child(assistant_block(block, index, bi, flags));
+                col = col.child(assistant_block(block, index, bi, ctx, seqs[bi]));
             }
             col
         }
@@ -1109,16 +1287,38 @@ fn entry_element(entry: &Entry, index: usize, flags: RenderFlags) -> Div {
             command,
             output,
             exit_code,
-            ..
-        } => bash_row(command, output, *exit_code, index),
+            cancelled,
+            truncated,
+            full_output_path,
+            excluded,
+        } => bash_row(
+            command,
+            output,
+            *exit_code,
+            *cancelled,
+            *truncated,
+            full_output_path.as_deref(),
+            *excluded,
+            false, // 完成条目（非运行中尾槽）
+            index,
+        ),
     }
 }
 
 /// assistant 块 → 元素（markdown / thinking 折叠 / 工具卡）。
 ///
-/// 输入: block — 内容块；index/bi — 条目与块序号（元素 id）；flags — 渲染偏好；
+/// 输入: block — 内容块；index/bi — 条目与块序号（元素 id）；
+///       ctx — 条目渲染上下文（渲染偏好 + 覆盖表 + 点击回路）；
+///       thinking_seq — thinking 全局序号（`thinking_seqs` 分配；
+///       非 Thinking 块为 None，Thinking 块必为 Some）；
 /// 输出: 块元素（空文本块给零高占位）。
-fn assistant_block(block: &Block, index: usize, bi: usize, flags: RenderFlags) -> Div {
+fn assistant_block(
+    block: &Block,
+    index: usize,
+    bi: usize,
+    ctx: &EntryCtx,
+    thinking_seq: Option<usize>,
+) -> Div {
     let _ = (index, bi);
     match block {
         Block::Text { text } if !text.is_empty() => div().w_full().child(
@@ -1128,147 +1328,276 @@ fn assistant_block(block: &Block, index: usize, bi: usize, flags: RenderFlags) -
         ),
         Block::Text { .. } => div(),
         Block::Thinking { text } => {
-            if flags.show_thinking {
-                div()
-                    .w_full()
-                    .text_color(palette::THINKING_TEXT)
-                    .child(div().test_text(text.clone()).child(text.clone()))
-            } else {
-                let placeholder = format!("<thinking {} chars>", text.chars().count());
-                div()
-                .text_color(palette::THINKING_PLACEHOLDER)
-                    .italic()
-                    .child(div().test_text(placeholder.clone()).child(placeholder))
-            }
+            thinking_block(text, ctx, thinking_seq.expect("Thinking 块必有序号"))
         }
         Block::ToolCall {
+            id,
             name,
-            args_json: _,
+            args_json,
             tool,
-            ..
-        } => tool_card(name, tool, index, bi),
+        } => tool_card(id, name, args_json, tool, ctx, index, bi),
     }
 }
 
-/// 工具卡（read/bash/edit/通用同构：状态面板 + 结果首行折叠预览）。
+/// thinking 块 → 元素（空块零占位、占位/正文经共享模型、点击单块切换；
+/// design D1/D3，spec「thinking 块语义对齐」）。
 ///
-/// 输入: name — 工具名；tool — 执行状态/结果；index/bi — 元素 id 序号；
-/// 输出: 卡片元素（面板底色随状态：运行灰/失败暗红/成功墨绿）。
-fn tool_card(name: &str, tool: &ToolExecution, index: usize, bi: usize) -> Div {
+/// 输入: text — thinking 正文；ctx — 条目渲染上下文；seq — 全局渲染序号
+///       （`thinking_seqs` 分配，空块也占号）；
+/// 输出: 块元素——空块给零高 `div()`（不占行，折叠态也不显占位）；非空块
+///       经共享 [`thinking_visible`] 得占位/正文行，带 id 与点击监听
+///       （仅非空块可点；点击翻转该块覆盖表，不碰全局与它块）。
+fn thinking_block(text: &str, ctx: &EntryCtx, seq: usize) -> Div {
+    // 生效值：单块覆盖优先、否则全局（与 chat.rs append_blocks 同构）。
+    let expanded = ctx.app.thinking_expanded_effective(seq);
+    // 语义在 thinking_visible（空块 → None 不占行，design D1）。
+    let Some(rows) = thinking_visible(text, expanded) else {
+        return div();
+    };
+    let this = ctx.this.clone();
+    let block = div()
+        .id(format!("thinking-{seq}"))
+        .w_full()
+        .on_click(move |_, _, cx| {
+            let Some(entity) = this.upgrade() else {
+                return;
+            };
+            entity.update(cx, |term, cx| {
+                term.state.app.toggle_thinking_block(seq);
+                cx.notify();
+            });
+        });
+    let mut block = block.test_support();
+    for row in &rows {
+        block = block.child(segs_row(row));
+    }
+    // 观测/点击壳外套一层普通容器保持 Div 返回类型（同 tool_card）。
+    div().flex().flex_col().child(block)
+}
+
+/// 工具卡（消费中性模型 `tool_card_model`：头行 + 折叠/展开体 + 提示行 +
+/// 受保护尾部；面板底色随状态三态，design D1）。
+///
+/// 输入: id — toolCallId（元素 id 与单卡覆盖键）；name — 工具名；
+///       args_json — 调用参数原文；tool — 执行状态；
+///       ctx — 条目渲染上下文（生效展开态查询 + 点击回路）；
+///       index/bi — 元素 id 序号；
+/// 输出: 卡片元素（行内着色由段角色 → palette 映射；仅 `result.is_some()`
+///       的卡挂点击监听——与 TUI 命中门控同源，design D2/D4）。
+fn tool_card(
+    id: &str,
+    name: &str,
+    args_json: &str,
+    tool: &ToolExecution,
+    ctx: &EntryCtx,
+    index: usize,
+    bi: usize,
+) -> Div {
     let _ = (index, bi);
     let theme = TuiTheme::default();
-    let (panel, status, fg) = match &tool.status {
-        ToolStatus::Pending => (theme.tool_running_bg, "pending", Color::Yellow),
-        ToolStatus::Running => (theme.tool_running_bg, "running", Color::Yellow),
-        ToolStatus::Ended if tool.is_error => (theme.tool_error_bg, "error", Color::Red),
-        ToolStatus::Ended => (theme.tool_success_bg, "done", Color::Green),
+    // 单卡生效展开态来自共享覆盖表（task 2.2：与 ratatui 同一事实源）。
+    let expanded = ctx.app.tool_expanded_effective(id);
+    let model = tool_card_model(name, args_json, tool, expanded, &theme);
+    let panel = match &tool.status {
+        ToolStatus::Pending | ToolStatus::Running => theme.tool_running_bg,
+        ToolStatus::Ended if tool.is_error => theme.tool_error_bg,
+        ToolStatus::Ended => theme.tool_success_bg,
     };
-    let head = format!("● {name} · {status}");
-    let preview = tool_preview(tool);
     let mut card = div()
+        .id(format!("tool-card-{id}"))
         .flex()
         .flex_col()
         .px_2()
         .py_1()
-        .bg(to_hsla(panel))
-        .child(
-            div()
-                .text_color(to_hsla(fg))
-                .test_text(head.clone())
-                .child(head),
-        );
-    if !preview.is_empty() {
-        card = card.child(
-            div()
-                .text_xs()
-                .text_color(palette::TOOL_PREVIEW_TEXT)
-                .test_text(preview.clone())
-                .child(preview),
-        );
+        .bg(to_hsla(panel));
+    // 点击切换单卡覆盖：仅已有最终结果的卡响应（与 TUI 命中门控同源）。
+    if tool.result.is_some() {
+        let this = ctx.this.clone();
+        let tool_id = id.to_string();
+        card = card.on_click(move |_, _, cx| {
+            let Some(entity) = this.upgrade() else {
+                return;
+            };
+            entity.update(cx, |term, cx| {
+                term.state.app.toggle_tool_expanded(&tool_id);
+                cx.notify();
+            });
+        });
     }
-    card
+    let mut card = card.test_support();
+    // 头行（状态相关，恒显）。
+    card = card.child(segs_row(&model.head));
+    // 折叠面（预览 + 提示行）仅折叠态作为常显子节点；展开面正文经内建
+    // Collapsible 挂载（open=生效态：不打开即不挂载、不占位，design D2）。
+    card = card.when(!expanded, |c| {
+        let mut c = c.child(segs_col(&model.body));
+        if let Some(hint) = &model.hint {
+            c = c.child(segs_row(std::slice::from_ref(hint)));
+        }
+        c
+    });
+    card = card.child(
+        Collapsible::new()
+            .open(expanded)
+            .content(segs_col(&model.body)),
+    );
+    // 受保护尾部（exit 状态行/截断警告）恒显。
+    for row in &model.tail {
+        card = card.child(segs_row(row));
+    }
+    // 观测/点击壳外再套一层普通容器以保持 Div 返回类型；flex_col 维持
+    // 卡片整行拉伸（与直接挂在条目列同宽，布局无损）。
+    div().flex().flex_col().child(card)
 }
 
-/// 工具结果首行预览（折叠态；与 TUI 同源抽取 `tools::result_text`）。
+/// 中性段行 → 内建文本行（GPUI 侧适配：逐段 runs 着色/字重，design D1）。
 ///
-/// 输入: tool — 执行结果（result 缺回落 partial）；
-/// 输出: 首行文本（多行时追加 `…`）；无内容返回空串。
-fn tool_preview(tool: &ToolExecution) -> String {
-    let text = crate::app::result_text(tool).unwrap_or_default();
-    let mut lines = text.lines();
-    let first = lines.next().unwrap_or("").to_string();
-    if lines.next().is_some() {
-        format!("{first}\n…")
-    } else {
-        first
+/// 输入: segs — 单行语义段（头行/正文行/提示行/尾部行）
+/// 输出: 行元素（空行以单个空格保行高；test_text 记录整行文本供快照断言）
+fn segs_row(segs: &[Seg]) -> Div {
+    let full: String = segs.iter().map(|s| s.text.as_str()).collect();
+    let mut text = String::new();
+    let mut runs: Vec<TextRun> = Vec::new();
+    for seg in segs {
+        if seg.text.is_empty() {
+            continue;
+        }
+        let start = text.len();
+        text.push_str(&seg.text);
+        let (color, weight, style) = seg_visual(seg.role);
+        runs.push(TextRun {
+            len: text.len() - start,
+            font: Font {
+                weight,
+                style,
+                ..Font::default()
+            },
+            color,
+            ..Default::default()
+        });
+    }
+    if text.is_empty() {
+        text.push(' '); // 空行保行高（正文空行占位）
+    }
+    let mut styled = StyledText::new(text);
+    if !runs.is_empty() {
+        styled = styled.with_runs(runs);
+    }
+    div().child(div().test_text(full).child(styled))
+}
+
+/// 中性段行序列 → 垂直列元素（卡片正文/预览多行装配，design D1）。
+///
+/// 输入: rows — 行段序列（模型 body 面：展开全文或折叠预览）；
+/// 输出: flex_col 容器（逐行 [`segs_row`]；空序列给空列）。
+fn segs_col(rows: &[Vec<Seg>]) -> Div {
+    let mut col = div().flex().flex_col();
+    for row in rows {
+        col = col.child(segs_row(row));
+    }
+    col
+}
+
+/// 段角色 → (颜色, 字重, 字形)：palette 收拢的纯视图映射（design D1）。
+///
+/// 输入: role — 中性段角色（卡片角色面向深底面板，通知/bash/thinking
+///       角色面向浅底消息区）
+/// 输出: 三元组（GPUI 前景色、字重、字形）
+fn seg_visual(role: SegRole) -> (Hsla, FontWeight, FontStyle) {
+    let regular = FontWeight::default();
+    let normal = FontStyle::default();
+    let bold = FontWeight::BOLD;
+    let italic = FontStyle::Italic;
+    match role {
+        // —— 工具卡（深底面板）——
+        SegRole::StatusRun => (palette::CARD_STATUS_RUN.into(), regular, normal),
+        SegRole::StatusOk => (palette::CARD_STATUS_OK.into(), regular, normal),
+        SegRole::StatusErr => (palette::CARD_STATUS_ERR.into(), regular, normal),
+        SegRole::Name => (palette::CARD_TEXT.into(), bold, normal),
+        SegRole::Arg => (palette::CARD_TEXT.into(), regular, normal),
+        SegRole::Timer | SegRole::Hint => (palette::CARD_DIM.into(), regular, normal),
+        SegRole::Body => (palette::TOOL_PREVIEW_TEXT.into(), regular, normal),
+        SegRole::Fg(c) => (fg_on_card(c), regular, normal),
+        // —— 消息区（浅底）——
+        SegRole::NoticeError => (palette::NOTICE_ERROR.into(), bold, normal),
+        SegRole::NoticeRetry => (palette::NOTICE_RETRY.into(), regular, normal),
+        SegRole::Notice => (palette::NOTICE_DEFAULT.into(), regular, italic),
+        SegRole::ThinkingText => (palette::THINKING_TEXT.into(), regular, italic),
+        SegRole::Cmd => (palette::BASH_CMD.into(), bold, normal),
+        SegRole::Warn => (palette::WARN.into(), regular, normal),
+        SegRole::ExitOk => (palette::EXIT_OK.into(), regular, normal),
+        SegRole::ExitBad => (palette::EXIT_BAD.into(), bold, normal),
+        SegRole::Dim => (palette::BASH_BODY.into(), regular, normal),
     }
 }
 
-/// 通知行（error 红 / retry 黄 / 其余弱化——对齐 TUI notice_line 语义）。
+/// `Fg` 段在深底卡片上的颜色：ANSI 命名色提亮（深底可读），
+/// Rgb 主题色（语法高亮等）原样透传。
 ///
-/// 输入: kind — 通知类别；text — 通知正文；index — 元素 id 序号；
-/// 输出: 色条行元素。
+/// 输入: c — 段携带的 ratatui 前景色
+/// 输出: 提亮/透传后的 Hsla
+fn fg_on_card(c: Color) -> Hsla {
+    match c {
+        Color::Red => palette::CARD_FG_RED.into(),
+        Color::Green => palette::CARD_FG_GREEN.into(),
+        Color::Yellow => palette::CARD_FG_YELLOW.into(),
+        Color::Cyan => palette::CARD_FG_CYAN.into(),
+        Color::DarkGray => palette::CARD_FG_GRAY.into(),
+        other => to_hsla(other),
+    }
+}
+
+/// 通知行（消费共享 `notice_model`：`[kind]` 前缀并入文本，色/粗/斜由段
+/// 角色 → palette 映射——对齐 TUI notice_line 语义，design D1）。
+///
+/// 输入: kind — 通知类别（"error"/"retry"/其它）；text — 通知正文；
+///       index — 元素 id 序号；
+/// 输出: 色条行元素（`[kind] text` 单段；test_text 记录整行）。
 fn notice_row(kind: &str, text: &str, index: usize) -> Div {
     let _ = index;
-    let fg = match kind {
-        "error" => palette::NOTICE_ERROR,
-        "retry" => palette::NOTICE_RETRY,
-        _ => palette::NOTICE_DEFAULT,
-    };
     div()
         .px_2()
         .py_1()
-        .text_color(fg)
-        .child(div().test_text(text.to_string()).child(text.to_string()))
+        .child(segs_row(&notice_model(kind, text)))
 }
 
-/// bash 条目（命令行 + 输出摘要，前 5 行 + `…`）。
+/// bash 条目（消费共享 `bash_entry_model`：命令行 + 尾部 500 行截断 +
+/// 状态行——与 TUI `append_bash` 同源薄适配，design D1）。
 ///
-/// 输入: command/output/exit_code — bash 条目字段；index — 元素 id 序号；
-/// 输出: 行元素。
-fn bash_row(command: &str, output: &str, exit_code: Option<i64>, index: usize) -> Div {
+/// 输入: command/output — 命令与输出；exit_code/cancelled/truncated/
+///       full_output_path — 结果态；excluded — `!!` 不进上下文；
+///       live — 运行中尾槽（状态行为 `⟳ 运行中…`，结果字段传 None/false）；
+///       index — 元素 id 序号；
+/// 输出: 行元素（逐行 [`segs_row`]；完成条目 live=false、运行中尾槽
+///       live=true——语义都在共享 `bash_entry_model`，design D1）。
+#[allow(clippy::too_many_arguments)]
+fn bash_row(
+    command: &str,
+    output: &str,
+    exit_code: Option<i64>,
+    cancelled: bool,
+    truncated: bool,
+    full_output_path: Option<&str>,
+    excluded: bool,
+    live: bool,
+    index: usize,
+) -> Div {
     let _ = index;
-    let mut head = format!("$ {command}");
-    if let Some(code) = exit_code {
-        head.push_str(&format!("  (exit {code})"));
-    }
-    let body = first_lines(output, 5);
-    let mut row = div()
-        .flex()
-        .flex_col()
-        .px_2()
-        .py_1()
-        .child(
-            div()
-                .text_sm()
-                .text_color(palette::BASH_HEAD)
-                .test_text(head.clone())
-                .child(head),
-        );
-    if !body.is_empty() {
-        row = row.child(
-            div()
-                .text_xs()
-                .text_color(palette::BASH_BODY)
-                .test_text(body.clone())
-                .child(body),
-        );
+    let mut row = div().flex().flex_col().px_2().py_1();
+    // 语义在 bash_entry_model（尾部截断/状态行/不进上下文标记，design D1）。
+    for segs in bash_entry_model(
+        command,
+        output,
+        exit_code,
+        cancelled,
+        truncated,
+        full_output_path,
+        excluded,
+        live,
+    ) {
+        row = row.child(segs_row(&segs));
     }
     row
-}
-
-/// 取前 n 行（超出追加 `…`）。
-///
-/// 输入: text — 多行文本；n — 行数上限；
-/// 输出: 摘要文本（空文本返回空串）。
-fn first_lines(text: &str, n: usize) -> String {
-    let mut ls = text.lines();
-    let head: Vec<&str> = ls.by_ref().take(n).collect();
-    let mut out = head.join("\n");
-    if ls.next().is_some() {
-        out.push_str("\n…");
-    }
-    out
 }
 
 #[cfg(test)]
@@ -1486,6 +1815,27 @@ done
         assert_eq!(
             route_keystroke(false, false, &k("l", true, false, false)),
             Route::ToApp
+        );
+        // 全局折叠开关（task 4.1）：ctrl+t / ctrl+o 进 App，裸 t/o 放行
+        assert_eq!(
+            route_keystroke(false, false, &k("t", true, false, false)),
+            Route::ToApp
+        );
+        assert_eq!(
+            route_keystroke(false, false, &k("o", true, false, false)),
+            Route::ToApp
+        );
+        assert_eq!(
+            route_keystroke(false, true, &k("o", true, false, false)),
+            Route::ToApp
+        );
+        assert_eq!(
+            route_keystroke(false, false, &k("t", false, false, false)),
+            Route::ToEditor
+        );
+        assert_eq!(
+            route_keystroke(false, false, &k("o", false, false, false)),
+            Route::ToEditor
         );
         assert_eq!(
             route_keystroke(false, true, &k("t", false, false, true)),
@@ -3532,13 +3882,27 @@ done
             ),
             (
                 "tool_call",
-                vec!["You:", "Use the read tool", "● read", "[package]"],
+                vec![
+                    "You:",
+                    "Use the read tool",
+                    "● read",
+                    // 头行参数（head_arg）+ 计时（timer_text）+ 折叠提示行
+                    "Cargo.toml",
+                    "Took",
+                    "ctrl+o to expand",
+                    "[package]",
+                ],
             ),
             (
                 // 错误/重试提示面：失败工具卡（· error）+ markdown 错误说明
                 //（含代码块，顺带覆盖高亮路径）。
                 "failed_tool",
-                vec!["You:", "· error", "failed with an ENOENT"],
+                vec![
+                    "You:",
+                    "· error",
+                    "definitely-does-not-exist-xyz.txt",
+                    "failed with an ENOENT",
+                ],
             ),
         ] {
             let (handle, term) = open_focused(cx, name);
@@ -3574,6 +3938,772 @@ done
             }
 
         }
+    }
+
+    /// 收集消息区文本快照拼串（path 含 gpui-messages 的 test_text 记录）。
+    ///
+    /// 输入: cx — 测试上下文；handle — 窗口句柄；
+    /// 输出: 最近一帧消息区各行文本按绘制序拼接的字符串（task 2.2 断言用）。
+    fn msg_texts(cx: &mut TestAppContext, handle: gpui_kit::AnyWindowHandle) -> String {
+        let texts = cx
+            .update_window(handle, |_, window, _| {
+                gpui_kit::base::test_support::texts(window)
+            })
+            .expect("texts");
+        texts
+            .iter()
+            .filter(|t| t.path().contains(&ElementId::Name("gpui-messages".into())))
+            .map(|t| t.text().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 单卡点击切换（task 2.2）：完成态卡点击翻转共享覆盖表、再点翻回；
+    /// 展开面经内建 Collapsible 挂载（提示行/全文行随面互换）。
+    ///
+    /// 功能: 灌 tool_call fixture → 折叠面断言 → 点击 → 展开面断言 →
+    ///       再点回折叠面断言（生效值读共享覆盖表）；
+    /// 输入: cx — 测试上下文；
+    /// 输出: 断言通过（覆盖表翻转 + 卡片面随帧重渲染）。
+    #[gpui_kit::test]
+    fn tool_card_click_toggles_single_card(cx: &mut TestAppContext) {
+        let (handle, term) = open_focused(cx, "tool_call");
+        cx.update(|cx| {
+            term.update(cx, |term, _| feed_fixture(term, "tool_call"));
+        });
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render");
+        cx.run_until_parked();
+
+        let tool_id = "call_x96eunvxvt479n9ys4r29ozo";
+        let card_id = format!("tool-card-{tool_id}");
+        let hint = "more lines, ctrl+o to expand";
+        let tail = "path = \"src/bin/probe/main.rs\"";
+        let effective = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                term.update(cx, |term, _| term.state.app.tool_expanded_effective(tool_id))
+            })
+        };
+
+        // 折叠面：提示行在场、被折叠的行不在场，生效值 = 全局折叠。
+        let msg = msg_texts(cx, handle);
+        assert!(msg.contains(hint), "折叠态应含提示行: {msg:?}");
+        assert!(!msg.contains(tail), "折叠态不应含被折叠行: {msg:?}");
+        assert!(!effective(cx), "初始为全局折叠");
+
+        // 点击 → 展开面（提示行去、全文行在），覆盖表翻转为展开。
+        cx.update_window(handle, |_, window, cx| window.click(card_id.clone(), cx))
+            .expect("click");
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render");
+        let msg = msg_texts(cx, handle);
+        assert!(msg.contains(tail), "展开态应含全文行: {msg:?}");
+        assert!(!msg.contains(hint), "展开态不应含提示行: {msg:?}");
+        assert!(effective(cx), "点击后单卡展开");
+
+        // 再点 → 回到折叠面，覆盖表翻回折叠。
+        cx.update_window(handle, |_, window, cx| window.click(card_id.clone(), cx))
+            .expect("click");
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render");
+        let msg = msg_texts(cx, handle);
+        assert!(msg.contains(hint), "再点回折叠面: {msg:?}");
+        assert!(!msg.contains(tail), "再点回折叠面: {msg:?}");
+        assert!(!effective(cx), "再点回全局折叠");
+    }
+
+    /// 运行中卡点击无动作（task 2.2：仅 `result.is_some()` 卡响应点击，
+    /// 与 TUI 命中门控同源，design D2/D4）。
+    ///
+    /// 功能: 注入 toolcall + tool_execution_start（无 end，卡留在流式尾块）
+    ///       → 点击卡 → 断言共享覆盖表未翻转；
+    /// 输入: cx — 测试上下文；
+    /// 输出: 断言通过（点击被门控拦截，不写覆盖表）。
+    #[gpui_kit::test]
+    fn running_tool_card_click_is_noop(cx: &mut TestAppContext) {
+        let (handle, term) = open_focused(cx, "running-card");
+        cx.update(|cx| {
+            term.update(cx, |term, _| {
+                use serde_json::json;
+                let steps = [
+                    json!({"type":"message_start","message":{"role":"assistant","content":[]}}),
+                    json!({"type":"message_update","assistantMessageEvent":{"type":"toolcall_start","contentIndex":0,"id":"run1","toolName":"bash"}}),
+                    json!({"type":"message_update","assistantMessageEvent":{"type":"toolcall_delta","contentIndex":0,"delta":"{\"command\":\"sleep 999\"}"}}),
+                    json!({"type":"tool_execution_start","toolCallId":"run1","toolName":"bash","args":{"command":"sleep 999"}}),
+                ];
+                for raw in steps {
+                    term.state.reduce(&ClientEvent::Event(raw), &term.commander, &term.ui_tx);
+                }
+            });
+        });
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render");
+        cx.run_until_parked();
+
+        // 无最终结果的卡（流式尾块）：点击应被门控拦截。
+        cx.update_window(handle, |_, window, cx| window.click("tool-card-run1", cx))
+            .expect("click");
+        cx.run_until_parked();
+
+        let effective = cx.update(|cx| {
+            term.update(cx, |term, _| term.state.app.tool_expanded_effective("run1"))
+        });
+        assert!(!effective, "运行中卡点击不应翻转覆盖表");
+    }
+
+    /// 单卡隔离与全局开关（task 2.2 验收）：双卡 fixture 点 A 只翻 A；
+    /// 全局 ctrl+o 翻转后覆盖清空、无覆盖卡跟随新全局值。
+    ///
+    /// 功能: 灌 tool_edit fixture（write + edit 两卡）→ 断言双卡随全局折叠
+    ///       → 点卡 A → 断言仅 A 展开 → `handle_key(ctrl+o)` 全局展开 →
+    ///       断言覆盖清空且双卡跟随 → 再 ctrl+o → 双卡回折叠；
+    /// 输入: cx — 测试上下文；
+    /// 输出: 断言通过（覆盖表隔离 + 全局开关消费，渲染面由单卡测试盖）。
+    #[gpui_kit::test]
+    fn tool_card_global_toggle_and_per_card_isolation(cx: &mut TestAppContext) {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (handle, term) = open_focused(cx, "tool_edit");
+        cx.update(|cx| {
+            term.update(cx, |term, _| feed_fixture(term, "tool_edit"));
+        });
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render");
+        cx.run_until_parked();
+
+        let card_a = "call_a508d15ac76543b8b42e6cd7"; // write 卡
+        let card_b = "call_8faa3ab5630c49d5be3e1cdc"; // edit 卡
+        let effective = |cx: &mut TestAppContext, id: &str| {
+            cx.update(|cx| term.update(cx, |term, _| term.state.app.tool_expanded_effective(id)))
+        };
+        let ctrl_o = || KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+
+        // 初始：双卡均随全局折叠。
+        assert!(!effective(cx, card_a), "A 初始折叠");
+        assert!(!effective(cx, card_b), "B 初始折叠");
+
+        // 点 A：只翻 A，B 不受影响（单卡隔离，design D1）。
+        cx.update_window(handle, |_, window, cx| {
+            window.click(format!("tool-card-{card_a}"), cx)
+        })
+        .expect("click A");
+        cx.run_until_parked();
+        assert!(effective(cx, card_a), "点 A 后 A 展开");
+        assert!(!effective(cx, card_b), "点 A 后 B 不受影响");
+
+        // 全局 ctrl+o：覆盖清空、双卡跟随新全局值（展开）。
+        cx.update(|cx| {
+            term.update(cx, |term, _| {
+                term.state
+                    .app
+                    .handle_key(ctrl_o(), &term.commander, &term.ui_tx)
+            })
+        });
+        assert!(effective(cx, card_a), "全局展开后 A 跟随");
+        assert!(effective(cx, card_b), "全局展开后 B 跟随");
+
+        // 再 ctrl+o：全局回折叠，双卡跟随。
+        cx.update(|cx| {
+            term.update(cx, |term, _| {
+                term.state
+                    .app
+                    .handle_key(ctrl_o(), &term.commander, &term.ui_tx)
+            })
+        });
+        assert!(!effective(cx, card_a), "全局回折叠后 A 跟随");
+        assert!(!effective(cx, card_b), "全局回折叠后 B 跟随");
+    }
+
+    /// thinking 块语义对齐（task 2.3）：空块不占行、非空块折叠为占位、
+    /// 单块点击仅翻该块（不碰全局与它块；seq 用共享 thinking_seqs 规则）。
+    ///
+    /// 功能: 注入 assistant 流式尾块（空 thinking + 两非空 thinking 夹
+    ///       text）→ 折叠面断言（双占位、无空块占位）→ 点 `thinking-1`
+    ///       → 断言仅块 0 展开、块 1 仍占位、全局未翻 → 再点回折叠；
+    /// 输入: cx — 测试上下文；
+    /// 输出: 断言通过（共享 seq/占位/覆盖语义）。
+    #[gpui_kit::test]
+    fn thinking_block_placeholder_and_isolated_click(cx: &mut TestAppContext) {
+        let (handle, term) = open_focused(cx, "thinking-blocks");
+        cx.update(|cx| {
+            term.update(cx, |term, _| {
+                use serde_json::json;
+                let steps = [
+                    json!({"type":"message_start","message":{"role":"assistant","content":[]}}),
+                    // 空 thinking（start 无 delta）→ 不占行，但占 seq 0。
+                    json!({"type":"message_update","assistantMessageEvent":{"type":"thinking_start","contentIndex":0}}),
+                    // 块 0：非空（seq 1）。
+                    json!({"type":"message_update","assistantMessageEvent":{"type":"thinking_start","contentIndex":1}}),
+                    json!({"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","contentIndex":1,"delta":"first-thought"}}),
+                    // 中间 text（不占 seq）。
+                    json!({"type":"message_update","assistantMessageEvent":{"type":"text_start","contentIndex":2}}),
+                    json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":2,"delta":"answer"}}),
+                    // 块 1：非空（seq 2）。
+                    json!({"type":"message_update","assistantMessageEvent":{"type":"thinking_start","contentIndex":3}}),
+                    json!({"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","contentIndex":3,"delta":"second-thought"}}),
+                ];
+                for raw in steps {
+                    term.state.reduce(&ClientEvent::Event(raw), &term.commander, &term.ui_tx);
+                }
+            });
+        });
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render");
+        cx.run_until_parked();
+
+        // 折叠面：两块占位；空块不占行（无 <thinking 0 chars>）、正文不显。
+        let msg = msg_texts(cx, handle);
+        assert!(msg.contains("<thinking 13 chars>"), "块0 占位: {msg:?}");
+        assert!(msg.contains("<thinking 14 chars>"), "块1 占位: {msg:?}");
+        assert!(!msg.contains("<thinking 0 chars>"), "空块不占行: {msg:?}");
+        assert!(!msg.contains("first-thought"), "折叠态不显正文: {msg:?}");
+
+        // 点块 0（seq=1）→ 仅块 0 展开；块 1 占位仍在即证全局未翻（OR 规则）。
+        cx.update_window(handle, |_, window, cx| window.click(String::from("thinking-1"), cx))
+            .expect("click");
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render");
+        let msg = msg_texts(cx, handle);
+        assert!(msg.contains("first-thought"), "点后块0 展开: {msg:?}");
+        assert!(!msg.contains("<thinking 13 chars>"), "点后块0 占位消失: {msg:?}");
+        assert!(msg.contains("<thinking 14 chars>"), "块1 不受影响: {msg:?}");
+        // 无覆盖序号的生效值 = 全局 show_thinking（直读全局未被翻转）。
+        let global = cx.update(|cx| {
+            term.update(cx, |term, _| term.state.app.thinking_expanded_effective(999))
+        });
+        assert!(!global, "单块点击不应翻转全局 show_thinking");
+
+        // 再点 → 块 0 回占位。
+        cx.update_window(handle, |_, window, cx| window.click(String::from("thinking-1"), cx))
+            .expect("click");
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render");
+        let msg = msg_texts(cx, handle);
+        assert!(msg.contains("<thinking 13 chars>"), "再点回占位: {msg:?}");
+        assert!(!msg.contains("first-thought"), "再点回占位: {msg:?}");
+    }
+
+    /// edit 卡 diff 文本 runs（task 2.4）：details.diff 字段与 args old/new
+    /// LCS 降级两路径正文都入消息区（颜色映射由 seg_visual 单测断言）。
+    ///
+    /// 功能: 灌 tool_edit fixture（diff 字段 -/+ 行）→ 同窗追加 ed1
+    ///       （diff 含 @@ 行）与 ed2（无 details → old/new 降级）→
+    ///       逐 needle 断言；
+    /// 输入: cx — 测试上下文；
+    /// 输出: 断言通过（两路径正文均渲染）。
+    #[gpui_kit::test]
+    fn edit_card_diff_field_and_fallback_paths(cx: &mut TestAppContext) {
+        let (handle, term) = open_focused(cx, "tool_edit");
+        cx.update(|cx| {
+            term.update(cx, |term, _| feed_fixture(term, "tool_edit"));
+        });
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render");
+        cx.run_until_parked();
+
+        // 路径1：fixture 的 details.diff（- 红 / + 绿行）。
+        let msg = msg_texts(cx, handle);
+        assert!(msg.contains("-1 FIXTURE-MARKER"), "diff 字段 - 行: {msg:?}");
+        assert!(msg.contains("+1 EDITED-MARKER"), "diff 字段 + 行: {msg:?}");
+
+        // 追加：@@ 青行卡（diff 字段）+ 无 details 的 old/new 降级卡。
+        cx.update(|cx| {
+            term.update(cx, |term, _| {
+                use serde_json::json;
+                let steps = [
+                    json!({"type":"message_start","message":{"role":"assistant","content":[]}}),
+                    json!({"type":"message_update","assistantMessageEvent":{"type":"toolcall_start","contentIndex":0,"id":"ed1","toolName":"edit"}}),
+                    json!({"type":"message_update","assistantMessageEvent":{"type":"toolcall_delta","contentIndex":0,"delta":"{\"path\":\"x.txt\",\"oldString\":\"a\",\"newString\":\"b\"}"}}),
+                    json!({"type":"tool_execution_start","toolCallId":"ed1","toolName":"edit","args":{"path":"x.txt"}}),
+                    json!({"type":"tool_execution_end","toolCallId":"ed1","toolName":"edit","isError":false,"durationMs":4,
+                        "result":{"content":[{"type":"text","text":"ok"}],"details":{"diff":"@@ -1,2 +1,2 @@\n-removed-line\n+added-line"}}}),
+                    json!({"type":"message_update","assistantMessageEvent":{"type":"toolcall_start","contentIndex":1,"id":"ed2","toolName":"edit"}}),
+                    json!({"type":"message_update","assistantMessageEvent":{"type":"toolcall_delta","contentIndex":1,"delta":"{\"path\":\"y.txt\",\"oldString\":\"old-fallback\",\"newString\":\"new-fallback\"}"}}),
+                    json!({"type":"tool_execution_start","toolCallId":"ed2","toolName":"edit","args":{"path":"y.txt"}}),
+                    json!({"type":"tool_execution_end","toolCallId":"ed2","toolName":"edit","isError":false,"durationMs":3,
+                        "result":{"content":[{"type":"text","text":"ok"}]}}),
+                ];
+                for raw in steps {
+                    term.state.reduce(&ClientEvent::Event(raw), &term.commander, &term.ui_tx);
+                }
+            });
+        });
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render");
+        cx.run_until_parked();
+
+        let msg = msg_texts(cx, handle);
+        // @@ 青行（文本在场；颜色映射由 seg_visual 单测断言）。
+        assert!(msg.contains("@@ -1,2 +1,2 @@"), "@@ 行: {msg:?}");
+        assert!(msg.contains("-removed-line"), "diff - 行: {msg:?}");
+        assert!(msg.contains("+added-line"), "diff + 行: {msg:?}");
+        // 降级路径：无 details.diff → args old/new LCS 行。
+        assert!(msg.contains("-old-fallback"), "降级 - 行: {msg:?}");
+        assert!(msg.contains("+new-fallback"), "降级 + 行: {msg:?}");
+    }
+
+    /// Fg 段 → 深底卡片提亮色（task 2.4）：diff 红/绿/青三色逐一映射。
+    ///
+    /// 输入: [`SegRole::Fg`] 携带的三种 diff 前景色；
+    /// 输出: 断言通过（`seg_visual` 首项 = CARD_FG_* 提亮色）。
+    #[test]
+    fn seg_visual_fg_diff_colors_map_on_card() {
+        use super::{SegRole, palette, seg_visual};
+        let (red, _, _) = seg_visual(SegRole::Fg(Color::Red));
+        let (green, _, _) = seg_visual(SegRole::Fg(Color::Green));
+        let (cyan, _, _) = seg_visual(SegRole::Fg(Color::Cyan));
+        assert_eq!(red, palette::CARD_FG_RED.into(), "diff - 红");
+        assert_eq!(green, palette::CARD_FG_GREEN.into(), "diff + 绿");
+        assert_eq!(cyan, palette::CARD_FG_CYAN.into(), "@@ 青");
+    }
+
+    /// 通知行消费共享 `notice_model`（task 2.5）：`[kind]` 前缀并入文本，
+    /// 色/粗/斜由段角色映射（error 红粗、retry 黄、其它暗灰斜体）。
+    ///
+    /// 功能: 注入 error/retry 两条通知条目 → 断言 `[error]`/`[retry]`
+    ///       前缀 needle 均在场；
+    /// 输入: cx — 测试上下文；
+    /// 输出: 断言通过（两 kind 均以共享模型前缀渲染）。
+    #[gpui_kit::test]
+    fn notice_row_uses_shared_model_prefixes(cx: &mut TestAppContext) {
+        let (handle, term) = open_focused(cx, "notice-rows");
+        cx.update(|cx| {
+            term.update(cx, |term, _| {
+                term.state
+                    .app
+                    .state
+                    .push_notice("error", "boom happened".to_string());
+                term.state
+                    .app
+                    .state
+                    .push_notice("retry", "retrying now".to_string());
+            });
+        });
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render");
+        cx.run_until_parked();
+
+        let msg = msg_texts(cx, handle);
+        assert!(msg.contains("[error] boom happened"), "error 前缀: {msg:?}");
+        assert!(msg.contains("[retry] retrying now"), "retry 前缀: {msg:?}");
+    }
+
+    /// bash 条目消费共享 `bash_entry_model`（task 3.1）：尾部 500 行截断
+    /// + 截断标记 + exit 状态行 + 命令行（与 TUI append_bash 同源）。
+    ///
+    /// 功能: start_bash + finish_bash（600 行输出、exit 0）→ 断言命令行、
+    ///       `…（已截断 101 行）`、尾行 row599 在场且 row100 已丢、
+    ///       `exit 0` 状态行在场；
+    /// 输入: cx — 测试上下文；
+    /// 输出: 断言通过（模型语义经 segs_row 呈现）。
+    #[gpui_kit::test]
+    fn bash_row_uses_shared_model_tail_cap_and_status(cx: &mut TestAppContext) {
+        let (handle, term) = open_focused(cx, "bash-entry");
+        cx.update(|cx| {
+            term.update(cx, |term, _| {
+                use serde_json::json;
+                let big: String = (0..600).map(|i| format!("row{i}\n")).collect();
+                let state = &mut term.state.app.state;
+                state.start_bash("big-command", false);
+                state.finish_bash(&json!({"output": big, "exitCode": 0}));
+            });
+        });
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render");
+        cx.run_until_parked();
+
+        let msg = msg_texts(cx, handle);
+        assert!(msg.contains("$ big-command"), "命令行: {msg:?}");
+        assert!(msg.contains("…（已截断 101 行）"), "截断标记: {msg:?}");
+        assert!(msg.contains("row101"), "首个保留行: {msg:?}");
+        assert!(msg.contains("row599"), "末行保留: {msg:?}");
+        assert!(!msg.contains("row100"), "头部行已丢: {msg:?}");
+        assert!(msg.contains("exit 0"), "exit 状态行: {msg:?}");
+    }
+
+    /// 运行中 bash 尾槽（5.3 冒烟 B2 发现的缺口；spec: bash 条目语义
+    /// 对齐——运行中 `⟳ 运行中…（esc 中止）` MUST 可见）：start_bash 后
+    /// 帧含命令行与运行状态行、行数对账含尾槽；输出分片后新行入帧；
+    /// finish_bash 落条目 → 运行状态行消失、`exit 0` 在场、行数收敛。
+    ///
+    /// 功能: 注入 start_bash + bash_execution_update → 渲染断言运行态；
+    ///       finish_bash → 断言收敛为完成条目；
+    /// 输入: cx — 测试上下文；
+    /// 输出: 断言通过（尾槽渲染、增长与收敛）。
+    #[gpui_kit::test]
+    fn live_bash_slot_renders_and_lands(cx: &mut TestAppContext) {
+        let (handle, term) = open_focused(cx, "live-bash");
+        // 运行开始 + 首个输出分片。
+        cx.update(|cx| {
+            term.update(cx, |term, _| {
+                use serde_json::json;
+                let state = &mut term.state.app.state;
+                state.start_bash("seq 1 3", false);
+                state.handle(&json!({"type":"bash_execution_update","delta":"line-one\n"}));
+            });
+        });
+        assert_eq!(
+            cx.update(|cx| term.read(cx).scroller_rows()),
+            1,
+            "空会话 + 尾槽 = 1 项"
+        );
+        let render = |cx: &mut TestAppContext| {
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .expect("render");
+            cx.run_until_parked();
+            msg_texts(cx, handle)
+        };
+        let msg = render(cx);
+        assert!(msg.contains("$ seq 1 3"), "命令行在场: {msg:?}");
+        assert!(msg.contains("⟳ 运行中"), "运行状态行在场: {msg:?}");
+        assert!(msg.contains("line-one"), "首行输出在场: {msg:?}");
+
+        // 输出分片增长 → 帧内出现新行（TUI 实时增长同语义）。
+        cx.update(|cx| {
+            term.update(cx, |term, _| {
+                use serde_json::json;
+                term.state
+                    .app
+                    .state
+                    .handle(&json!({"type":"bash_execution_update","delta":"line-two\n"}));
+            });
+        });
+        let msg = render(cx);
+        assert!(msg.contains("line-two"), "增长输出在场: {msg:?}");
+
+        // 完成 → 尾槽收敛为落盘条目：运行状态行消失、exit 0 在场。
+        cx.update(|cx| {
+            term.update(cx, |term, _| {
+                use serde_json::json;
+                term.state.app.state.finish_bash(
+                    &json!({"output":"line-one\nline-two\n","exitCode":0}),
+                );
+            });
+        });
+        let msg = render(cx);
+        assert!(!msg.contains("运行中"), "运行状态行应消失: {msg:?}");
+        assert!(msg.contains("exit 0"), "exit 状态行在场: {msg:?}");
+        assert_eq!(cx.update(|cx| term.read(cx).scroller_rows()), 1, "落 1 条目、尾槽消失");
+        assert_eq!(
+            cx.update(|cx| term.read(cx).state.session().entries().len()),
+            1,
+            "落盘条目数"
+        );
+    }
+
+    /// 队列条（task 3.2）：消息区与输入区之间，`[steer]`/`[queue]` 前缀
+    /// 行随流式排队出现；队列清空后整条消失（空队列不占位）。
+    ///
+    /// 功能: 注入 queue_update（steering 1 + followUp 2）→ 断言前缀行与
+    ///       `… 1 more`（最多 2 行）在 gpui-queue 路径下；再注入空队列
+    ///       → 断言 gpui-queue 路径无任何文本；
+    /// 输入: cx — 测试上下文；
+    /// 输出: 断言通过（复用 view::queue_lines 同源输出）。
+    #[gpui_kit::test]
+    fn queue_strip_appears_and_clears(cx: &mut TestAppContext) {
+        let (handle, term) = open_focused(cx, "queue-strip");
+        // 流式排队：steering 1 + followUp 2 → 3 项 → 取 2 行 + `… 1 more`。
+        cx.update(|cx| {
+            term.update(cx, |term, _| {
+                term.state.reduce(
+                    &ClientEvent::Event(serde_json::json!({
+                        "type": "queue_update",
+                        "steering": ["s1"],
+                        "followUp": ["q1", "q2"]
+                    })),
+                    &term.commander,
+                    &term.ui_tx,
+                );
+            });
+        });
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render");
+        cx.run_until_parked();
+
+        let queue_text = |cx: &mut TestAppContext| {
+            let texts = cx
+                .update_window(handle, |_, window, _| {
+                    gpui_kit::base::test_support::texts(window)
+                })
+                .expect("texts");
+            texts
+                .iter()
+                .filter(|t| t.path().contains(&ElementId::Name("gpui-queue".into())))
+                .map(|t| t.text().to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let q = queue_text(cx);
+        assert!(q.contains("[steer] s1"), "steer 行: {q:?}");
+        assert!(q.contains("[queue] q1"), "queue 行: {q:?}");
+        assert!(q.contains("… 1 more"), "超 2 行计数: {q:?}");
+
+        // 清空队列 → 整条消失（空队列不占位）。
+        cx.update(|cx| {
+            term.update(cx, |term, _| {
+                term.state.reduce(
+                    &ClientEvent::Event(serde_json::json!({
+                        "type": "queue_update",
+                        "steering": [],
+                        "followUp": []
+                    })),
+                    &term.commander,
+                    &term.ui_tx,
+                );
+            });
+        });
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render");
+        cx.run_until_parked();
+        assert!(queue_text(cx).is_empty(), "空队列不应渲染任何行");
+    }
+
+    /// extension widget 面板（task 3.3）：setWidget 数据 → ` widget ` 标题
+    /// 边框面板可见（青色文字）；widgetLines null → 清除；未设置/已清除
+    /// 不占位（消息区照常可见，不被面板挤压覆盖）。
+    ///
+    /// 功能: 无数据先渲染断言无 gpui-widget 文本 → 注入 setWidget（两行）
+    ///       → 断言标题与行在场且消息区仍可见 → 注入 null → 断言清除；
+    /// 输入: cx — 测试上下文；
+    /// 输出: 断言通过（RPC → handle_extension_request → 面板渲染链路）。
+    #[gpui_kit::test]
+    fn widget_panel_set_and_clear(cx: &mut TestAppContext) {
+        let (handle, term) = open_focused(cx, "widget-panel");
+        // 消息区底料（断言面板不遮挡消息内容）。
+        cx.update(|cx| {
+            term.update(cx, |term, _| feed_fixture(term, "text_only"));
+        });
+        let widget_text = |cx: &mut TestAppContext| {
+            let texts = cx
+                .update_window(handle, |_, window, _| {
+                    gpui_kit::base::test_support::texts(window)
+                })
+                .expect("texts");
+            texts
+                .iter()
+                .filter(|t| t.path().contains(&ElementId::Name("gpui-widget".into())))
+                .map(|t| t.text().to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let inject = |cx: &mut TestAppContext, widget_lines: serde_json::Value| {
+            cx.update(|cx| {
+                term.update(cx, |term, _| {
+                    term.state.reduce(
+                        &ClientEvent::Event(serde_json::json!({
+                            "type": "extension_ui_request",
+                            "id": "w1",
+                            "method": "setWidget",
+                            "widgetLines": widget_lines
+                        })),
+                        &term.commander,
+                        &term.ui_tx,
+                    );
+                });
+            });
+        };
+        let render = |cx: &mut TestAppContext| {
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .expect("render");
+            cx.run_until_parked();
+        };
+
+        // 未设置：无面板文本（不占位）。
+        render(cx);
+        assert!(widget_text(cx).is_empty(), "未设置不应有面板");
+
+        // setWidget 带数据 → 面板可见（标题 + 行），消息区不被遮挡。
+        inject(cx, serde_json::json!(["line-a", "line-b"]));
+        render(cx);
+        let w = widget_text(cx);
+        assert!(w.contains(" widget "), "标题在场: {w:?}");
+        assert!(w.contains("line-a"), "widget 行 1: {w:?}");
+        assert!(w.contains("line-b"), "widget 行 2: {w:?}");
+        let msg = msg_texts(cx, handle);
+        assert!(!msg.is_empty(), "面板不应挤压/遮挡消息区");
+
+        // widgetLines null → 清除（主规格：null 清空而非报错）。
+        inject(cx, serde_json::Value::Null);
+        render(cx);
+        assert!(widget_text(cx).is_empty(), "null 应清除面板");
+        let msg = msg_texts(cx, handle);
+        assert!(!msg.is_empty(), "清除后消息区照常");
+    }
+
+    /// ctrl+t / ctrl+o 端到端（task 4.1）：按键经拦截层 → `Route::ToApp` →
+    /// `App::handle_key` 翻转全局开关，消息区即时重渲染，按键不落入
+    /// Textarea（spec: 键位与全局折叠开关）。
+    ///
+    /// 功能: 注入 thinking 块 + 20 行 read 卡（均折叠）→ 断言占位/提示
+    ///       在场 → press ctrl+t → thinking 正文展开且输入框仍空 →
+    ///       press ctrl+o → 卡全量展开、提示消失且输入框仍空；
+    /// 输入: cx — 测试上下文；
+    /// 输出: 断言通过（两全局开关翻转 + 重渲染 + 不漏入编辑器）。
+    #[gpui_kit::test]
+    fn ctrl_t_ctrl_o_toggle_globals_end_to_end(cx: &mut TestAppContext) {
+        let (handle, term) = open_focused(cx, "ctrl-to");
+        cx.update(|cx| {
+            term.update(cx, |term, _| {
+                use serde_json::json;
+                let rows: String = (1..=20).map(|i| format!("row{i}\n")).collect();
+                let steps = [
+                    json!({"type":"message_start","message":{"role":"assistant","content":[]}}),
+                    // 非空 thinking 块（默认折叠为占位）。
+                    json!({"type":"message_update","assistantMessageEvent":{"type":"thinking_start","contentIndex":0}}),
+                    json!({"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","contentIndex":0,"delta":"secret-thoughts"}}),
+                    // read 卡（20 行结果 → 默认折叠带提示行）。
+                    json!({"type":"message_update","assistantMessageEvent":{"type":"toolcall_start","contentIndex":1,"id":"rc1","toolName":"read"}}),
+                    json!({"type":"message_update","assistantMessageEvent":{"type":"toolcall_delta","contentIndex":1,"delta":"{\"path\":\"src/main.rs\",\"offset\":1,\"limit\":20}"}}),
+                    json!({"type":"tool_execution_start","toolCallId":"rc1","toolName":"read","args":{"path":"src/main.rs","offset":1,"limit":20}}),
+                    json!({"type":"tool_execution_end","toolCallId":"rc1","toolName":"read","isError":false,"durationMs":3,
+                        "result":{"content":[{"type":"text","text":rows}],"structuredContent":rows}}),
+                ];
+                for raw in steps {
+                    term.state.reduce(&ClientEvent::Event(raw), &term.commander, &term.ui_tx);
+                }
+            });
+        });
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render");
+        cx.run_until_parked();
+
+        // 初始：两处均折叠（占位 + 提示行），输入框为空。
+        let msg = msg_texts(cx, handle);
+        assert!(msg.contains("<thinking 15 chars>"), "thinking 占位: {msg:?}");
+        assert!(msg.contains("more lines, ctrl+o to expand"), "卡提示行: {msg:?}");
+        assert!(!msg.contains("secret-thoughts"), "折叠态不显 thinking 正文: {msg:?}");
+        assert!(!msg.contains("row20"), "折叠态不显全文: {msg:?}");
+
+        // ctrl+t → thinking 全局展开，不入输入框。
+        cx.update_window(handle, |_, window, cx| window.press("ctrl-t", cx))
+            .expect("press ctrl+t");
+        cx.run_until_parked();
+        let global = cx.update(|cx| {
+            term.update(cx, |term, _| term.state.app.thinking_expanded_effective(999))
+        });
+        let editor = cx.update(|cx| term.update(cx, |term, _| term.state.app.editor.text().to_string()));
+        let focused = cx.update_window(handle, |_, window, cx| {
+            term.read(cx).focus.is_focused(window)
+        }).unwrap_or(false);
+        assert!(global, "ctrl+t 后 show_thinking 应翻转 (editor={editor:?} focused={focused})");
+        let msg = msg_texts(cx, handle);
+        assert!(msg.contains("secret-thoughts"), "ctrl+t 后 thinking 展开: {msg:?}");
+        assert!(!msg.contains("<thinking 15 chars>"), "占位应消失: {msg:?}");
+        let value = cx.update(|cx| term.read(cx).textarea.read(cx).value().to_string());
+        assert_eq!(value, "", "ctrl+t 不应落入输入框");
+
+        // ctrl+o → 工具卡全局展开（提示行去、全文在），不入输入框。
+        cx.update_window(handle, |_, window, cx| window.press("ctrl-o", cx))
+            .expect("press ctrl+o");
+        cx.run_until_parked();
+        let msg = msg_texts(cx, handle);
+        assert!(msg.contains("row20"), "ctrl+o 后卡展开: {msg:?}");
+        assert!(!msg.contains("more lines, ctrl+o to expand"), "提示行应消失: {msg:?}");
+        let value = cx.update(|cx| term.read(cx).textarea.read(cx).value().to_string());
+        assert_eq!(value, "", "ctrl+o 不应落入输入框");
+    }
+
+    /// 计时走字任务启停（task 4.2）：Running 期间起 1s interval 且每秒
+    /// notify（观察者计数递增）；工具结束 → 渲染点对账取消，后续时钟
+    /// 推进不再重绘（镜像 ratatui `timer_redraw_due` 门控）。
+    ///
+    /// 功能: 注入 tool_execution_start → 渲染（任务在场）→
+    ///       advance_clock(1s)+pump → 断言 notify 计数 +1 →
+    ///       注入 tool_execution_end → 渲染（任务已取消）→
+    ///       再推进时钟 → 计数不再增长；
+    /// 输入: cx — 测试上下文；
+    /// 输出: 断言通过（任务启停与周期重绘门控）。
+    #[gpui_kit::test]
+    fn timer_task_starts_while_running_and_stops_when_ended(cx: &mut TestAppContext) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        let (handle, term) = open_focused(cx, "timer-tick");
+        // notify 计数（观察者挂在组件上，区分周期重绘与手动渲染）。
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let _sub = cx.update(|cx| {
+            let ticks = ticks.clone();
+            cx.observe(&term, move |_, _| {
+                ticks.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+        let running = |cx: &mut TestAppContext, done: bool| {
+            cx.update(|cx| {
+                term.update(cx, |term, _| {
+                    use serde_json::json;
+                    if !done {
+                        term.state.reduce(
+                            &ClientEvent::Event(json!({
+                                "type":"message_start","message":{"role":"assistant","content":[]}
+                            })),
+                            &term.commander,
+                            &term.ui_tx,
+                        );
+                        term.state.reduce(
+                            &ClientEvent::Event(json!({
+                                "type":"message_update",
+                                "assistantMessageEvent":{"type":"toolcall_start","contentIndex":0,"id":"t1","toolName":"bash"}
+                            })),
+                            &term.commander,
+                            &term.ui_tx,
+                        );
+                        term.state.reduce(
+                            &ClientEvent::Event(json!({
+                                "type":"tool_execution_start","toolCallId":"t1","toolName":"bash","args":{"command":"sleep 9"}
+                            })),
+                            &term.commander,
+                            &term.ui_tx,
+                        );
+                    } else {
+                        term.state.reduce(
+                            &ClientEvent::Event(json!({
+                                "type":"tool_execution_end","toolCallId":"t1","toolName":"bash","isError":false,"durationMs":5,
+                                "result":{"content":[{"type":"text","text":"done"}]}
+                            })),
+                            &term.commander,
+                            &term.ui_tx,
+                        );
+                    }
+                });
+            });
+        };
+        let render = |cx: &mut TestAppContext| {
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .expect("render");
+            cx.run_until_parked();
+        };
+        let tick_count = |cx: &mut TestAppContext| {
+            cx.update(|_| ticks.load(Ordering::SeqCst))
+        };
+        let task_alive = |cx: &mut TestAppContext| {
+            cx.update(|cx| term.read(cx).timer_task.is_some())
+        };
+
+        // Running：渲染点对账起任务；时钟未推进 → 尚未走字。
+        running(cx, false);
+        render(cx);
+        assert!(task_alive(cx), "Running 期间应有计时任务");
+        assert_eq!(tick_count(cx), 0, "未到 1s 不应重绘");
+
+        // 推进 1s → interval 触发 → notify（观察者计数 +1），任务仍在。
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(tick_count(cx), 1, "Running 期间每秒 notify 走字");
+        assert!(task_alive(cx), "走字后任务应继续");
+
+        // 工具结束 → 渲染点对账取消任务。
+        running(cx, true);
+        render(cx);
+        assert!(!task_alive(cx), "Ended 后任务应取消");
+
+        // 再推进时钟 → 无任务可触发，计数不增（无周期重绘）。
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(tick_count(cx), 1, "Ended 后不应有周期重绘");
     }
 
     /// 未知工具通用卡兜底（task 5.2：不 panic、卡头在场）。

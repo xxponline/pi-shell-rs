@@ -227,6 +227,7 @@ pub(crate) fn layout_bash_tail(
 const BASH_OUTPUT_MAX_LINES: usize = 500;
 
 /// 追加一条 bash 渲染：命令行 + 输出（弱化、行数上限）+ 状态行。
+/// TUI 薄适配——语义在 [`bash_entry_model`]（design D1）。
 ///
 /// 输入: out — 目标行；command/output — 命令与输出；exit_code/cancelled/
 ///       truncated/full_output_path — 结果态；excluded — `!!` 不进上下文；
@@ -244,64 +245,139 @@ fn append_bash(
     excluded: bool,
     live: bool,
 ) {
-    let mut cmd_spans = vec![Span::styled(
-        format!("$ {command}"),
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-    )];
-    if excluded {
-        cmd_spans.push(Span::styled(
-            "（不进上下文）",
-            Style::default().fg(Color::DarkGray),
-        ));
+    for row in bash_entry_model(
+        command,
+        output,
+        exit_code,
+        cancelled,
+        truncated,
+        full_output_path,
+        excluded,
+        live,
+    ) {
+        out.push(crate::app::tools::segs_to_line(&row));
     }
-    out.push(Line::from(cmd_spans));
+}
+
+/// bash 条目中性模型（design D1）：命令行 + 输出（尾部截断）+ 状态行。
+///
+/// 输入: command/output — 命令与输出；exit_code/cancelled/truncated/
+///       full_output_path — 结果态；excluded — `!!` 不进上下文；
+///       live — 运行中（状态行替换为运行标记）
+/// 输出: 行序列（每行 = 段序列）——命令行（黄粗 + 可选不进上下文标记）、
+///       截断标记行、输出行（仅保留末尾 `BASH_OUTPUT_MAX_LINES` 行、
+///       跳过结尾换行空元素）、状态行（运行中/取消/exit/done + 可选
+///       truncated 后缀）；不 panic
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bash_entry_model(
+    command: &str,
+    output: &str,
+    exit_code: Option<i64>,
+    cancelled: bool,
+    truncated: bool,
+    full_output_path: Option<&str>,
+    excluded: bool,
+    live: bool,
+) -> Vec<Vec<crate::app::tools::Seg>> {
+    use crate::app::tools::{Seg, SegRole};
+    let mut rows: Vec<Vec<Seg>> = Vec::new();
+
+    let mut cmd = vec![Seg::new(format!("$ {command}"), SegRole::Cmd)];
+    if excluded {
+        cmd.push(Seg::new("（不进上下文）", SegRole::Dim));
+    }
+    rows.push(cmd);
 
     // 输出行（超上限保留末尾）
     let all: Vec<&str> = output.split('\n').collect();
     let total = all.len();
     let start = total.saturating_sub(BASH_OUTPUT_MAX_LINES);
     if start > 0 {
-        out.push(Line::from(Span::styled(
-            format!("…（已截断 {} 行）", start),
-            Style::default().fg(Color::DarkGray),
-        )));
+        rows.push(vec![Seg::new(
+            format!("…（已截断 {start} 行）"),
+            SegRole::Dim,
+        )]);
     }
     for (i, row) in all[start..].iter().enumerate() {
         if row.is_empty() && start + i == total - 1 {
             continue; // 仅跳过结尾换行产生的最后一个空元素（保留中间空行）
         }
-        out.push(Line::from(Span::styled(
-            (*row).to_string(),
-            Style::default().fg(Color::DarkGray),
-        )));
+        rows.push(vec![Seg::new((*row).to_string(), SegRole::Dim)]);
     }
 
     // 状态行
     let status = if live {
-        Span::styled("⟳ 运行中…（esc 中止）", Style::default().fg(Color::Yellow))
+        Seg::new("⟳ 运行中…（esc 中止）", SegRole::Warn)
     } else if cancelled {
-        Span::styled("cancelled", Style::default().fg(Color::Yellow))
+        Seg::new("cancelled", SegRole::Warn)
     } else {
         match exit_code {
-            Some(0) => Span::styled("exit 0", Style::default().fg(Color::Green)),
-            Some(code) => Span::styled(
-                format!("exit {code}"),
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            None => Span::styled("done", Style::default().fg(Color::DarkGray)),
+            Some(0) => Seg::new("exit 0", SegRole::ExitOk),
+            Some(code) => Seg::new(format!("exit {code}"), SegRole::ExitBad),
+            None => Seg::new("done", SegRole::Dim),
         }
     };
-    let mut status_spans = vec![status];
+    let mut status_row = vec![status];
     if truncated {
-        status_spans.push(Span::styled(
+        status_row.push(Seg::new(
             match full_output_path {
                 Some(p) => format!(" · truncated → {p}"),
                 None => " · truncated".to_string(),
             },
-            Style::default().fg(Color::Yellow),
+            SegRole::Warn,
         ));
     }
-    out.push(Line::from(status_spans));
+    rows.push(status_row);
+    rows
+}
+
+/// thinking 块可见行中性模型（design D1；空块 → None 不占行）。
+///
+/// 输入: text — thinking 正文；expanded — 展开态（折叠为占位行）
+/// 输出: None = 空块（不渲染任何行）；Some(rows) = 折叠单行占位
+///       `<thinking N chars>` 或展开的逐行正文（均暗灰斜体）
+pub(crate) fn thinking_visible(
+    text: &str,
+    expanded: bool,
+) -> Option<Vec<Vec<crate::app::tools::Seg>>> {
+    use crate::app::tools::{Seg, SegRole};
+    if text.is_empty() {
+        return None;
+    }
+    if expanded {
+        Some(
+            text.split('\n')
+                .map(|line| vec![Seg::new(line.to_string(), SegRole::ThinkingText)])
+                .collect(),
+        )
+    } else {
+        let n = text.chars().count();
+        Some(vec![vec![Seg::new(
+            format!("<thinking {n} chars>"),
+            SegRole::ThinkingText,
+        )]])
+    }
+}
+
+/// 为一段内容块分配 thinking 全局序号（design D2 规则的共享实现，
+/// TUI 命中表与 GPUI 单块覆盖表同源消费）。
+///
+/// 输入: blocks — 一段内容块序列；base — 入口全局序号游标（上一段出口）
+/// 输出: `(标记, 出口游标)`——标记与 blocks 等长，仅 Thinking 块为
+///       Some(seq)（**含空块**——空块也消耗序号，后接 delta 变非空时
+///       既有序号不重排），其余块为 None；出口 = 下一段的入口基值
+pub(crate) fn thinking_seqs(blocks: &[Block], base: usize) -> (Vec<Option<usize>>, usize) {
+    let mut marks = Vec::with_capacity(blocks.len());
+    let mut next = base;
+    for block in blocks {
+        if matches!(block, Block::Thinking { .. }) {
+            marks.push(Some(next));
+            next += 1;
+        } else {
+            marks.push(None);
+        }
+    }
+    (marks, next)
 }
 
 /// 按通知类型生成样式行：error 红色加粗、retry 黄色、其余弱化斜体灰。
@@ -309,16 +385,22 @@ fn append_bash(
 /// 输入: kind — 通知类别（"error"/"retry"/其它）；text — 通知正文
 /// 输出: 单行样式化通知
 fn notice_line(kind: &str, text: &str) -> Line<'static> {
-    let style = match kind {
-        "error" => Style::default()
-            .fg(Color::Red)
-            .add_modifier(Modifier::BOLD),
-        "retry" => Style::default().fg(Color::Yellow),
-        _ => Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::ITALIC),
+    crate::app::tools::segs_to_line(&notice_model(kind, text))
+}
+
+/// 通知行中性模型（design D1；`[kind]` 前缀并入文本，单一语义段）。
+///
+/// 输入: kind — 通知类别（"error" → 红粗、"retry" → 黄、其余 → 暗灰斜体）；
+///       text — 通知正文
+/// 输出: 单行段序列（`[kind] text`）
+pub(crate) fn notice_model(kind: &str, text: &str) -> Vec<crate::app::tools::Seg> {
+    use crate::app::tools::{Seg, SegRole};
+    let role = match kind {
+        "error" => SegRole::NoticeError,
+        "retry" => SegRole::NoticeRetry,
+        _ => SegRole::Notice,
     };
-    Line::from(vec![Span::styled(format!("[{kind}] {text}"), style)])
+    vec![Seg::new(format!("[{kind}] {text}"), role)]
 }
 
 /// 把一组内容块追加到输出行（markdown 文本/thinking 两态/工具卡片）。
@@ -340,7 +422,11 @@ pub(crate) fn append_blocks(
     thinking_seq: &mut usize,
     theme: &TuiTheme,
 ) {
-    for block in blocks {
+    // 序号分配先行（共享规则 thinking_seqs，design D2：无条件递增、
+    // 含空块、跨调用穿透——出口游标回写由本函数完成）。
+    let (seqs, exit_seq) = thinking_seqs(blocks, *thinking_seq);
+    *thinking_seq = exit_seq;
+    for (idx, block) in blocks.iter().enumerate() {
         let start = out.len();
         // 本块命中标识（None = 不入命中表，design D1）。
         let mut mark: Option<HitKind> = None;
@@ -352,34 +438,17 @@ pub(crate) fn append_blocks(
                 }
             }
             Block::Thinking { text } => {
-                // 每个 thinking 块无条件消耗一个全局序号（含空块——空块后
-                // 接 delta 变非空时既有序号不重排，design D2）。
-                let seq = *thinking_seq;
-                *thinking_seq += 1;
-                if text.is_empty() {
-                    continue;
-                }
-                mark = Some(HitKind::Thinking(seq));
+                let seq = seqs[idx].expect("Thinking 块必有序号");
                 // 生效值：单块覆盖优先、否则全局（design D3，与工具 D1 同构）。
                 let expanded = flags.show_thinking
                     || thinking_overrides.get(&seq).copied().unwrap_or(false);
-                if expanded {
-                    // 展开态：完整思考文本，弱化斜体灰（逐行保留换行）。
-                    let style = Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC);
-                    for part in text.split('\n') {
-                        out.push(Line::from(Span::styled(part.to_string(), style)));
-                    }
-                } else {
-                    // 折叠态：单行占位（含字符数）。
-                    let n = text.chars().count();
-                    out.push(Line::from(vec![Span::styled(
-                        format!("<thinking {n} chars>"),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    )]));
+                // 语义在 thinking_visible（空块 → None 不占行，design D1）。
+                let Some(rows) = thinking_visible(text, expanded) else {
+                    continue;
+                };
+                mark = Some(HitKind::Thinking(seq));
+                for row in &rows {
+                    out.push(crate::app::tools::segs_to_line(row));
                 }
             }
             Block::ToolCall { id, name, args_json, tool } => {
@@ -876,6 +945,47 @@ mod tests {
         assert!(retry_text.contains("[retry] 重试 1/3: boom"));
     }
 
+    /// bash 命令行必须黄粗（回归防护：task1.2 段化重构曾把 `$ cmd` 的
+    /// 黄色丢成纯粗体；HEAD 与 spec「命令行黄色加粗」均为黄+粗）。
+    ///
+    /// 功能: 仅含落盘 bash 条目的会话 → chat_lines_themed → 断言首行
+    ///       `$ cmd` 前景色 Yellow + BOLD；
+    /// 输入: 无（纯函数）；
+    /// 输出: 断言通过。
+    #[test]
+    fn bash_command_line_is_yellow_bold() {
+        let mut st = SessionState::new();
+        st.transcript.push(Entry::Bash {
+            command: "echo hi".into(),
+            output: "hi\n".into(),
+            exit_code: Some(0),
+            cancelled: false,
+            truncated: false,
+            full_output_path: None,
+            excluded: false,
+        });
+        let empty_s: std::collections::HashMap<String, bool> = Default::default();
+        let empty_t: std::collections::HashMap<usize, bool> = Default::default();
+        let (lines, _) = chat_lines_themed(
+            &st,
+            RenderFlags::default(),
+            &empty_s,
+            &empty_t,
+            &TuiTheme::default(),
+        );
+        let spans = &lines[0].spans;
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.starts_with("$ echo hi"), "首行应为命令行: {text}");
+        assert_eq!(spans[0].style.fg, Some(Color::Yellow), "命令行应为黄色");
+        assert!(
+            spans[0]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD),
+            "命令行应粗体"
+        );
+    }
+
     #[test]
     fn bash_entry_and_live_rendering() {
         use pi_shell_rs::session::Entry;
@@ -981,6 +1091,154 @@ mod tests {
         assert!(text.contains("已截断"), "超限提示: {text}");
         assert!(text.contains("row599"), "保留末尾");
         assert!(!text.contains("row0\n"), "丢弃开头（或至少不含首行）");
+    }
+
+    /// 中性通知模型（task 1.3）：`[kind]` 前缀并入、角色按 kind 分派。
+    #[test]
+    fn notice_model_prefix_and_roles() {
+        use crate::app::tools::SegRole;
+        let err = notice_model("error", "400 bad");
+        assert_eq!(err.len(), 1);
+        assert_eq!(err[0].text, "[error] 400 bad");
+        assert_eq!(err[0].role, SegRole::NoticeError);
+
+        let retry = notice_model("retry", "重试 1/3");
+        assert_eq!(retry[0].text, "[retry] 重试 1/3");
+        assert_eq!(retry[0].role, SegRole::NoticeRetry);
+
+        let info = notice_model("info", "note");
+        assert_eq!(info[0].text, "[info] note");
+        assert_eq!(info[0].role, SegRole::Notice);
+    }
+
+    /// 中性 bash 模型（task 1.3）：600 行 → 尾 500 + 截断标记；状态行四态。
+    #[test]
+    fn bash_entry_model_tail_cap_and_status_variants() {
+        use crate::app::tools::SegRole;
+        let big: String = (0..600).map(|i| format!("row{i}\n")).collect();
+        let rows = bash_entry_model("big", &big, Some(0), false, false, None, false, false);
+        // 命令行 + 截断标记 + 500 输出行 + 状态行
+        let joined: String = rows
+            .iter()
+            .map(|r| r.iter().map(|s| s.text.as_str()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("…（已截断 101 行）"), "截断标记: {joined}");
+        assert!(joined.contains("row599"), "保留末尾");
+        assert!(!joined.contains("row0\n"), "丢弃开头");
+        let out_rows = rows.len() - 1; // 去掉命令行
+        assert!(out_rows <= 1 + 1 + 500, "输出不超限: {out_rows}");
+
+        // 状态行四态
+        let st = |rows: &Vec<Vec<crate::app::tools::Seg>>| rows.last().unwrap().clone();
+        assert_eq!(st(&rows)[0].text, "exit 0");
+        assert_eq!(st(&rows)[0].role, SegRole::ExitOk);
+
+        let cancelled = bash_entry_model("x", "", None, true, false, None, false, false);
+        assert_eq!(st(&cancelled)[0].text, "cancelled");
+        assert_eq!(st(&cancelled)[0].role, SegRole::Warn);
+
+        let live = bash_entry_model("x", "", None, false, false, None, false, true);
+        assert!(st(&live)[0].text.contains("运行中"), "运行中文案");
+        assert_eq!(st(&live)[0].role, SegRole::Warn);
+
+        let failed = bash_entry_model("x", "", Some(127), false, false, None, false, false);
+        assert_eq!(st(&failed)[0].text, "exit 127");
+        assert_eq!(st(&failed)[0].role, SegRole::ExitBad);
+
+        // truncated 后缀 + 不进上下文标记
+        let tr = bash_entry_model("x", "", None, false, true, Some("/tmp/t.log"), true, false);
+        assert_eq!(st(&tr)[1].text, " · truncated → /tmp/t.log");
+        assert_eq!(tr[0][1].text, "（不进上下文）");
+    }
+
+    /// 中性 thinking 模型（task 1.3）：空块 → None；两态文案与行数。
+    #[test]
+    fn thinking_visible_empty_none_and_two_states() {
+        use crate::app::tools::SegRole;
+        assert!(thinking_visible("", false).is_none(), "折叠空块不占行");
+        assert!(thinking_visible("", true).is_none(), "展开空块不占行");
+
+        let collapsed = thinking_visible("secret thoughts", false).unwrap();
+        assert_eq!(collapsed.len(), 1, "折叠单行占位");
+        assert_eq!(collapsed[0][0].text, "<thinking 15 chars>");
+        assert_eq!(collapsed[0][0].role, SegRole::ThinkingText);
+
+        let expanded = thinking_visible("l1\nl2", true).unwrap();
+        assert_eq!(expanded.len(), 2, "展开逐行");
+        assert_eq!(expanded[0][0].text, "l1");
+        assert_eq!(expanded[1][0].text, "l2");
+        assert_eq!(expanded[0][0].role, SegRole::ThinkingText);
+    }
+
+    /// seq 共享规则（task 1.5）：空块计数、非 thinking 不耗序、
+    /// 跨段（跨条目）递增——出口游标作下一段基值。
+    #[test]
+    fn thinking_seqs_counts_empty_and_chains_across_segments() {
+        // 段 1：空 thinking（计数不打标）+ 非空 + Text（不耗序）+ 非空
+        let seg1 = vec![
+            Block::Thinking { text: String::new() }, // seq 0
+            Block::Thinking { text: "a".into() },    // seq 1
+            Block::Text { text: "t".into() },        // 不耗序
+            Block::Thinking { text: "b".into() },    // seq 2
+        ];
+        let (marks1, exit1) = thinking_seqs(&seg1, 0);
+        assert_eq!(marks1, vec![Some(0), Some(1), None, Some(2)]);
+        assert_eq!(exit1, 3, "出口 = 下段基值（含空块消耗）");
+
+        // 段 2（跨条目）：从段 1 出口继续
+        let seg2 = vec![
+            Block::Text { text: "x".into() },
+            Block::Thinking { text: "c".into() }, // seq 3
+        ];
+        let (marks2, exit2) = thinking_seqs(&seg2, exit1);
+        assert_eq!(marks2, vec![None, Some(3)]);
+        assert_eq!(exit2, 4, "跨段递增");
+    }
+
+    /// seq 双端同源（task 1.5）：同 fixture 下共享规则分配的序号 ==
+    /// TUI 命中表 `HitKind::Thinking(seq)` 序列（GPUI 单块覆盖表消费
+    /// 同一 `thinking_seqs`，两端序号必然一致）。
+    #[test]
+    fn thinking_seqs_match_tui_marks_on_fixture() {
+        use pi_shell_rs::session::replay_file;
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/probe/text_only/snapshot/transcript.jsonl");
+        let state = replay_file(&path).expect("replay fixture");
+
+        // 共享规则端：按 transcript 顺序逐条目分配（跨条目穿透）
+        let mut base = 0usize;
+        let mut rule: Vec<usize> = Vec::new();
+        for entry in state.entries() {
+            if let Entry::Assistant { blocks, .. } = entry {
+                let (marks, exit) = thinking_seqs(blocks, base);
+                base = exit;
+                // 与打标口径一致：仅非空 thinking 打标（空块无行无标）
+                for (b, m) in blocks.iter().zip(&marks) {
+                    if let (Block::Thinking { text }, Some(seq)) = (b, m)
+                        && !text.is_empty()
+                    {
+                        rule.push(*seq);
+                    }
+                }
+            }
+        }
+        assert!(!rule.is_empty(), "fixture 应含非空 thinking 块");
+
+        // TUI 端：chat_lines 命中表
+        let empty = std::collections::HashMap::new();
+        let empty_t = std::collections::HashMap::new();
+        let (_, meta) = chat_lines(&state, RenderFlags::default(), &empty, &empty_t);
+        let tui: Vec<usize> = meta
+            .iter()
+            .flatten()
+            .filter_map(|k| match k {
+                HitKind::Thinking(seq) => Some(*seq),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(rule, tui, "双端同 fixture 同序号");
     }
 
     /// design D5 / spec 状态背景面板：三态着色、状态文字保留、非卡片行无背景。

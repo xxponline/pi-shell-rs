@@ -214,7 +214,7 @@ pub fn paint_selection(
 ///
 /// 输入: state — 含 steering_queue/follow_up_queue 的会话状态
 /// 输出: 空队列返回空 vec（不占布局行）
-fn queue_lines(state: &SessionState, local_queue: &[String]) -> Vec<Line<'static>> {
+pub(crate) fn queue_lines(state: &SessionState, local_queue: &[String]) -> Vec<Line<'static>> {
     let mut items: Vec<String> = Vec::new();
     for text in local_queue {
         items.push(format!("[queued] {text}"));
