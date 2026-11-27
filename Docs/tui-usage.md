@@ -163,6 +163,7 @@ label（条目名；`/` 菜单中 value==label 视觉不变）。
 | Ctrl+G | **外部编辑器**：挂起 TUI 打开编辑器（`settings.json externalEditor` → `$VISUAL`/`$EDITOR` → nano），保存退出回填输入；失败黄条且输入不变 |
 | Ctrl+X | 复制最后一条回复到终端剪贴板（OSC52，同 `/copy`） |
 | Ctrl+V | 粘贴剪贴板：图片→临时文件路径插入，否则文本→光标处插入；空则无操作 |
+| ↑ / ↓ | **输入历史浏览**（`add-input-history`，与 pi 同源）：输入区首行且（空 / 浏览中 / 行首）按 ↑ 进入或上翻历史（行中先回行首、再按才进）；末行浏览中 ↓ 下翻、翻过最新完整还原草稿（含光标）；内容变更（打字/粘贴/删除）与提交退出浏览（草稿丢弃、浏览文本就地留驻）；历史 = 本会话 user 消息（启动/切会话/树导航幂等重建、提交入栈、上限 100）；补全菜单打开时仍为菜单导航 |
 | Ctrl+D | **仅输入为空时退出**（非空 = 光标处向后删字符） |
 | Esc（流式中） | 发送 abort **并恢复排队消息到输入框**，回到空闲 |
 | Esc（空闲） | **无操作**（不退出、不清空——对齐 pi） |
@@ -212,8 +213,8 @@ label（条目名；`/` 菜单中 value==label 视觉不变）。
 - 会话列表仅当前项目（pi 的 listAll 双列表未实现）。
 - **Shift+Enter / Ctrl+- 依赖 kitty 键盘协议**（启动时探测，最多 2s；不支持的
   终端上换行请用 Ctrl+J，undo 无替代键）。
-- 输入区超长单行按水平滚动显示（不视觉换行）；无输入历史
-  （pi 的历史键默认也未绑定）；Tab 纯路径补全已落地（`add-path-tab-completion`）。
+- 输入区超长单行按水平滚动显示（不视觉换行）；Tab 纯路径补全已落地
+  （`add-path-tab-completion`）。
 
 ## GPUI 构建模式（可选特性 `gpui-support`）
 
@@ -264,6 +265,11 @@ PI_GPUI_RENDER_PROBE=1 cargo run --bin pi-shell-gpui --features gpui-support
   **ctrl+t / ctrl+o 切换 thinking / 工具卡全局展开**（与 `key_intent` 同源
   经三区路由进共享分发，不落入输入框，切换时同 TUI 清单块/单卡覆盖）；
   编辑键（撤销 cmd-z/ctrl-z、kill、词移等）由内建编辑器自理，不逐键对齐 TUI。
+- 输入历史（`add-input-history`）：↑/↓ 与 TUI 同源共享分派——首行/末行
+  条件成立交共享层（历史步进/行首/行尾，ToApp 自带回写桥），条件外原生
+  移动；行位读 Textarea 实时光标（原生移动不回写镜像）；内容变更退出
+  浏览、程序化回写不误退出。已知差异：行位判定用逻辑行（pi 用视觉行，
+  折行长条目边界近似）；纯鼠标点击不退出浏览（pi 点击退出）。
 - P1 键位补线（`align-gpui-input-scroll`）：`alt+up` 取回排队消息到输入框、
   `ctrl+p` / `ctrl+shift+p` 循环切换模型（下一个/上一个）、`shift+tab` 循环
   thinking 级别、菜单关闭时 `tab` 强制路径补全、`ctrl+x` 复制最后回复

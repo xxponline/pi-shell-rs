@@ -9,9 +9,20 @@ use std::collections::VecDeque;
 const UNDO_CAP: usize = 100;
 /// kill-ring 容量（新 kill 在前）。
 const KILL_RING_CAP: usize = 32;
+/// 提交历史容量（超出淘汰最旧；pi addToHistory 同源）。
+const HISTORY_CAP: usize = 100;
 
 /// 内容快照：(行数组, 光标行, 光标列)。
 type Snapshot = (Vec<String>, usize, usize);
+
+/// 历史步进结果（回画用：TUI 直接读状态、GPUI 据此回写内建编辑器）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum HistoryStep {
+    /// 载入历史条目：新文本 + 光标落点（true=行首[Up]、false=行尾[Down]）。
+    Load { text: String, start: bool },
+    /// 还原草稿：新文本 + 进入浏览前的原光标。
+    Draft { text: String, row: usize, col: usize },
+}
 
 /// 多行编辑器缓冲。
 #[derive(Debug, Clone)]
@@ -27,6 +38,12 @@ pub struct EditorBuffer {
     yank_pos: usize,
     /// 上一次操作是否为 yank（yank-pop 仅紧随 yank 生效）。
     after_yank: bool,
+    /// 提交历史（最新在前，上限 [`HISTORY_CAP`]）。
+    history: Vec<String>,
+    /// 历史浏览索引（None=草稿态，等价 pi 的 -1）。
+    history_index: Option<usize>,
+    /// 首次进入浏览时捕获的草稿（lines/row/col）。
+    history_draft: Option<Snapshot>,
 }
 
 impl Default for EditorBuffer {
@@ -49,6 +66,9 @@ impl EditorBuffer {
             kill_ring: VecDeque::new(),
             yank_pos: 0,
             after_yank: false,
+            history: Vec::new(),
+            history_index: None,
+            history_draft: None,
         }
     }
 
@@ -281,6 +301,142 @@ impl EditorBuffer {
     /// 光标到行尾。
     pub fn end(&mut self) {
         self.col = self.lines[self.row].chars().count();
+    }
+
+    // ---------- 输入历史（spec: 输入历史浏览；design D1-D5） ----------
+
+    /// 是否处于历史浏览态（分派条件用）。
+    ///
+    /// 输入: 无；输出: true = 正在浏览历史（等价 pi 的 index > -1）
+    pub fn history_browsing(&self) -> bool {
+        self.history_index.is_some()
+    }
+
+    /// 历史条数。
+    ///
+    /// 输入: 无；输出: 当前历史长度（上限 [`HISTORY_CAP`]）
+    pub fn history_len(&self) -> usize {
+        self.history.len()
+    }
+
+    /// 取历史条目（0=最新）。
+    ///
+    /// 输入: index — 0-based 索引（0=最新）；输出: 条目文本 / 越界 None
+    pub fn history_entry(&self, index: usize) -> Option<&str> {
+        self.history.get(index).map(String::as_str)
+    }
+
+    /// 当前浏览中的条目文本（None=不在浏览；GPUI Change 退出判定用）。
+    ///
+    /// 输入: 无；输出: 浏览中条目原文 / 非浏览态 None
+    pub fn history_current(&self) -> Option<&str> {
+        self.history_index
+            .and_then(|i| self.history.get(i))
+            .map(String::as_str)
+    }
+
+    /// 提交入栈（pi `addToHistory` 同源：trim、空跳过、相邻同文去重、
+    /// 头插、上限淘汰最旧）。
+    ///
+    /// 输入: text — 提交原文；
+    /// 输出: 无返回；副作用为 history 头插（可能淘汰最旧）
+    pub fn push_history(&mut self, text: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if self.history.first().is_some_and(|h| h == trimmed) {
+            return;
+        }
+        self.history.insert(0, trimmed.to_string());
+        if self.history.len() > HISTORY_CAP {
+            self.history.pop();
+        }
+    }
+
+    /// 幂等重建（design D3：先清后灌——修正 pi 渲染回灌无清除的重复入栈
+    /// 缺陷；重建覆盖此前 push，两路不打架）。
+    ///
+    /// 输入: user_msgs — 当前会话（分支）transcript 的 user 消息（时间序）；
+    /// 输出: 无返回；副作用为 history 重算、浏览态复位（当前文本留驻）
+    pub fn rebuild_history<'a>(&mut self, user_msgs: impl Iterator<Item = &'a str>) {
+        self.history.clear();
+        self.history_index = None;
+        self.history_draft = None;
+        for msg in user_msgs {
+            self.push_history(msg);
+        }
+    }
+
+    /// 退出浏览（内容变更/提交/程序化路径调用；草稿丢弃、浏览文本留驻）。
+    ///
+    /// 输入: 无；输出: 无返回；副作用为 index/draft 双清
+    pub fn exit_history_browsing(&mut self) {
+        self.history_index = None;
+        self.history_draft = None;
+    }
+
+    /// 历史步进（pi `navigateHistory` 同源的状态机）。
+    ///
+    /// 输入: direction — -1=上翻更旧 / +1=下翻更新（翻过最新回草稿）；
+    /// 输出: Some([`HistoryStep`]) = 状态已变且给出回画值（GPUI 桥/测试）；
+    ///       None = 空历史 / 越界到界 / 草稿态再 Down（一律 no-op）
+    pub fn navigate_history(&mut self, direction: i32) -> Option<HistoryStep> {
+        if self.history.is_empty() {
+            return None;
+        }
+        let current = match self.history_index {
+            Some(i) => i as isize,
+            None => -1,
+        };
+        let next = current - direction as isize;
+        // 注意：-1 = 回草稿态，合法；用 isize 比较避免 `as usize` 回绕。
+        if next < -1 || next >= self.history.len() as isize {
+            return None;
+        }
+        // 首次进入：压 undo 快照（进浏览可撤销回进前状态）+ 捕获草稿。
+        if self.history_index.is_none() && next >= 0 {
+            self.push_undo();
+            self.history_draft = Some((self.lines.clone(), self.row, self.col));
+        }
+        self.history_index = if next < 0 { None } else { Some(next as usize) };
+        if let Some(index) = self.history_index {
+            let start = direction < 0;
+            let text = self.history[index].clone();
+            self.load_history_text(&text, start);
+            Some(HistoryStep::Load { text, start })
+        } else {
+            let (lines, row, col) = self.history_draft.take()?;
+            self.lines = lines;
+            self.row = row.min(self.lines.len() - 1);
+            self.col = col.min(self.lines[self.row].chars().count());
+            self.after_yank = false;
+            Some(HistoryStep::Draft {
+                text: self.text(),
+                row: self.row,
+                col: self.col,
+            })
+        }
+    }
+
+    /// 载入历史条目文本（不入 undo；光标落行首/行尾）。
+    ///
+    /// 输入: text — 条目全文；start — true 落行首（Up）/ false 落行尾（Down）；
+    /// 输出: 无返回；副作用为替换行数组与光标
+    fn load_history_text(&mut self, text: &str, start: bool) {
+        self.lines = if text.is_empty() {
+            vec![String::new()]
+        } else {
+            text.split('\n').map(String::from).collect()
+        };
+        if start {
+            self.row = 0;
+            self.col = 0;
+        } else {
+            self.row = self.lines.len() - 1;
+            self.col = self.lines[self.row].chars().count();
+        }
+        self.after_yank = false;
     }
 
     /// 词左移（跳过空白与非空白，可跨行到上一行行尾）。
@@ -895,5 +1051,152 @@ mod tests {
         b.yank();
         assert_eq!(b.text(), "ab\ncd");
         assert_eq!((b.row(), b.col()), (1, 2));
+    }
+
+    // ===== 输入历史（task 1.1–1.3；spec: 输入历史浏览）=====
+
+    /// 1.1 入栈语义：最新在前、trim、空跳过、相邻同文去重、上限淘汰。
+    #[test]
+    fn push_history_orders_trims_dedups_and_caps() {
+        let mut b = EditorBuffer::new();
+        b.push_history("  first  ");
+        b.push_history("second");
+        b.push_history("second"); // 相邻重复 → 去重
+        b.push_history("   "); // 空白 → 跳过
+        assert_eq!(b.history_len(), 2);
+        assert_eq!(b.history_entry(0), Some("second"), "最新在前");
+        assert_eq!(b.history_entry(1), Some("first"));
+        // 上限：推满 100 后最旧被淘汰
+        for i in 0..120 {
+            b.push_history(&format!("m{i}"));
+        }
+        assert_eq!(b.history_len(), 100, "上限 100");
+        assert_eq!(b.history_entry(0), Some("m119"), "最新在顶");
+        assert_eq!(b.history_entry(99), Some("m20"), "最旧被淘汰");
+    }
+
+    /// 1.2 状态机矩阵：进入/上翻/下翻/回草稿/到界 no-op + 光标落点。
+    #[test]
+    fn navigate_history_state_machine_matrix() {
+        let mut b = EditorBuffer::new();
+        // 空历史 → no-op
+        assert_eq!(b.navigate_history(-1), None, "空历史 no-op");
+
+        b.push_history("old msg");
+        b.push_history("new msg");
+        // 首按（草稿态）→ 载入最新、光标行首；草稿已捕获
+        b.replace("draft text");
+        b.set_cursor(0, 4);
+        assert_eq!(
+            b.navigate_history(-1),
+            Some(HistoryStep::Load { text: "new msg".into(), start: true }),
+            "首按载入最新、落行首"
+        );
+        assert!(b.history_browsing(), "进入浏览态");
+        assert_eq!(b.text(), "new msg");
+        assert_eq!((b.row(), b.col()), (0, 0), "Up 载入光标行首");
+
+        // 继续上翻 → 次旧
+        assert_eq!(
+            b.navigate_history(-1),
+            Some(HistoryStep::Load { text: "old msg".into(), start: true })
+        );
+        // 到最旧再 Up → no-op（不越界）
+        let before = b.text();
+        assert_eq!(b.navigate_history(-1), None, "到界 no-op");
+        assert_eq!(b.text(), before);
+
+        // Down 回新条目，光标落行尾
+        assert_eq!(
+            b.navigate_history(1),
+            Some(HistoryStep::Load { text: "new msg".into(), start: false }),
+            "Down 载入落行尾"
+        );
+        assert_eq!((b.row(), b.col()), (0, 7));
+        // 再 Down 翻过最新 → 还原草稿（文本+光标）
+        assert_eq!(
+            b.navigate_history(1),
+            Some(HistoryStep::Draft { text: "draft text".into(), row: 0, col: 4 }),
+            "翻过最新回草稿"
+        );
+        assert!(!b.history_browsing(), "回草稿态");
+        assert_eq!(b.text(), "draft text");
+        assert_eq!((b.row(), b.col()), (0, 4), "草稿光标还原");
+        // 草稿态再 Down → no-op
+        assert_eq!(b.navigate_history(1), None, "草稿态 Down no-op");
+
+        // 进浏览时压了 undo：undo 回到进浏览前状态
+        b.replace("changed after");
+        b.navigate_history(-1);
+        b.undo();
+        assert_eq!(b.text(), "changed after", "undo 恢复进浏览前文本");
+    }
+
+    /// 1.2 多行条目载入与光标落点（Up 行首 / Down 行尾）。
+    #[test]
+    fn navigate_history_multiline_entry_cursor_placement() {
+        let mut b = EditorBuffer::new();
+        b.push_history("line1\nline2");
+        assert!(matches!(
+            b.navigate_history(-1),
+            Some(HistoryStep::Load { start: true, .. })
+        ));
+        assert_eq!(b.text(), "line1\nline2");
+        assert_eq!((b.row(), b.col()), (0, 0), "多行 Up 落首行行首");
+        assert!(matches!(
+            b.navigate_history(1),
+            Some(HistoryStep::Draft { .. }) | Some(HistoryStep::Load { start: false, .. })
+        ));
+    }
+
+    /// 1.3 幂等重建：先清后灌、覆盖 push、复位浏览态、两次重建逐字节相同。
+    #[test]
+    fn rebuild_history_is_idempotent_and_overrides_pushes() {
+        let msgs = ["m1", "m2", "m3"];
+        let mut b = EditorBuffer::new();
+        // 先 push 过东西（含重复）——重建应整体覆盖
+        b.push_history("stale-1");
+        b.push_history("stale-1");
+        b.push_history("stale-2");
+        b.rebuild_history(msgs.into_iter());
+        let first: Vec<String> = (0..b.history_len())
+            .map(|i| b.history_entry(i).unwrap().to_string())
+            .collect();
+        assert_eq!(first, ["m3", "m2", "m1"], "时间序倒灌、最新在前");
+
+        // 浏览中重建 → 复位浏览态、文本留驻
+        b.navigate_history(-1);
+        assert!(b.history_browsing());
+        b.rebuild_history(msgs.into_iter());
+        assert!(!b.history_browsing(), "重建复位浏览态");
+
+        // 逐字节幂等（pi 重复入栈缺陷的对照钉子）
+        b.rebuild_history(msgs.into_iter());
+        let second: Vec<String> = (0..b.history_len())
+            .map(|i| b.history_entry(i).unwrap().to_string())
+            .collect();
+        assert_eq!(first, second, "重复重建结果逐字节相同（不翻倍）");
+
+        // 空白消息过滤
+        b.rebuild_history(["  ", "ok"].into_iter());
+        assert_eq!(b.history_len(), 1);
+        assert_eq!(b.history_entry(0), Some("ok"));
+    }
+
+    /// 1.3 退出浏览：草稿丢弃、文本留驻、再进入重新捕获。
+    #[test]
+    fn exit_history_browsing_keeps_text_discards_draft() {
+        let mut b = EditorBuffer::new();
+        b.push_history("hist");
+        b.replace("draft");
+        b.navigate_history(-1);
+        assert_eq!(b.text(), "hist");
+        b.exit_history_browsing();
+        assert!(!b.history_browsing());
+        assert_eq!(b.text(), "hist", "浏览文本留驻");
+        // 再进入：重新捕获（草稿 = 当前文本）
+        b.navigate_history(-1);
+        b.navigate_history(1);
+        assert_eq!(b.text(), "hist", "新草稿 = 退出时文本");
     }
 }

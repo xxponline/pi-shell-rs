@@ -473,7 +473,16 @@ impl GPUIAgentTerminal {
         // push 回写用 set_value，不发 Change，不会形成回环）。
         let change_sub = cx.subscribe(&textarea, |this, _ta, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
+                // 内容变更退出浏览（task4.2）：进 Change 前记浏览条目，同步后
+                // 文本偏离该条目 → 用户改内容 → 退出；程序化回写（历史载入
+                // 推的就是条目原文）文本相等 → 不退出，天然免 guard（design D4）。
+                let browsed = this.state.app.editor.history_current().map(str::to_string);
                 this.sync_editor_from_textarea(cx);
+                if let Some(entry) = browsed
+                    && this.state.app.editor.text() != entry
+                {
+                    this.state.app.editor.exit_history_browsing();
+                }
                 this.state
                     .app
                     .update_completion(&this.commander, &this.ui_tx);
@@ -536,6 +545,14 @@ impl GPUIAgentTerminal {
                         term.state.app.completion.open,
                         &keystroke,
                     );
+                    // 输入历史分派（task4.1）：条件成立 → 共享（ToApp 分支
+                    // 自带 sync+push 桥，与 TUI 同一 history_or_* 规则）；
+                    // 否则保持原路由（菜单/浮层/修饰键优先级不变）。
+                    let route = if term.history_route(&keystroke, cx) {
+                        Route::ToApp
+                    } else {
+                        route
+                    };
                     match route {
                         Route::ToEditor => return, // 编辑键交内建编辑器
                         Route::ToScroller => {
@@ -686,16 +703,24 @@ impl GPUIAgentTerminal {
     /// 输出: 无返回值；副作用为 Textarea 文本与光标更新（文本相同则不动）。
     fn push_editor_to_textarea(&mut self, window: &mut Window, cx: &mut App) {
         let text = self.state.app.editor.text();
-        if self.textarea.read(cx).value().as_str() == text.as_str() {
-            return;
-        }
         let (row, col) = (self.state.app.editor.row(), self.state.app.editor.col());
         let position = Position {
             line: row as u32,
             character: col as u32,
         };
+        let ta = self.textarea.read(cx);
+        let value_same = ta.value().as_str() == text.as_str();
+        let cursor = ta.cursor_position();
+        let cursor_same = cursor.line == position.line && cursor.character == position.character;
+        if value_same && cursor_same {
+            return; // 无变化：不重放 set_value（避免无谓重建）
+        }
         self.textarea.update(cx, |ta, cx| {
-            ta.set_value(text, window, cx);
+            // 文本同则只对齐光标（task4.1：home/历史载入等同文本改光标的
+            // 语义键必须把光标推下去——早先整段早返回会吞掉它）。
+            if !value_same {
+                ta.set_value(text, window, cx);
+            }
             ta.set_cursor_position(position, window, cx);
         });
     }
@@ -729,6 +754,33 @@ impl GPUIAgentTerminal {
             self.state
                 .app
                 .handle_key(key, &self.commander, &self.ui_tx);
+        }
+    }
+
+    /// Up/Down 是否走共享历史分派（task4.1；与 TUI `history_or_*` 同一
+    /// 分区条件，design D2 逻辑行近似 pi 视觉行）。
+    ///
+    /// 功能: 修饰键/浮层/菜单不入（既有路由优先）；行位判定读【Textarea
+    ///       实时光标/行数】——原生移动不回写镜像，镜像行位会滞后；进
+    ///       ToApp 后 sync 先行，共享层再按镜像的空/浏览/列细分历史与
+    ///       行首/行尾；
+    /// 输入: ks — 键击；cx — gpui App（读 Textarea 实时状态）；
+    /// 输出: true = 交共享层；false = 放行原生/维持原路由
+    fn history_route(&self, ks: &Keystroke, cx: &App) -> bool {
+        if ks.modifiers.control || ks.modifiers.alt || ks.modifiers.shift {
+            return false; // 修饰键走既有路由（ctrl+↑滚动跳转、alt+up 取回…）
+        }
+        if self.state.app.overlay.is_some() || self.state.app.completion.open {
+            return false; // 浮层/菜单优先（route 原样生效）
+        }
+        let ta = self.textarea.read(cx);
+        let line = ta.cursor_position().line as usize;
+        match ks.key.as_str() {
+            // 首行（空/行中/行首都在共享层细分）；非首行 → 原生上移
+            "up" => line == 0,
+            // 末行（浏览→翻新、非浏览→行尾，与 TUI/pi 一致）；非末行 → 原生
+            "down" => line + 1 >= ta.value().split('\n').count(),
+            _ => false,
         }
     }
 
@@ -3098,6 +3150,124 @@ done
     fn input_border_width_rule_unchanged() {
         assert_eq!(super::input_border_width(false), 1, "常态 1px");
         assert_eq!(super::input_border_width(true), 2, "聚焦加粗 2px");
+    }
+
+    /// GPUI Up/Down 历史分派（task4.1；spec: 输入历史浏览）：空输入直入、
+    /// 翻过最新回空草稿、首按行中回行首次按进历史、多行非首行原生、
+    /// 末行非浏览到行尾。
+    ///
+    /// 功能: 注入历史 → 分相位按 Up/Down，断言 Textarea 值/光标与浏览态；
+    /// 输入: 开窗测试会话（输入区已聚焦）；
+    /// 输出: 断言通过（分派条件内共享、条件外原生）。
+    #[gpui_kit::test]
+    fn history_keys_route_to_shared_and_back(cx: &mut TestAppContext) {
+        let (handle, term) = open_focused(cx, "history-route");
+        cx.update(|cx| {
+            term.update(cx, |t, _| {
+                t.state.app.editor.push_history("hist msg");
+            })
+        });
+        let value = |cx: &mut TestAppContext| {
+            cx.update(|cx| term.read(cx).textarea.read(cx).value().to_string())
+        };
+        let cursor = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                let p = term.read(cx).textarea.read(cx).cursor_position();
+                (p.line as usize, p.character as usize)
+            })
+        };
+        let browsing = |cx: &mut TestAppContext| {
+            cx.update(|cx| term.read(cx).state.app.editor.history_browsing())
+        };
+        // 重置编辑器内容并回写 Textarea（复用语义回写桥）。
+        let reset = |cx: &mut TestAppContext, text: &str| {
+            cx.update(|cx| {
+                term.update(cx, |t, cx| {
+                    t.state.app.editor.replace(text);
+                    t.state.app.editor.exit_history_browsing();
+                    t.push_editor_via_active_window(cx);
+                })
+            });
+            cx.run_until_parked();
+        };
+        let press = |cx: &mut TestAppContext, key: &str| {
+            cx.update_window(handle, |_, window, cx| window.press(key, cx))
+                .unwrap_or_else(|e| panic!("press {key}: {e}"));
+            cx.run_until_parked();
+        };
+
+        // 相位 1：空输入直入最新 → 翻过最新回空草稿。
+        reset(cx, "");
+        press(cx, "up");
+        assert_eq!(value(cx), "hist msg", "空输入直入历史");
+        assert_eq!(cursor(cx), (0, 0), "载入落行首");
+        assert!(browsing(cx), "进入浏览态");
+        press(cx, "down");
+        assert_eq!(value(cx), "", "翻过最新回空草稿");
+        assert!(!browsing(cx), "回草稿态");
+
+        // 相位 2：行中首按回行首（不进历史）、次按进历史。
+        reset(cx, "draft");
+        assert_eq!(cursor(cx), (0, 5), "重置后光标行尾");
+        press(cx, "up");
+        assert_eq!(cursor(cx), (0, 0), "首按回行首");
+        assert_eq!(value(cx), "draft", "首按不载入历史");
+        assert!(!browsing(cx), "首按不进浏览");
+        press(cx, "up");
+        assert_eq!(value(cx), "hist msg", "次按进历史");
+        assert!(browsing(cx));
+
+        // 相位 3：多行——非首行 Up 原生、非末行/末行按下表分派。
+        reset(cx, "l1\nl2"); // 光标在末行尾 (1,2)
+        press(cx, "up");
+        assert_eq!(value(cx), "l1\nl2", "非首行 Up 不动历史");
+        assert_eq!(cursor(cx).0, 0, "非首行 Up 原生上移");
+        assert!(!browsing(cx), "原生移动不进浏览");
+        press(cx, "down"); // 回 (1,2)（原生下移回末行）
+        assert_eq!(cursor(cx), (1, 2), "原生下移回末行");
+        press(cx, "down"); // 末行非浏览 → 共享行尾（pi 同源，值不变）
+        assert_eq!(value(cx), "l1\nl2", "末行 Down 不改文本");
+        assert_eq!(cursor(cx), (1, 2), "末行非浏览 Down 落行尾");
+        assert!(!browsing(cx));
+    }
+
+    /// GPUI 内容变更退出浏览、程序化回写不退（task4.2；spec: 内容变更退出）。
+    ///
+    /// 功能: 空输入 Up 进浏览 → esc（ToApp 回写，文本相等）不断 →
+    ///       键入一字符（文本偏离条目）退出浏览且文本留驻；
+    /// 输入: 开窗测试会话；
+    /// 输出: 断言通过。
+    #[gpui_kit::test]
+    fn typing_exits_browsing_but_programmatic_push_does_not(cx: &mut TestAppContext) {
+        let (handle, term) = open_focused(cx, "history-change-exit");
+        cx.update(|cx| {
+            term.update(cx, |t, _| {
+                t.state.app.editor.push_history("hist msg");
+            })
+        });
+        let value = |cx: &mut TestAppContext| {
+            cx.update(|cx| term.read(cx).textarea.read(cx).value().to_string())
+        };
+        let browsing = |cx: &mut TestAppContext| {
+            cx.update(|cx| term.read(cx).state.app.editor.history_browsing())
+        };
+        // 空输入 Up → 浏览
+        cx.update_window(handle, |_, window, cx| window.press("up", cx)).expect("up");
+        cx.run_until_parked();
+        assert!(browsing(cx), "进入浏览");
+        assert_eq!(value(cx), "hist msg");
+
+        // 程序化回写（esc → ToApp → sync+push，文本与条目相等）→ 不退出
+        cx.update_window(handle, |_, window, cx| window.press("escape", cx)).expect("esc");
+        cx.run_until_parked();
+        assert!(browsing(cx), "程序化回写不退出浏览");
+        assert_eq!(value(cx), "hist msg");
+
+        // 用户键入（文本偏离条目）→ 退出浏览、文本就地留驻
+        cx.update_window(handle, |_, window, cx| window.input("x", cx)).expect("input");
+        cx.run_until_parked();
+        assert!(!browsing(cx), "键入退出浏览");
+        assert_eq!(value(cx), "xhist msg", "浏览文本就地留驻（光标行首插字）");
     }
 
     /// 浮层下滚轮被遮罩阻断（task 6.2；spec: 浮层下滚轮忽略）。

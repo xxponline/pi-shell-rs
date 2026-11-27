@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use pi_shell_rs::rpc::{CommandSender, ResponsePolicy, RpcClient};
-use pi_shell_rs::session::{Phase, SessionState};
+use pi_shell_rs::session::{Entry, Phase, SessionState};
 use ratatui::style::Color;
 use ratatui::text::Line;
 use std::collections::{HashMap, VecDeque};
@@ -1308,6 +1308,9 @@ impl App {
     fn edit_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        // 内容类编辑退出历史浏览（design D4；纯光标与历史步进不退）。
+        // 退出只清 index/draft、不碰内容，与 pi 先退后改等价，故统一后置。
+        let content_change = Self::key_mutates_content(&key);
         match key.code {
             // 纯字符插入（修饰键字符不落入）
             KeyCode::Char(c) if !ctrl && !alt => self.editor.insert(c),
@@ -1331,8 +1334,8 @@ impl App {
             KeyCode::Left => self.editor.move_left(),
             KeyCode::Right if alt => self.editor.word_right(),
             KeyCode::Right => self.editor.move_right(),
-            KeyCode::Up => self.editor.move_up(),
-            KeyCode::Down => self.editor.move_down(),
+            KeyCode::Up => self.history_or_move_up(),
+            KeyCode::Down => self.history_or_move_down(),
             KeyCode::Home => self.editor.home(),
             KeyCode::End => self.editor.end(),
             // 删除
@@ -1342,6 +1345,90 @@ impl App {
             // 未支持的 ctrl/alt 组合：忽略（不插入字符）
             _ => {}
         }
+        if content_change {
+            self.editor.exit_history_browsing();
+        }
+    }
+
+    /// 编辑键是否改变内容（历史浏览退出判定；design D4）。
+    ///
+    /// 输入: key — 原始按键（含修饰键）；
+    /// 输出: true = 插入/删除/kill/yank/undo 类内容变更；纯光标与历史步进为 false
+    fn key_mutates_content(key: &KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Char(_) if !ctrl && !alt => true,
+            KeyCode::Char(c) => matches!(
+                (c, ctrl, alt),
+                ('w', true, false)
+                    | ('u', true, false)
+                    | ('k', true, false)
+                    | ('y', true, false)
+                    | ('-', true, false)
+                    | ('d', false, true)
+                    | ('y', false, true)
+            ),
+            KeyCode::Backspace | KeyCode::Delete => true,
+            _ => false,
+        }
+    }
+
+    /// 上键历史分派（spec: 输入历史浏览；design D2——pi 同源条件）。
+    ///
+    /// 功能: 首行且（空 | 浏览中 | 列 0）→ 历史步进；首行其余 → 回行首
+    ///       （pi `moveToLineStart` 同源，替代 `move_up` 首行 no-op）；
+    ///       非首行 → 普通上移；
+    /// 输入: 无（读改 self.editor）；
+    /// 输出: 无返回；副作用为编辑器状态/历史浏览推进
+    fn history_or_move_up(&mut self) {
+        if self.editor.row() == 0
+            && (self.editor.is_empty()
+                || self.editor.history_browsing()
+                || self.editor.col() == 0)
+        {
+            let _ = self.editor.navigate_history(-1);
+        } else if self.editor.row() == 0 {
+            self.editor.home();
+        } else {
+            self.editor.move_up();
+        }
+    }
+
+    /// 下键历史分派（spec: 输入历史浏览；design D2——pi 同源条件）。
+    ///
+    /// 功能: 末行且浏览中 → 历史步进；末行其余 → 行尾（pi `moveToLineEnd`
+    ///       同源，替代 `move_down` 末行 no-op）；非末行 → 普通下移；
+    /// 输入: 无（读改 self.editor）；
+    /// 输出: 无返回；副作用为编辑器状态/历史浏览推进
+    fn history_or_move_down(&mut self) {
+        let last_row = self.editor.lines().len().saturating_sub(1);
+        if self.editor.row() == last_row && self.editor.history_browsing() {
+            let _ = self.editor.navigate_history(1);
+        } else if self.editor.row() == last_row {
+            self.editor.end();
+        } else {
+            self.editor.move_down();
+        }
+    }
+
+    /// 从当前 transcript 重建输入历史（design D3：`load_messages` 是
+    /// transcript 唯一整体重写点，单点挂钩覆盖启动/切会话/new/fork/树导航/
+    /// import；先清后灌幂等，修正 pi 渲染回灌重复入栈缺陷）。
+    ///
+    /// 输入: 无（读 self.state、写 self.editor）；
+    /// 输出: 无返回；副作用为 history 重算、浏览态复位（当前文本留驻）
+    fn rebuild_input_history(&mut self) {
+        let msgs: Vec<&str> = self
+            .state
+            .entries()
+            .iter()
+            .filter_map(|e| match e {
+                Entry::User { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        self.editor.rebuild_history(msgs.into_iter());
     }
 
     /// 构造提交类命令的 payload（纯函数，便于断言 steer 字段）。
@@ -1667,8 +1754,9 @@ impl App {
     /// → 文本（光标处插入）→ 皆空无操作；图片写失败降级试文本；全程无红条。
     ///
     /// 输入: self — 应用状态（副作用宿主）
-    /// 输出: 无返回值
-    fn paste_clipboard(&mut self) {
+    /// 输出: bool — 是否插入了内容（图片路径或文本）；皆空为 false（历史
+    ///       浏览退出仅在真变更时触发，design D4）
+    fn paste_clipboard(&mut self) -> bool {
         self.log_event("key", "paste clipboard");
         let image = crate::app::clipboard::read_image();
         let text = if image.is_none() {
@@ -1676,18 +1764,18 @@ impl App {
         } else {
             None
         };
-        self.paste_from(image, text);
+        self.paste_from(image, text)
     }
 
     /// 粘贴链核心（可注入，便于单测）：图片 → 文本 → 无操作。
     ///
     /// 输入: image — 剪贴板图片（None=无图片/读取失败）；text — 文本兜底
-    /// 输出: 无返回值；副作用为插入路径/文本
+    /// 输出: bool — 是否插入了内容（图片路径或文本）；皆空为 false
     fn paste_from(
         &mut self,
         image: Option<crate::app::clipboard::ClipboardImage>,
         text: Option<String>,
-    ) {
+    ) -> bool {
         if let Some(img) = image {
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1700,7 +1788,7 @@ impl App {
                     let text = path.to_string_lossy().to_string();
                     self.editor.insert_text(&text);
                     self.log_event("key", &format!("paste image → {text}"));
-                    return;
+                    return true;
                 }
                 Err(e) => {
                     // 图片写失败 → 按 spec 降级试文本
@@ -1711,8 +1799,10 @@ impl App {
         if let Some(text) = text {
             self.editor.insert_text(&text);
             self.log_event("key", &format!("paste text {} chars", text.chars().count()));
+            return true;
         }
         // 皆空 → 无操作（无红条）
+        false
     }
 
     /// /copy：取最后一条 assistant 文本（get_last_assistant_text），
@@ -3413,11 +3503,13 @@ impl App {
                     self.should_quit = true;
                 } else {
                     self.editor.delete_forward();
+                    self.editor.exit_history_browsing();
                 }
                 None
             }
             KeyIntent::Newline => {
                 self.editor.newline();
+                self.editor.exit_history_browsing();
                 None
             }
             KeyIntent::Ignore => None,
@@ -3429,7 +3521,9 @@ impl App {
             | KeyIntent::ScrollBottom => None, // handle_key 在前序块拦截
             KeyIntent::ExternalEditor => None, // handle_key 单独发事件
             KeyIntent::PasteClipboard => {
-                self.paste_clipboard();
+                if self.paste_clipboard() {
+                    self.editor.exit_history_browsing();
+                }
                 None
             }
             KeyIntent::CopyMessage => Some(intent), // handle_key 调 cmd_copy
@@ -3481,6 +3575,9 @@ impl App {
         }
         let message = self.editor.text();
         let message = message.trim().to_string();
+        // 提交退出历史浏览（spec: 提交 MUST 退出；pi submitValue 同源）——
+        // 斜杠/bash/常规各路一并复位（空输入已在 can_submit 拒绝）。
+        self.editor.exit_history_browsing();
         // 1) 斜杠分发（pi 次序：斜杠先于 ! 与压缩队列——压缩期也立即执行，
         //    斜杠非 prompt 不受压缩拒绝约束；dispatch 命中即清空输入）
         if command == "prompt" && self.dispatch_slash(&message, commander, report_tx) {
@@ -3524,6 +3621,10 @@ impl App {
             }
             // `!` 无命令体 → 普通消息继续
         }
+        // 消息类提交入栈（spec: 历史 = transcript user 消息；斜杠/bash 已在
+        // 上面分流返回——此后各路（常规/steer/排队/扩展旁路）都会成为 user
+        // 消息；design D3：push 只在提交，load_messages 重建整体覆盖）。
+        self.editor.push_history(&message);
         // 3) compaction 进行中：本地排队（pi 的 prompt 在压缩中直接拒绝，必须客户端排队）。
         //    例外：动态扩展命令立即发送——pi 的 _tryExecuteExtensionCommand 先于其
         //    压缩检查（skill/模板展开在其后，仍需排队，design D3）。
@@ -4015,6 +4116,9 @@ impl App {
             }
             AsyncKind::Messages => {
                 self.state.load_messages(data);
+                // 输入历史整体重建（design D3：本处为 transcript 唯一整体
+                // 重写点，单点覆盖启动/切会话/new/fork/树导航/import）。
+                self.rebuild_input_history();
                 // 会话重建/切换链应答（design D5 主路径）：整段 transcript
                 // 被替换，滚动恢复贴底跟随——钉住态切到更长会话时 clamp
                 // 救不了（top 不越界、不恢复跟随），必须显式重置。
@@ -8071,6 +8175,155 @@ done
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&cdir);
+    }
+
+    /// 上下键历史分派（task 2.1；pi 同源条件）：空输入直入、首按回行首、
+    /// 次按进历史、到界 no-op、Down 回草稿、非首行普通上移。
+    #[test]
+    fn history_arrow_dispatch_follows_pi() {
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let mut app = App::new();
+        app.editor.push_history("old msg");
+        app.editor.push_history("new msg");
+
+        // 空输入：直入最新（光标行首）
+        app.edit_key(up);
+        assert_eq!(app.editor.text(), "new msg");
+        assert_eq!((app.editor.row(), app.editor.col()), (0, 0));
+        // 次按更旧；到界再按 no-op
+        app.edit_key(up);
+        assert_eq!(app.editor.text(), "old msg");
+        app.edit_key(up);
+        assert_eq!(app.editor.text(), "old msg", "到界 no-op");
+        // Down 回新（行尾）→ 再 Down 翻过最新回空草稿
+        app.edit_key(down);
+        assert_eq!(app.editor.text(), "new msg");
+        assert_eq!(app.editor.col(), 7, "Down 载入落行尾");
+        app.edit_key(down);
+        assert_eq!(app.editor.text(), "", "翻过最新回空草稿");
+
+        // 非空草稿：首按回行首（不载入），次按进历史
+        app.editor.replace("draft text");
+        app.editor.set_cursor(0, 4);
+        app.edit_key(up);
+        assert_eq!(app.editor.col(), 0, "首按回行首");
+        assert_eq!(app.editor.text(), "draft text", "首按不载入历史");
+        app.edit_key(up);
+        assert_eq!(app.editor.text(), "new msg", "次按进历史");
+
+        // 程序化 replace 不退出（真实流由 edit_key/paste 路径退出）——
+        // 多行分派测试前显式退出，隔离「非浏览态」的首/末行分派
+        app.editor.exit_history_browsing();
+        // 非首行 → 普通上移（多行）
+        app.editor.replace("l1\nl2");
+        app.editor.set_cursor(1, 0);
+        app.edit_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!((app.editor.row(), app.editor.col()), (0, 0), "非首行普通上移");
+        // 非末行 Down → 普通下移（列夹取保持）
+        app.edit_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!((app.editor.row(), app.editor.col()), (1, 0), "非末行普通下移");
+        // 末行（非浏览）Down → 行尾（pi moveToLineEnd 同源）
+        app.editor.set_cursor(1, 0);
+        app.edit_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!((app.editor.row(), app.editor.col()), (1, 2), "末行 Down 落行尾");
+    }
+
+    /// 内容变更退出浏览、纯光标移动不退（task 2.2）。
+    #[test]
+    fn content_change_exits_browsing_but_cursor_does_not() {
+        let mut app = App::new();
+        app.editor.push_history("hist entry");
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        app.edit_key(up);
+        assert!(app.editor.history_browsing(), "空输入 Up 进入浏览");
+
+        // 纯光标：Left 不退
+        app.edit_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(app.editor.history_browsing(), "光标移动不退出浏览");
+
+        // 内容变更：插字符退出 + 浏览文本就地成草稿
+        app.edit_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(!app.editor.history_browsing(), "打字退出浏览");
+        assert_eq!(app.editor.text(), "xhist entry", "浏览文本就地留驻");
+
+        // 再进入：先回行首（col=1）→ 次按才进历史
+        app.edit_key(up);
+        assert_eq!(app.editor.col(), 0, "行中首按回行首");
+        assert!(!app.editor.history_browsing(), "首按不进历史");
+        app.edit_key(up);
+        assert!(app.editor.history_browsing(), "次按进历史");
+        assert_eq!(app.editor.text(), "hist entry");
+    }
+
+    /// 提交入栈、斜杠不入栈、流式事件不触碰历史（task 2.3 / 3.2）。
+    #[test]
+    fn submit_pushes_history_slash_and_streams_do_not() {
+        let (client, cdir, _log) =
+            recording_commander("hist-push", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        let mut app = App::new();
+
+        // 正常提交：入栈 + 清空 + 退出浏览
+        app.editor.push_history("old");
+        let _ = app.editor.navigate_history(-1); // 构造浏览态
+        assert!(app.editor.history_browsing());
+        app.editor.replace("hello there");
+        app.submit_as(&commander, &tx, "prompt");
+        assert_eq!(app.editor.history_entry(0), Some("hello there"), "正常提交入栈");
+        assert!(app.editor.is_empty(), "提交清空输入");
+        assert!(!app.editor.history_browsing(), "提交退出浏览");
+
+        // 斜杠不是 transcript user 消息 → 不入栈
+        app.editor.replace("/changelog");
+        app.submit_as(&commander, &tx, "prompt");
+        assert_eq!(
+            app.editor.history_entry(0),
+            Some("hello there"),
+            "斜杠不入栈"
+        );
+
+        // 流式 core 事件落 transcript 但不触碰 history（只 push 于提交）
+        let before = app.editor.history_len();
+        // 非扩展/非压缩事件：apply_core_event 即 session 归约（列 A 直调同源）
+        app.state
+            .handle(&serde_json::json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"streamed user"}]}}));
+        app.state
+            .handle(&serde_json::json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"reply"}]}}));
+        assert_eq!(app.editor.history_len(), before, "流式 append 不触碰 history");
+
+        let _ = std::fs::remove_dir_all(&cdir);
+    }
+
+    /// load_messages 整体重建历史（task 3.1）：user 消息入史、幂等不翻倍、
+    /// 覆盖此前 push、浏览态复位。
+    #[test]
+    fn messages_response_rebuilds_history_idempotently() {
+        let mut app = App::new();
+        app.editor.push_history("stale"); // 重建前脏数据
+
+        let payload = serde_json::json!({"messages":[
+            {"role":"user","content":[{"type":"text","text":"q1"}]},
+            {"role":"assistant","content":[{"type":"text","text":"a1"}]},
+            {"role":"user","content":[{"type":"text","text":"q2"}]}
+        ]});
+        app.handle_async_data(AsyncKind::Messages, 1, &payload);
+        assert_eq!(app.editor.history_len(), 2, "只取 user、覆盖 push");
+        assert_eq!(app.editor.history_entry(0), Some("q2"), "最新在前");
+        assert_eq!(app.editor.history_entry(1), Some("q1"));
+
+        // 幂等：同载荷重建两次结果逐字节相同（pi 重复入栈缺陷的对照钉子）
+        app.handle_async_data(AsyncKind::Messages, 2, &payload);
+        assert_eq!(app.editor.history_len(), 2, "重复重建不翻倍");
+        assert_eq!(app.editor.history_entry(0), Some("q2"));
+
+        // 浏览中重建 → 复位浏览态、文本留驻
+        let _ = app.editor.navigate_history(-1);
+        assert!(app.editor.history_browsing());
+        app.handle_async_data(AsyncKind::Messages, 3, &payload);
+        assert!(!app.editor.history_browsing(), "重建复位浏览态");
+        assert_eq!(app.editor.text(), "q2", "浏览文本留驻");
     }
 
     // ── 双击 Esc（spec：双击 Esc 动作） ──
