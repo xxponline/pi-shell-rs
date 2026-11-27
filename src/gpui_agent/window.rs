@@ -19,18 +19,50 @@ use crate::gpui_agent::terminal::GPUIAgentTerminal;
 ///       由组件的退出钩子/实体 Drop 回收 pi）；
 /// 输入: 无（`PI_BIN` 环境变量覆盖二进制路径）；
 /// 输出: 无返回值；正常退出码 0，启动失败退出码 1（stderr 中文可读错误）。
-/// 固定浅色主题模式（spec: 独立窗口浅色模式固定）。
+/// pi `scrollbarTrack` 预计算（light.json okhsl → sRGB，task1.4）。
+const SCROLLBAR_TRACK_LIGHT: &str = "#e1e3e4";
+/// pi `scrollbarThumb` 预计算（light.json）。
+const SCROLLBAR_THUMB_LIGHT: &str = "#96a0a4";
+/// pi `scrollbarTrack` 预计算（dark.json）。
+const SCROLLBAR_TRACK_DARK: &str = "#484e52";
+/// pi `scrollbarThumb` 预计算（dark.json）。
+const SCROLLBAR_THUMB_DARK: &str = "#97a0a5";
+
+/// 滚动条 token 按 mode 覆写为 pi 值（task1.4；spec: 消息区滚动条 pi 同源）。
 ///
-/// 功能: 把全局主题显式置为 Light，不安装系统外观订阅；
-/// 输入: cx — gpui App 上下文（须已执行 `gpui_kit::init`）；
-/// 输出: 无返回；副作用为全局 `Theme.mode = Light`，此后系统外观
-///       变化不影响本窗口配色（完整主题系统为后续 change）。
-fn pin_light_theme(cx: &mut gpui_kit::App) {
-    gpui_kit::component::theme::Theme::change(
-        gpui_kit::component::theme::ThemeMode::Light,
-        None,
-        cx,
-    );
+/// 功能: 把全局 Theme 的 light/dark 两份 `ThemeConfig.colors` 的
+///       `scrollbar.background` / `scrollbar.thumb.background` /
+///       `scrollbar.thumb.hover.background` 三个字段全部换成 pi
+///       `scrollbarTrack/Thumb` 预计算 hex（pi 无 hover token → hover 取
+///       thumb 值；kit 默认主题显式给了 hover，不写会残留默认灰），再触发
+///       `Theme::change` 重解析；
+/// 输入: cx — gpui App（须已 `gpui_kit::init` 且全局 Theme 已创建；
+///       未创建时直接跳过——首次 `Theme::change` 后再调即可）；
+/// 输出: 无返回；副作用为全局主题配置与解析色（track/thumb/hover）更新。
+pub(crate) fn apply_pi_scrollbar_tokens(cx: &mut gpui_kit::App) {
+    use gpui_kit::component::theme::{Theme, ThemeConfig};
+    use std::rc::Rc;
+    if !cx.has_global::<Theme>() {
+        return;
+    }
+    let (light, dark, mode) = {
+        let t = Theme::global(cx);
+        (t.light_theme.clone(), t.dark_theme.clone(), t.mode)
+    };
+    let patch = |cfg: Rc<ThemeConfig>, track: &str, thumb: &str| -> Rc<ThemeConfig> {
+        let mut c = cfg.as_ref().clone();
+        c.colors.scrollbar = Some(track.into());
+        c.colors.scrollbar_thumb = Some(thumb.into());
+        c.colors.scrollbar_thumb_hover = Some(thumb.into());
+        Rc::new(c)
+    };
+    {
+        let t = Theme::global_mut(cx);
+        t.light_theme = patch(light, SCROLLBAR_TRACK_LIGHT, SCROLLBAR_THUMB_LIGHT);
+        t.dark_theme = patch(dark, SCROLLBAR_TRACK_DARK, SCROLLBAR_THUMB_DARK);
+    }
+    // reload_mode=true：换配置后重应用（`Theme::change` 文档承诺的通路）。
+    Theme::change(mode, None, cx);
 }
 
 pub fn run() {
@@ -47,8 +79,10 @@ pub fn run() {
 
     gpui_kit::application().run(|cx| {
         gpui_kit::init(cx);
-        // 启动即浅色（spec: 独立窗口浅色模式固定；不装外观订阅）。
-        pin_light_theme(cx);
+        // 启动默认 System + 按当前外观应用（spec: 启动默认跟随系统外观；
+        // A3 内存态不落盘），随后覆写滚动条 token（task1.4；Theme 已创建）。
+        crate::gpui_agent::theme::init_theme(cx);
+        apply_pi_scrollbar_tokens(cx);
         // 关窗即退（宿主仓实测：macOS 默认 Explicit 会进程残留）。
         cx.set_quit_mode(QuitMode::LastWindowClosed);
 
@@ -65,6 +99,11 @@ pub fn run() {
         };
 
         gpui_kit::open_window(options, cx, |window, cx| {
+            // system 随 OS 外观热切换（task2.2）：订阅保活于 Global 至退出；
+            // 固定 Light/Dark 在回调内自判不动作（幂等）。
+            let sub =
+                window.observe_window_appearance(crate::gpui_agent::theme::on_appearance_changed);
+            cx.set_global(crate::gpui_agent::theme::AppearanceSubscription(sub));
             let terminal = cx.new(|cx| GPUIAgentTerminal::new(session, window, cx));
             // 开窗即聚焦输入窗（后续焦点由 gpui 焦点环/点击维护）。
             terminal.read(cx).input_focus().focus(window, cx);
@@ -78,20 +117,44 @@ pub fn run() {
 mod tests {
     // 显式导入（不 glob）：glob 会把 `gpui::*` 的 `test` 属性宏引进作用域，
     // gpui 测试宏展开发出的裸 `#[test]` 会解析到它 → 无限递归（kit lib.rs 注释）。
-    use super::pin_light_theme;
+    use super::apply_pi_scrollbar_tokens;
     use gpui_kit::component::theme::{Theme, ThemeMode};
 
-    /// pin_light_theme 必须把主题强制为 Light（spec: 启动即浅色）。
+    /// pi 滚动条 token 覆写（task1.4）：两 mode 解析 track/thumb = pi 预计算，
+    /// hover = thumb（pi 无 hover token），切回 mode 补丁仍在。
     ///
-    /// 功能: 先翻成 Dark 模拟被外观带偏，再 pin，断言回 Light；
+    /// 功能: pin 后打补丁 → 断言浅色解析值；切 Dark 再断言；切回 Light 复验；
     /// 输入: 测试上下文（`gpui_kit::init` 已执行）；
-    /// 输出: 断言通过（mode 由 Dark 复位为 Light）。
+    /// 输出: 断言通过（track/thumb/hover 均为 pi 同源 RGB）。
     #[gpui_kit::test]
-    fn pin_light_theme_forces_light_mode(cx: &mut gpui_kit::TestAppContext) {
+    fn pi_scrollbar_tokens_apply_per_mode(cx: &mut gpui_kit::TestAppContext) {
         cx.update(gpui_kit::init);
-        cx.update(|cx| Theme::change(ThemeMode::Dark, None, cx));
-        cx.update(|cx| assert_eq!(Theme::global(cx).mode, ThemeMode::Dark, "前置：先处于 Dark"));
-        cx.update(pin_light_theme);
-        cx.update(|cx| assert_eq!(Theme::global(cx).mode, ThemeMode::Light, "pin 后必须 Light"));
+        cx.update(crate::gpui_agent::theme::init_theme);
+        cx.update(apply_pi_scrollbar_tokens);
+        let rgb = |h: gpui_kit::Hsla| {
+            let c: gpui_kit::Rgba = h.into();
+            (
+                (c.r * 255.0).round() as u8,
+                (c.g * 255.0).round() as u8,
+                (c.b * 255.0).round() as u8,
+            )
+        };
+        cx.update(|cx| {
+            let t = Theme::global(cx);
+            assert_eq!(rgb(t.scrollbar), (0xe1, 0xe3, 0xe4), "浅 track");
+            assert_eq!(rgb(t.scrollbar_thumb), (0x96, 0xa0, 0xa4), "浅 thumb");
+            assert_eq!(
+                rgb(t.scrollbar_thumb_hover),
+                (0x96, 0xa0, 0xa4),
+                "浅 hover = thumb（pi 无 hover token）"
+            );
+            Theme::change(ThemeMode::Dark, None, cx);
+            let t = Theme::global(cx);
+            assert_eq!(rgb(t.scrollbar), (0x48, 0x4e, 0x52), "深 track");
+            assert_eq!(rgb(t.scrollbar_thumb), (0x97, 0xa0, 0xa5), "深 thumb");
+            Theme::change(ThemeMode::Light, None, cx);
+            let t = Theme::global(cx);
+            assert_eq!(rgb(t.scrollbar), (0xe1, 0xe3, 0xe4), "切回浅 track 补丁仍在");
+        });
     }
 }

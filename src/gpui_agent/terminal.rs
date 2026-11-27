@@ -33,10 +33,13 @@ use crate::gpui_agent::scroll::{ScrollMetrics, jump_target, page_down_target, pa
 use crate::gpui_agent::input::keystroke_to_keyevents;
 use crate::rpc::{ClientEvent, CommandSender};
 use crate::session::{Block, Entry, SessionState, ToolExecution, ToolStatus};
-/// 浅色主题调色板（spec: 独立窗口浅色模式固定；design D1）。
+/// 主题调色板双表（spec: 独立窗口主题三模式；design D2/D6）。
 ///
-/// 收拢原散落的硬编码色：浅色面板/文字一组，深色工具卡上的浅字一组；
-/// 后续主题 change 将整体替换为 theme token。
+/// `LIGHT`/`DARK` 两套31 字段常数：语义 token 由 pi `light.json`/
+/// `dark.json` 编写期预计算（pi-tui 同算法，校验 5/5 命中既有 dark 现值），
+/// 面板底类为自有值（浅色现值、深色手调；input 边框深色取 pi dark border）。
+/// 消费点按 resolved mode 取表（render 入口解析一次，纯函数链穿 `pal`
+/// 参数——task1.2/1.3 已接通，旧单表常数已删除）。
 mod palette {
     use gpui_kit::Rgba;
 
@@ -50,69 +53,261 @@ mod palette {
         }
     }
 
-    // —— 浅色面板（Light 主题底色）——
-    /// 根/消息区/补全菜单底（白）。
-    pub(super) const CHAT_BG: Rgba = hex(0xffffff);
-    /// 状态行底。
-    pub(super) const STATUS_BG: Rgba = hex(0xf0f0f2);
-    /// 输入区边框（spec: 输入区简约边框——lighting 纯黑）。
-    pub(super) const INPUT_BORDER: Rgba = hex(0x000000);
-    /// 补全选中行底。
-    pub(super) const COMP_SELECTED_BG: Rgba = hex(0xd8e6fb);
+    /// 随 mode 解析的完整调色板（每字段均有 light/dark 两值）。
+    ///（`gpui_kit::Rgba` 无 `Debug`，断言经 `rgb()` 元组转译）
+    #[derive(Clone, Copy, PartialEq)]
+    pub(super) struct Palette {
+        // —— 自有面板面（pi 无 bg token：终端留白）——
+        /// 根/消息区/补全菜单底。
+        pub(super) chat_bg: Rgba,
+        /// 状态行底。
+        pub(super) status_bg: Rgba,
+        /// 输入区边框（浅=纯黑 spec 钉定；深=pi dark border）。
+        pub(super) input_border: Rgba,
+        /// 补全选中行底。
+        pub(super) comp_selected_bg: Rgba,
+        /// 补全普通行文字。
+        pub(super) comp_text: Rgba,
+        /// 补全选中行文字。
+        pub(super) comp_text_selected: Rgba,
+        /// 补全计数行文字。
+        pub(super) comp_count_text: Rgba,
+        // —— pi 同源语义 token（light.json / dark.json 预计算）——
+        /// "You:" 标签（← accent）。
+        pub(super) user_label: Rgba,
+        /// thinking 正文/占位（← thinkingText）。
+        pub(super) thinking_text: Rgba,
+        /// bash 输出摘要（← muted）。
+        pub(super) bash_body: Rgba,
+        /// bash 命令行（← warning 系）。
+        pub(super) bash_cmd: Rgba,
+        /// bash 运行中/取消/truncated 提示（← warning）。
+        pub(super) warn: Rgba,
+        /// 通知：错误（← error）。
+        pub(super) notice_error: Rgba,
+        /// 通知：重试/警告（← warning）。
+        pub(super) notice_retry: Rgba,
+        /// 通知：普通（← muted）。
+        pub(super) notice_default: Rgba,
+        /// bash `exit 0`（← success）。
+        pub(super) exit_ok: Rgba,
+        /// bash `exit N`（N≠0，← error）。
+        pub(super) exit_bad: Rgba,
+        /// 工具卡结果预览（← toolOutput）。
+        pub(super) tool_preview_text: Rgba,
+        /// 工具卡头行参数/正文（← toolTitle）。
+        pub(super) card_text: Rgba,
+        /// 工具卡计时/折叠提示（← dim）。
+        pub(super) card_dim: Rgba,
+        /// 工具卡状态：运行中（← warning）。
+        pub(super) card_status_run: Rgba,
+        /// 工具卡状态：成功（← success）。
+        pub(super) card_status_ok: Rgba,
+        /// 工具卡状态：失败（← error）。
+        pub(super) card_status_err: Rgba,
+        /// 工具卡 `Fg` 段 ANSI 红（diff 删除行，← toolDiffRemoved）。
+        pub(super) card_fg_red: Rgba,
+        /// 工具卡 `Fg` 段 ANSI 绿（diff 新增行，← toolDiffAdded）。
+        pub(super) card_fg_green: Rgba,
+        /// 工具卡 `Fg` 段 ANSI 黄（截断警告，← warning）。
+        pub(super) card_fg_yellow: Rgba,
+        /// 工具卡 `Fg` 段 ANSI 暗灰（← syntaxComment）。
+        pub(super) card_fg_gray: Rgba,
+        /// 工具卡面板底：运行中（← toolPendingBg；混血根源，随模式）。
+        pub(super) card_bg_pending: Rgba,
+        /// 工具卡面板底：成功（← toolSuccessBg）。
+        pub(super) card_bg_ok: Rgba,
+        /// 工具卡面板底：失败（← toolErrorBg）。
+        pub(super) card_bg_err: Rgba,
+        /// 工具卡 `Fg` 段 ANSI 青（pi 无青 token，自有：浅手调/深现值）。
+        pub(super) card_fg_cyan: Rgba,
+    }
 
-    // —— 浅色面板上的文字 ——
-    /// 补全选中行文字。
-    pub(super) const COMP_TEXT_SELECTED: Rgba = hex(0x1f1f1f);
-    /// 补全普通行文字。
-    pub(super) const COMP_TEXT: Rgba = hex(0x4a4a4a);
-    /// 补全计数行文字。
-    pub(super) const COMP_COUNT_TEXT: Rgba = hex(0x707070);
-    /// "You:" 标签。
-    pub(super) const USER_LABEL: Rgba = hex(0x2f7fe0);
-    /// thinking 正文/占位（弱化斜体；占位与展开同角色，≡ TUI 单一样式）。
-    pub(super) const THINKING_TEXT: Rgba = hex(0x666666);
-    /// bash 输出摘要（弱化正文）。
-    pub(super) const BASH_BODY: Rgba = hex(0x606060);
-    /// 通知：错误。
-    pub(super) const NOTICE_ERROR: Rgba = hex(0xc62828);
-    /// 通知：重试/警告。
-    pub(super) const NOTICE_RETRY: Rgba = hex(0x946200);
-    /// 通知：普通（弱化）。
-    pub(super) const NOTICE_DEFAULT: Rgba = hex(0x666666);
-    /// bash 命令行（浅底深黄粗体，对齐 TUI 黄粗语义）。
-    pub(super) const BASH_CMD: Rgba = hex(0x8a6d00);
-    /// bash 运行中/取消/truncated 提示（浅底琥珀）。
-    pub(super) const WARN: Rgba = hex(0x946200);
-    /// bash `exit 0`（浅底深绿）。
-    pub(super) const EXIT_OK: Rgba = hex(0x1b7f2e);
-    /// bash `exit N`（N≠0，浅底深红粗体）。
-    pub(super) const EXIT_BAD: Rgba = hex(0xb71c1c);
+    /// 浅色表（pi light.json 预计算 + 自有浅色现值）。
+    pub(super) const LIGHT: Palette = Palette {
+        chat_bg: hex(0xffffff),
+        status_bg: hex(0xf0f0f2),
+        input_border: hex(0x000000),
+        comp_selected_bg: hex(0xd8e6fb),
+        comp_text: hex(0x4a4a4a),
+        comp_text_selected: hex(0x1f1f1f),
+        comp_count_text: hex(0x707070),
+        user_label: hex(0x7459b4),
+        thinking_text: hex(0x7c868c),
+        bash_body: hex(0x677176),
+        bash_cmd: hex(0x8f6802),
+        warn: hex(0x8f6802),
+        notice_error: hex(0xc8253d),
+        notice_retry: hex(0x8f6802),
+        notice_default: hex(0x677176),
+        exit_ok: hex(0x337e58),
+        exit_bad: hex(0xc8253d),
+        tool_preview_text: hex(0x677176),
+        card_text: hex(0x3b3f41),
+        card_dim: hex(0x879095),
+        card_status_run: hex(0x8f6802),
+        card_status_ok: hex(0x337e58),
+        card_status_err: hex(0xc8253d),
+        card_fg_red: hex(0xc8253d),
+        card_fg_green: hex(0x337e58),
+        card_fg_yellow: hex(0x8f6802),
+        card_fg_gray: hex(0x677176),
+        card_bg_pending: hex(0xe4e5e6),
+        card_bg_ok: hex(0xdee9e1),
+        card_bg_err: hex(0xeee2e1),
+        card_fg_cyan: hex(0x0097a7),
+    };
 
-    // —— 深色工具卡（底色来自 TuiTheme = pi dark）上的浅字 ——
-    /// 工具卡结果预览（卡底为深色，保持浅字）。
-    pub(super) const TOOL_PREVIEW_TEXT: Rgba = hex(0x9a9a9a);
-    /// 工具卡状态：运行中（深底亮琥珀，提亮保可读）。
-    pub(super) const CARD_STATUS_RUN: Rgba = hex(0xe6c14a);
-    /// 工具卡状态：成功（深底亮绿）。
-    pub(super) const CARD_STATUS_OK: Rgba = hex(0x7fd07f);
-    /// 工具卡状态：失败（深底亮红）。
-    pub(super) const CARD_STATUS_ERR: Rgba = hex(0xe07575);
-    /// 工具卡头行参数/正文（深底浅字）。
-    pub(super) const CARD_TEXT: Rgba = hex(0xd8d8d8);
-    /// 工具卡计时/折叠提示（深底灰字）。
-    pub(super) const CARD_DIM: Rgba = hex(0x9a9a9a);
-    /// 工具卡 `Fg` 段的 ANSI 红提亮（diff 删除行等，深底可读）。
-    pub(super) const CARD_FG_RED: Rgba = hex(0xe07575);
-    /// 工具卡 `Fg` 段的 ANSI 绿提亮（diff 新增行等）。
-    pub(super) const CARD_FG_GREEN: Rgba = hex(0x7fd07f);
-    /// 工具卡 `Fg` 段的 ANSI 黄提亮（截断警告等）。
-    pub(super) const CARD_FG_YELLOW: Rgba = hex(0xe6c14a);
-    /// 工具卡 `Fg` 段的 ANSI 青提亮（diff hunk 头等）。
-    pub(super) const CARD_FG_CYAN: Rgba = hex(0x6ec6c6);
-    /// 工具卡 `Fg` 段的 ANSI 暗灰提亮（深底可读）。
-    pub(super) const CARD_FG_GRAY: Rgba = hex(0x9a9a9a);
+    /// 深色表（pi dark.json 预计算 + 自有深色手调）。
+    pub(super) const DARK: Palette = Palette {
+        chat_bg: hex(0x1e1e1e),
+        status_bg: hex(0x26262a),
+        input_border: hex(0x5fa8cc),
+        comp_selected_bg: hex(0x213b49),
+        comp_text: hex(0xdee0e1),
+        comp_text_selected: hex(0xdee0e1),
+        comp_count_text: hex(0x9da5a9),
+        user_label: hex(0xa798d7),
+        thinking_text: hex(0x96a0a4),
+        bash_body: hex(0x9da5a9),
+        bash_cmd: hex(0xcd9a22),
+        warn: hex(0xcd9a22),
+        notice_error: hex(0xea7f81),
+        notice_retry: hex(0xcd9a22),
+        notice_default: hex(0x9da5a9),
+        exit_ok: hex(0x68b78d),
+        exit_bad: hex(0xea7f81),
+        tool_preview_text: hex(0x9da5a9),
+        card_text: hex(0xdee0e1),
+        card_dim: hex(0x7e888e),
+        card_status_run: hex(0xcd9a22),
+        card_status_ok: hex(0x68b78d),
+        card_status_err: hex(0xea7f81),
+        card_fg_red: hex(0xea7f81),
+        card_fg_green: hex(0x68b78d),
+        card_fg_yellow: hex(0xcd9a22),
+        card_fg_gray: hex(0x9da5a9),
+        card_bg_pending: hex(0x34383a),
+        card_bg_ok: hex(0x254131),
+        card_bg_err: hex(0x5b282a),
+        card_fg_cyan: hex(0x6ec6c6),
+    };
+
+    /// 按 resolved 是否深色取表（task2 接 Theme 全局 mode；本任务先纯函数可测）。
+    ///
+    /// 输入: is_dark — resolved mode（system 已解析为 Light/Dark）
+    /// 输出: 指向对应静态表的引用
+    pub(super) const fn for_dark(is_dark: bool) -> &'static Palette {
+        if is_dark { &DARK } else { &LIGHT }
+    }
+
+    /// 双表取值与源一致性（task1.1 验证；无 TTY 纯逻辑）。
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Rgba → u8 三元组（`Rgba` 无 `Debug`，断言经此转译）。
+        fn rgb(c: Rgba) -> (u8, u8, u8) {
+            (
+                (c.r * 255.0).round() as u8,
+                (c.g * 255.0).round() as u8,
+                (c.b * 255.0).round() as u8,
+            )
+        }
+
+        /// 深色卡三态必须与 `TuiTheme::default`（pi dark 同源）逐值一致。
+        #[test]
+        fn dark_card_panels_match_tui_theme_defaults() {
+            let t = crate::app::theme::TuiTheme::default();
+            let rat = |c: ratatui::style::Color| match c {
+                ratatui::style::Color::Rgb(r, g, b) => (r, g, b),
+                other => panic!("应为 Rgb 色: {other:?}"),
+            };
+            assert_eq!(rgb(DARK.card_bg_pending), rat(t.tool_running_bg));
+            assert_eq!(rgb(DARK.card_bg_err), rat(t.tool_error_bg));
+            assert_eq!(rgb(DARK.card_bg_ok), rat(t.tool_success_bg));
+        }
+
+        /// 浅色卡三态为浅值（pi light 同源），与深色表不同。
+        #[test]
+        fn light_card_panels_are_light() {
+            assert_eq!(rgb(LIGHT.card_bg_pending), (0xe4, 0xe5, 0xe6));
+            assert_eq!(rgb(LIGHT.card_bg_ok), (0xde, 0xe9, 0xe1));
+            assert_eq!(rgb(LIGHT.card_bg_err), (0xee, 0xe2, 0xe1));
+            assert_ne!(rgb(LIGHT.card_bg_pending), rgb(DARK.card_bg_pending));
+        }
+
+        /// 面板面：浅=现值（白底/黑边 spec 钉定），深=手调底 + pi dark 边框。
+        #[test]
+        fn panel_surfaces_per_mode() {
+            assert_eq!(rgb(LIGHT.chat_bg), (255, 255, 255));
+            assert_eq!(rgb(LIGHT.input_border), (0, 0, 0));
+            assert_eq!(rgb(DARK.chat_bg), (0x1e, 0x1e, 0x1e));
+            assert_eq!(rgb(DARK.input_border), (0x5f, 0xa8, 0xcc));
+        }
+
+        /// 青色自有（pi 无青 token，syntaxType 实为紫）：两模式各自取值。
+        #[test]
+        fn cyan_self_owned_per_mode() {
+            assert_eq!(rgb(LIGHT.card_fg_cyan), (0x00, 0x97, 0xa7));
+            assert_eq!(rgb(DARK.card_fg_cyan), (0x6e, 0xc6, 0xc6));
+        }
+
+        /// `for_dark` 按 resolved 选表（`const` 提升使地址不稳，故值比较）。
+        #[test]
+        fn for_dark_selects_table() {
+            assert!(*for_dark(true) == DARK, "is_dark 应选 DARK 表");
+            assert!(*for_dark(false) == LIGHT, "浅色应选 LIGHT 表");
+            assert_eq!(rgb(for_dark(true).chat_bg), rgb(DARK.chat_bg));
+            assert_eq!(rgb(for_dark(false).chat_bg), rgb(LIGHT.chat_bg));
+        }
+    }
 }
 
+
+/// 输入区边框宽度规则（spec: 输入区简约边框 MODIFIED——常态 1px、聚焦加粗
+/// 2px；两模式同规，纯逻辑无 TTY 可测）。
+///
+/// 输入: focused — 输入区当前焦点态；
+/// 输出: 边框像素宽（1 或 2）
+fn input_border_width(focused: bool) -> u16 {
+    if focused { 2 } else { 1 }
+}
+
+/// 测试探针：Rgba → 0xRRGGBB 打包（仅 test 构建；task2.3 帧色断言）。
+#[cfg(test)]
+fn pack_rgb(c: gpui_kit::Rgba) -> u32 {
+    (((c.r * 255.0).round() as u32) << 16)
+        | (((c.g * 255.0).round() as u32) << 8)
+        | (c.b * 255.0).round() as u32
+}
+
+#[cfg(test)]
+thread_local! {
+    /// 测试探针（task2.3/3.2）：最近一帧消息区底 / 输入边框 / 卡面板底
+    /// （0xRRGGBB；按测试线程隔离——进程级 static 会被并行测试互踩）。
+    static PROBE_CHAT_BG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static PROBE_INPUT_BORDER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static PROBE_CARD_BG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// 读测试探针：最近一帧消息区底色（仅 test 构建；task2.3/3.2 断言）。
+#[cfg(test)]
+fn probe_chat_bg() -> u32 {
+    PROBE_CHAT_BG.with(|c| c.get())
+}
+
+/// 读测试探针：最近一帧输入边框色（仅 test 构建）。
+#[cfg(test)]
+fn probe_input_border() -> u32 {
+    PROBE_INPUT_BORDER.with(|c| c.get())
+}
+
+/// 读测试探针：最近渲染的卡面板底色（仅 test 构建）。
+#[cfg(test)]
+fn probe_card_bg() -> u32 {
+    PROBE_CARD_BG.with(|c| c.get())
+}
 
 /// 网格字号（px）——与宿主 AgentTerminal 同值（13px），保证度量口径一致。
 const GRID_FONT_SIZE_PX: f32 = 13.;
@@ -192,8 +387,11 @@ impl TerminalState {
     /// 输入: 无；
     /// 输出: 空态 `TerminalState`。
     fn new() -> Self {
+        let mut app = AppState::new();
+        // GPUI 表面标记：/settings 含 Theme 行（共享层只认标记不认类型）。
+        app.set_surface(crate::app::SurfaceKind::Gpui);
         Self {
-            app: AppState::new(),
+            app,
             closed: false,
         }
     }
@@ -675,8 +873,9 @@ impl GPUIAgentTerminal {
     ///
     /// 功能: Info/SendFailed → notice（绿/红，同 ratatui），AsyncData/
     ///       CommandsFetched → 缓存回填 + 补全重算，RestoreQueued → 回填
-    ///       输入框，OpenModelSelect → 选择器不可用提示（P0 无浮层）；
-    ///       其余（外部编辑器/主题等）P0 静默丢弃；
+    ///       输入框，OpenModelSelect → 选择器不可用提示（P0 无浮层），
+    ///       ThemeCycle → 循环三态并应用（task3.1）；
+    ///       其余（外部编辑器等）P0 静默丢弃；
     /// 输入: ev — 回报事件（泵任务逐条投递）；
     /// 输出: 无返回值；副作用为 notice/缓存/输入框更新（随后 notify 重绘）。
     fn apply_ui_event(&mut self, ev: &UiEvent, cx: &mut Context<Self>) {
@@ -700,6 +899,11 @@ impl GPUIAgentTerminal {
                 // 回填改的是 App.editor：立即回写 Textarea，否则下一次语义键
                 // 的“键前同步”会用空编辑器反清镜像（task 4.3 桥接时序）。
                 self.push_editor_via_active_window(cx);
+            }
+            UiEvent::ThemeCycle => {
+                // /settings Theme 行（task3.1）：循环三态并应用；A3 不落盘，
+                // 重绘由 Theme::change 的 refresh_windows 驱动。
+                crate::gpui_agent::theme::cycle_and_apply(cx);
             }
             UiEvent::OpenModelSelect => {
                 self.state.app.notice = Some((
@@ -790,6 +994,16 @@ impl Render for GPUIAgentTerminal {
     /// 输入: window — 网格度量来源（字体表/像素吸附）；cx — 实体上下文（未用）；
     /// 输出: 垂直 flex 元素树；三个分区各带 id 与观测锚点（无头测试 find 断言）。
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 调色板随全局 mode 解析一次（task1.2：内建控件随 kit Theme 切换，
+        // 我们的 token 走同一 mode；system/默认在 task2 接入）。
+        let pal =
+            palette::for_dark(gpui_kit::component::theme::Theme::global(cx).mode.is_dark());
+        // 测试探针（task2.3/3.2）：记录本帧解析出的底色/边框（仅 test 构建）。
+        #[cfg(test)]
+        {
+            PROBE_CHAT_BG.with(|c| c.set(pack_rgb(pal.chat_bg)));
+            PROBE_INPUT_BORDER.with(|c| c.set(pack_rgb(pal.input_border)));
+        }
         //（桥接注意：渲染点不能盲目回写——Change 订阅投递可能落后于渲染，
         //  会用旧镜像清空正在输入的文本。App→Textarea 回写只发生在语义键
         //  拦截后与异步回填（RestoreQueued）两处。）
@@ -847,11 +1061,11 @@ impl Render for GPUIAgentTerminal {
                 };
                 let entries = session.entries();
                 if let Some(entry) = entries.get(index) {
-                    entry_element(entry, index, &ctx, seq_bases[index])
+                    entry_element(entry, index, &ctx, seq_bases[index], pal)
                 } else if let Some(block) = session.in_flight().get(index - entries.len()) {
                     // 流式尾块（未 message_end）：与条目同样式逐块渲染。
                     let seq = in_flight_seqs.get(index - entries.len()).copied().flatten();
-                    assistant_block(block, index, index - entries.len(), &ctx, seq)
+                    assistant_block(block, index, index - entries.len(), &ctx, seq, pal)
                 } else if session.bash_running
                     && index == entries.len() + session.in_flight().len()
                 {
@@ -867,6 +1081,7 @@ impl Render for GPUIAgentTerminal {
                         session.bash_excluded,
                         true,
                         index,
+                        pal,
                     )
                 } else {
                     empty
@@ -896,16 +1111,16 @@ impl Render for GPUIAgentTerminal {
                     .flex()
                     .items_center();
                 if selected {
-                    row = row.bg(palette::COMP_SELECTED_BG);
+                    row = row.bg(pal.comp_selected_bg);
                 }
                 completion_pane.push(
                     row.child(
                         div()
                             .text_sm()
                             .text_color(if selected {
-                                palette::COMP_TEXT_SELECTED
+                                pal.comp_text_selected
                             } else {
-                                palette::COMP_TEXT
+                                pal.comp_text
                             })
                             .child(item.label.clone())
                             .test_text(item.label.clone()),
@@ -922,7 +1137,7 @@ impl Render for GPUIAgentTerminal {
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(palette::COMP_COUNT_TEXT)
+                                .text_color(pal.comp_count_text)
                                 .child(format!("({}/{})", comp.selected + 1, comp.items.len()))
                                 .test_text(format!(
                                     "({}/{})",
@@ -990,7 +1205,7 @@ impl Render for GPUIAgentTerminal {
             .relative() // 浮层绝对定位的锚（task 3.2）
             .flex()
             .flex_col()
-            .bg(palette::CHAT_BG)
+            .bg(pal.chat_bg)
             .child(
                 // 消息区（task 5.2）：内建虚拟滚动（回看/贴底/跳底由
                 // MessageScroller 自理），行内容按条目索引回调渲染。
@@ -1017,7 +1232,7 @@ impl Render for GPUIAgentTerminal {
                 div()
                     .id("gpui-status")
                     .h(line_h)
-                    .bg(palette::STATUS_BG)
+                    .bg(pal.status_bg)
                     // 验收反馈（task 1.4）：状态行再上拉 10px，与输入区留隙
                     // 消除重叠。
                     .mb(px(10.))
@@ -1049,13 +1264,13 @@ impl Render for GPUIAgentTerminal {
                     .flex_col()
                     .px_2()
                     .map(|b| {
-                        if self.focus.is_focused(window) {
+                        if input_border_width(self.focus.is_focused(window)) == 2 {
                             b.border_2()
                         } else {
                             b.border_1()
                         }
                     })
-                    .border_color(palette::INPUT_BORDER)
+                    .border_color(pal.input_border)
                     .test_support()
                     .child(Textarea::new(&self.textarea).appearance(false)),
             )
@@ -1065,7 +1280,7 @@ impl Render for GPUIAgentTerminal {
                     .id("gpui-completion")
                     .flex()
                     .flex_col()
-                    .bg(palette::CHAT_BG)
+                    .bg(pal.chat_bg)
                     // 验收反馈（task 1.4）：底部留 10px——空菜单时把输入框
                     // 整体上拉离底边；放 completion 而非根容器，避免影响
                     // 浮层 absolute 锚定。
@@ -1352,9 +1567,16 @@ struct EntryCtx<'a> {
 /// 输入: entry — 会话条目；index — 条目序号（元素 id 稳定性）；
 ///       ctx — 条目渲染上下文（渲染偏好/覆盖表查询/点击回路）；
 ///       seq_base — 本条目的 thinking 全局序号基值（前缀扫描出口）；
+///       pal — 当前 mode 调色板（面板/文字随模式取表）；
 /// 输出: 条目行元素（User 标签+markdown / Assistant 分块 / Notice 色条 /
 ///       Bash 命令+输出摘要；未知内容不 panic）。
-fn entry_element(entry: &Entry, index: usize, ctx: &EntryCtx, seq_base: usize) -> Div {
+fn entry_element(
+    entry: &Entry,
+    index: usize,
+    ctx: &EntryCtx,
+    seq_base: usize,
+    pal: &'static palette::Palette,
+) -> Div {
     match entry {
         Entry::User { text } => div()
             .flex()
@@ -1364,7 +1586,7 @@ fn entry_element(entry: &Entry, index: usize, ctx: &EntryCtx, seq_base: usize) -
             .child(
                 div()
                     .text_sm()
-                    .text_color(palette::USER_LABEL)
+                    .text_color(pal.user_label)
                     .test_text("You:")
                     .child("You:"),
             )
@@ -1379,11 +1601,11 @@ fn entry_element(entry: &Entry, index: usize, ctx: &EntryCtx, seq_base: usize) -
             let (seqs, _) = thinking_seqs(blocks, seq_base);
             let mut col = div().flex().flex_col().px_2().py_1();
             for (bi, block) in blocks.iter().enumerate() {
-                col = col.child(assistant_block(block, index, bi, ctx, seqs[bi]));
+                col = col.child(assistant_block(block, index, bi, ctx, seqs[bi], pal));
             }
             col
         }
-        Entry::Notice { kind, text } => notice_row(kind, text, index),
+        Entry::Notice { kind, text } => notice_row(kind, text, index, pal),
         Entry::Bash {
             command,
             output,
@@ -1402,6 +1624,7 @@ fn entry_element(entry: &Entry, index: usize, ctx: &EntryCtx, seq_base: usize) -
             *excluded,
             false, // 完成条目（非运行中尾槽）
             index,
+            pal,
         ),
     }
 }
@@ -1412,6 +1635,7 @@ fn entry_element(entry: &Entry, index: usize, ctx: &EntryCtx, seq_base: usize) -
 ///       ctx — 条目渲染上下文（渲染偏好 + 覆盖表 + 点击回路）；
 ///       thinking_seq — thinking 全局序号（`thinking_seqs` 分配；
 ///       非 Thinking 块为 None，Thinking 块必为 Some）；
+///       pal — 当前 mode 调色板（下行各子块共用）；
 /// 输出: 块元素（空文本块给零高占位）。
 fn assistant_block(
     block: &Block,
@@ -1419,6 +1643,7 @@ fn assistant_block(
     bi: usize,
     ctx: &EntryCtx,
     thinking_seq: Option<usize>,
+    pal: &'static palette::Palette,
 ) -> Div {
     let _ = (index, bi);
     match block {
@@ -1429,14 +1654,14 @@ fn assistant_block(
         ),
         Block::Text { .. } => div(),
         Block::Thinking { text } => {
-            thinking_block(text, ctx, thinking_seq.expect("Thinking 块必有序号"))
+            thinking_block(text, ctx, thinking_seq.expect("Thinking 块必有序号"), pal)
         }
         Block::ToolCall {
             id,
             name,
             args_json,
             tool,
-        } => tool_card(id, name, args_json, tool, ctx, index, bi),
+        } => tool_card(id, name, args_json, tool, ctx, index, bi, pal),
     }
 }
 
@@ -1444,11 +1669,11 @@ fn assistant_block(
 /// design D1/D3，spec「thinking 块语义对齐」）。
 ///
 /// 输入: text — thinking 正文；ctx — 条目渲染上下文；seq — 全局渲染序号
-///       （`thinking_seqs` 分配，空块也占号）；
+///       （`thinking_seqs` 分配，空块也占号）；pal — 当前 mode 调色板；
 /// 输出: 块元素——空块给零高 `div()`（不占行，折叠态也不显占位）；非空块
 ///       经共享 [`thinking_visible`] 得占位/正文行，带 id 与点击监听
 ///       （仅非空块可点；点击翻转该块覆盖表，不碰全局与它块）。
-fn thinking_block(text: &str, ctx: &EntryCtx, seq: usize) -> Div {
+fn thinking_block(text: &str, ctx: &EntryCtx, seq: usize, pal: &'static palette::Palette) -> Div {
     // 生效值：单块覆盖优先、否则全局（与 chat.rs append_blocks 同构）。
     let expanded = ctx.app.thinking_expanded_effective(seq);
     // 语义在 thinking_visible（空块 → None 不占行，design D1）。
@@ -1470,10 +1695,23 @@ fn thinking_block(text: &str, ctx: &EntryCtx, seq: usize) -> Div {
         });
     let mut block = block.test_support();
     for row in &rows {
-        block = block.child(segs_row(row));
+        block = block.child(segs_row(row, pal));
     }
     // 观测/点击壳外套一层普通容器保持 Div 返回类型（同 tool_card）。
     div().flex().flex_col().child(block)
+}
+
+/// 工具卡面板底三态 → 按 mode 取表（task1.3 纯逻辑，无 TTY 可测）。
+///
+/// 输入: status — 执行状态；is_error — 失败标记（仅 Ended 生效）；
+///       pal — 当前 mode 调色板（双表之一）；
+/// 输出: 面板底 Rgba（运行/失败/成功三态，浅深两套值）
+fn card_panel_bg(status: &ToolStatus, is_error: bool, pal: &'static palette::Palette) -> Rgba {
+    match status {
+        ToolStatus::Pending | ToolStatus::Running => pal.card_bg_pending,
+        ToolStatus::Ended if is_error => pal.card_bg_err,
+        ToolStatus::Ended => pal.card_bg_ok,
+    }
 }
 
 /// 工具卡（消费中性模型 `tool_card_model`：头行 + 折叠/展开体 + 提示行 +
@@ -1482,9 +1720,10 @@ fn thinking_block(text: &str, ctx: &EntryCtx, seq: usize) -> Div {
 /// 输入: id — toolCallId（元素 id 与单卡覆盖键）；name — 工具名；
 ///       args_json — 调用参数原文；tool — 执行状态；
 ///       ctx — 条目渲染上下文（生效展开态查询 + 点击回路）；
-///       index/bi — 元素 id 序号；
+///       index/bi — 元素 id 序号；pal — 当前 mode 调色板（面板底随模式）；
 /// 输出: 卡片元素（行内着色由段角色 → palette 映射；仅 `result.is_some()`
 ///       的卡挂点击监听——与 TUI 命中门控同源，design D2/D4）。
+#[allow(clippy::too_many_arguments)] // pal 穿参（task1.2）+ bash_row 同款
 fn tool_card(
     id: &str,
     name: &str,
@@ -1493,24 +1732,25 @@ fn tool_card(
     ctx: &EntryCtx,
     index: usize,
     bi: usize,
+    pal: &'static palette::Palette,
 ) -> Div {
     let _ = (index, bi);
-    let theme = TuiTheme::default();
     // 单卡生效展开态来自共享覆盖表（task 2.2：与 ratatui 同一事实源）。
     let expanded = ctx.app.tool_expanded_effective(id);
-    let model = tool_card_model(name, args_json, tool, expanded, &theme);
-    let panel = match &tool.status {
-        ToolStatus::Pending | ToolStatus::Running => theme.tool_running_bg,
-        ToolStatus::Ended if tool.is_error => theme.tool_error_bg,
-        ToolStatus::Ended => theme.tool_success_bg,
-    };
+    // read/write 正文预览的语法主题走共享 TuiTheme 默认（syntax 不在本
+    // change 的 spec 语义 token 清单内）；面板底随 mode 取表（task1.3）。
+    let model = tool_card_model(name, args_json, tool, expanded, &TuiTheme::default());
+    let panel = card_panel_bg(&tool.status, tool.is_error, pal);
+    // 测试探针（task3.2）：记录最近渲染的卡面板底色（仅 test 构建）。
+    #[cfg(test)]
+    PROBE_CARD_BG.with(|c| c.set(pack_rgb(panel)));
     let mut card = div()
         .id(format!("tool-card-{id}"))
         .flex()
         .flex_col()
         .px_2()
         .py_1()
-        .bg(to_hsla(panel));
+        .bg(panel);
     // 点击切换单卡覆盖：仅已有最终结果的卡响应（与 TUI 命中门控同源）。
     if tool.result.is_some() {
         let this = ctx.this.clone();
@@ -1527,24 +1767,24 @@ fn tool_card(
     }
     let mut card = card.test_support();
     // 头行（状态相关，恒显）。
-    card = card.child(segs_row(&model.head));
+    card = card.child(segs_row(&model.head, pal));
     // 折叠面（预览 + 提示行）仅折叠态作为常显子节点；展开面正文经内建
     // Collapsible 挂载（open=生效态：不打开即不挂载、不占位，design D2）。
     card = card.when(!expanded, |c| {
-        let mut c = c.child(segs_col(&model.body));
+        let mut c = c.child(segs_col(&model.body, pal));
         if let Some(hint) = &model.hint {
-            c = c.child(segs_row(std::slice::from_ref(hint)));
+            c = c.child(segs_row(std::slice::from_ref(hint), pal));
         }
         c
     });
     card = card.child(
         Collapsible::new()
             .open(expanded)
-            .content(segs_col(&model.body)),
+            .content(segs_col(&model.body, pal)),
     );
     // 受保护尾部（exit 状态行/截断警告）恒显。
     for row in &model.tail {
-        card = card.child(segs_row(row));
+        card = card.child(segs_row(row, pal));
     }
     // 观测/点击壳外再套一层普通容器以保持 Div 返回类型；flex_col 维持
     // 卡片整行拉伸（与直接挂在条目列同宽，布局无损）。
@@ -1553,9 +1793,10 @@ fn tool_card(
 
 /// 中性段行 → 内建文本行（GPUI 侧适配：逐段 runs 着色/字重，design D1）。
 ///
-/// 输入: segs — 单行语义段（头行/正文行/提示行/尾部行）
+/// 输入: segs — 单行语义段（头行/正文行/提示行/尾部行）；
+///       pal — 当前 mode 调色板（段色随模式取表）；
 /// 输出: 行元素（空行以单个空格保行高；test_text 记录整行文本供快照断言）
-fn segs_row(segs: &[Seg]) -> Div {
+fn segs_row(segs: &[Seg], pal: &'static palette::Palette) -> Div {
     let full: String = segs.iter().map(|s| s.text.as_str()).collect();
     let mut text = String::new();
     let mut runs: Vec<TextRun> = Vec::new();
@@ -1565,7 +1806,7 @@ fn segs_row(segs: &[Seg]) -> Div {
         }
         let start = text.len();
         text.push_str(&seg.text);
-        let (color, weight, style) = seg_visual(seg.role);
+        let (color, weight, style) = seg_visual(seg.role, pal);
         runs.push(TextRun {
             len: text.len() - start,
             font: Font {
@@ -1590,60 +1831,61 @@ fn segs_row(segs: &[Seg]) -> Div {
 /// 中性段行序列 → 垂直列元素（卡片正文/预览多行装配，design D1）。
 ///
 /// 输入: rows — 行段序列（模型 body 面：展开全文或折叠预览）；
+///       pal — 当前 mode 调色板（下传逐行）；
 /// 输出: flex_col 容器（逐行 [`segs_row`]；空序列给空列）。
-fn segs_col(rows: &[Vec<Seg>]) -> Div {
+fn segs_col(rows: &[Vec<Seg>], pal: &'static palette::Palette) -> Div {
     let mut col = div().flex().flex_col();
     for row in rows {
-        col = col.child(segs_row(row));
+        col = col.child(segs_row(row, pal));
     }
     col
 }
 
-/// 段角色 → (颜色, 字重, 字形)：palette 收拢的纯视图映射（design D1）。
+/// 段角色 → (颜色, 字重, 字形)：palette 收拢的纯视图映射（design D2）。
 ///
-/// 输入: role — 中性段角色（卡片角色面向深底面板，通知/bash/thinking
-///       角色面向浅底消息区）
+/// 输入: role — 中性段角色（卡片角色面向卡面板、通知/bash/thinking
+///       角色面向消息区）；pal — 当前 mode 调色板（双表按模式取值）；
 /// 输出: 三元组（GPUI 前景色、字重、字形）
-fn seg_visual(role: SegRole) -> (Hsla, FontWeight, FontStyle) {
+fn seg_visual(role: SegRole, pal: &'static palette::Palette) -> (Hsla, FontWeight, FontStyle) {
     let regular = FontWeight::default();
     let normal = FontStyle::default();
     let bold = FontWeight::BOLD;
     let italic = FontStyle::Italic;
     match role {
-        // —— 工具卡（深底面板）——
-        SegRole::StatusRun => (palette::CARD_STATUS_RUN.into(), regular, normal),
-        SegRole::StatusOk => (palette::CARD_STATUS_OK.into(), regular, normal),
-        SegRole::StatusErr => (palette::CARD_STATUS_ERR.into(), regular, normal),
-        SegRole::Name => (palette::CARD_TEXT.into(), bold, normal),
-        SegRole::Arg => (palette::CARD_TEXT.into(), regular, normal),
-        SegRole::Timer | SegRole::Hint => (palette::CARD_DIM.into(), regular, normal),
-        SegRole::Body => (palette::TOOL_PREVIEW_TEXT.into(), regular, normal),
-        SegRole::Fg(c) => (fg_on_card(c), regular, normal),
-        // —— 消息区（浅底）——
-        SegRole::NoticeError => (palette::NOTICE_ERROR.into(), bold, normal),
-        SegRole::NoticeRetry => (palette::NOTICE_RETRY.into(), regular, normal),
-        SegRole::Notice => (palette::NOTICE_DEFAULT.into(), regular, italic),
-        SegRole::ThinkingText => (palette::THINKING_TEXT.into(), regular, italic),
-        SegRole::Cmd => (palette::BASH_CMD.into(), bold, normal),
-        SegRole::Warn => (palette::WARN.into(), regular, normal),
-        SegRole::ExitOk => (palette::EXIT_OK.into(), regular, normal),
-        SegRole::ExitBad => (palette::EXIT_BAD.into(), bold, normal),
-        SegRole::Dim => (palette::BASH_BODY.into(), regular, normal),
+        // —— 工具卡（面板色随 mode）——
+        SegRole::StatusRun => (pal.card_status_run.into(), regular, normal),
+        SegRole::StatusOk => (pal.card_status_ok.into(), regular, normal),
+        SegRole::StatusErr => (pal.card_status_err.into(), regular, normal),
+        SegRole::Name => (pal.card_text.into(), bold, normal),
+        SegRole::Arg => (pal.card_text.into(), regular, normal),
+        SegRole::Timer | SegRole::Hint => (pal.card_dim.into(), regular, normal),
+        SegRole::Body => (pal.tool_preview_text.into(), regular, normal),
+        SegRole::Fg(c) => (fg_on_card(c, pal), regular, normal),
+        // —— 消息区 ——
+        SegRole::NoticeError => (pal.notice_error.into(), bold, normal),
+        SegRole::NoticeRetry => (pal.notice_retry.into(), regular, normal),
+        SegRole::Notice => (pal.notice_default.into(), regular, italic),
+        SegRole::ThinkingText => (pal.thinking_text.into(), regular, italic),
+        SegRole::Cmd => (pal.bash_cmd.into(), bold, normal),
+        SegRole::Warn => (pal.warn.into(), regular, normal),
+        SegRole::ExitOk => (pal.exit_ok.into(), regular, normal),
+        SegRole::ExitBad => (pal.exit_bad.into(), bold, normal),
+        SegRole::Dim => (pal.bash_body.into(), regular, normal),
     }
 }
 
-/// `Fg` 段在深底卡片上的颜色：ANSI 命名色提亮（深底可读），
-/// Rgb 主题色（语法高亮等）原样透传。
+/// `Fg` 段在卡片面板上的颜色：ANSI 命名色按 mode 取表（浅底加深、深底
+/// 提亮），Rgb 主题色（语法高亮等）原样透传。
 ///
-/// 输入: c — 段携带的 ratatui 前景色
+/// 输入: c — 段携带的 ratatui 前景色；pal — 当前 mode 调色板；
 /// 输出: 提亮/透传后的 Hsla
-fn fg_on_card(c: Color) -> Hsla {
+fn fg_on_card(c: Color, pal: &'static palette::Palette) -> Hsla {
     match c {
-        Color::Red => palette::CARD_FG_RED.into(),
-        Color::Green => palette::CARD_FG_GREEN.into(),
-        Color::Yellow => palette::CARD_FG_YELLOW.into(),
-        Color::Cyan => palette::CARD_FG_CYAN.into(),
-        Color::DarkGray => palette::CARD_FG_GRAY.into(),
+        Color::Red => pal.card_fg_red.into(),
+        Color::Green => pal.card_fg_green.into(),
+        Color::Yellow => pal.card_fg_yellow.into(),
+        Color::Cyan => pal.card_fg_cyan.into(),
+        Color::DarkGray => pal.card_fg_gray.into(),
         other => to_hsla(other),
     }
 }
@@ -1652,14 +1894,14 @@ fn fg_on_card(c: Color) -> Hsla {
 /// 角色 → palette 映射——对齐 TUI notice_line 语义，design D1）。
 ///
 /// 输入: kind — 通知类别（"error"/"retry"/其它）；text — 通知正文；
-///       index — 元素 id 序号；
+///       index — 元素 id 序号；pal — 当前 mode 调色板；
 /// 输出: 色条行元素（`[kind] text` 单段；test_text 记录整行）。
-fn notice_row(kind: &str, text: &str, index: usize) -> Div {
+fn notice_row(kind: &str, text: &str, index: usize, pal: &'static palette::Palette) -> Div {
     let _ = index;
     div()
         .px_2()
         .py_1()
-        .child(segs_row(&notice_model(kind, text)))
+        .child(segs_row(&notice_model(kind, text), pal))
 }
 
 /// bash 条目（消费共享 `bash_entry_model`：命令行 + 尾部 500 行截断 +
@@ -1668,7 +1910,7 @@ fn notice_row(kind: &str, text: &str, index: usize) -> Div {
 /// 输入: command/output — 命令与输出；exit_code/cancelled/truncated/
 ///       full_output_path — 结果态；excluded — `!!` 不进上下文；
 ///       live — 运行中尾槽（状态行为 `⟳ 运行中…`，结果字段传 None/false）；
-///       index — 元素 id 序号；
+///       index — 元素 id 序号；pal — 当前 mode 调色板；
 /// 输出: 行元素（逐行 [`segs_row`]；完成条目 live=false、运行中尾槽
 ///       live=true——语义都在共享 `bash_entry_model`，design D1）。
 #[allow(clippy::too_many_arguments)]
@@ -1682,6 +1924,7 @@ fn bash_row(
     excluded: bool,
     live: bool,
     index: usize,
+    pal: &'static palette::Palette,
 ) -> Div {
     let _ = index;
     let mut row = div().flex().flex_col().px_2().py_1();
@@ -1696,7 +1939,7 @@ fn bash_row(
         excluded,
         live,
     ) {
-        row = row.child(segs_row(&segs));
+        row = row.child(segs_row(&segs, pal));
     }
     row
 }
@@ -2673,6 +2916,190 @@ done
         );
     }
 
+    /// mode 切换后渲染帧立即用新调色板（task2.3 spike）。
+    ///
+    /// 功能: 固定 Light 出帧断言白底 → 切 Dark 应用 → 出帧断言深底；
+    ///       （kit `Theme::edit` 自带 `cx.refresh_windows()`——真实窗口由
+    ///       其驱动自动出帧，测试宿主显式出帧做一帧断言，无需
+    ///       observe_global 兜底）；
+    /// 输入: 开窗测试会话；
+    /// 输出: 断言通过（两帧 `chat_bg` 探针分别为浅/深表值）。
+    #[gpui_kit::test]
+    fn mode_switch_repaints_frame_with_new_palette(cx: &mut TestAppContext) {
+        use crate::gpui_agent::theme::{ThemeSetting, ThemeState, apply};
+        let (handle, _term) = open_focused(cx, "mode-switch-repaint");
+        // 固定 Light：一帧断言浅底。
+        cx.update(|cx| {
+            ThemeState::set(cx, ThemeSetting::Light);
+            apply(cx);
+        });
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render light");
+        assert_eq!(super::probe_chat_bg(), 0xff_ffff, "浅帧白底");
+        // 切 Dark：应用后一帧断言深底。
+        cx.update(|cx| {
+            ThemeState::set(cx, ThemeSetting::Dark);
+            apply(cx);
+        });
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render dark");
+        assert_eq!(super::probe_chat_bg(), 0x1e_1e_1e, "深帧深底");
+    }
+
+    /// /settings Theme 行三态循环（task3.1 e2e）：键盘可达、循环生效、不落盘。
+    ///
+    /// 功能: 真实 slash 通路开 /settings（surface=Gpui → theme_row）→
+    ///       Down×3 到 Theme 行（游标 3）→ Enter ×3 循环
+    ///       system→light→dark→system（泵应用，帧色探针随动）→
+    ///       settings.json 字节全程不变（A3）；
+    /// 输入: 开窗测试会话 + 临时 settings_path（防写真实文件）；
+    /// 输出: 断言通过（三态顺序、mode/帧色、文件字节、浮层保持）。
+    #[gpui_kit::test]
+    fn settings_theme_row_cycles_three_modes_without_persistence(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::app::overlay::Overlay;
+        use crate::gpui_agent::theme::{ThemeSetting, ThemeState};
+        use gpui_kit::component::theme::{Theme, ThemeMode};
+        let (handle, term) = open_focused(cx, "settings-theme-row");
+        // 临时 settings 文件：字节比对防落盘 + 防写真实文件。
+        let dir = std::env::temp_dir().join(format!("gpui-theme-row-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{"theme":"system"}"#).unwrap();
+        cx.update(|cx| {
+            term.update(cx, |term, _| {
+                term.state.app.override_settings_path(path.clone());
+            })
+        });
+        let before = std::fs::read(&path).unwrap();
+
+        // 真实 slash 通路开 /settings（完成菜单 Enter 提交）。
+        cx.update_window(handle, |_, window, cx| {
+            window.input("/settings", cx);
+            window.press("enter", cx);
+        })
+        .expect("submit /settings");
+        cx.run_until_parked();
+        // 泵 get_state 回填（退 loading）：RPC 线程真实时序，轮询拉取。
+        let mut loaded = false;
+        for _ in 0..100 {
+            cx.update(|cx| term.update(cx, |term, cx| term.pump_ui_events(cx)));
+            let loading = cx.update(|cx| match &term.read(cx).state.app.overlay {
+                Some(Overlay::Settings { loading, .. }) => *loading,
+                _ => true,
+            });
+            if !loading {
+                loaded = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(loaded, "get_state 回填、退 loading");
+
+        // Down×3 → Theme 行（surface 门控可达性）。
+        for _ in 0..3 {
+            cx.update_window(handle, |_, window, cx| window.press("down", cx))
+                .expect("down");
+        }
+        let cursor = cx.update(|cx| match &term.read(cx).state.app.overlay {
+            Some(Overlay::Settings { cursor, loading, .. }) => {
+                assert!(!*loading, "get_state 已回填、退 loading");
+                *cursor
+            }
+            other => panic!("应为 Settings 浮层: {other:?}"),
+        });
+        assert_eq!(cursor, 3, "GPUI 表面可达 Theme 行");
+
+        // Enter ×3：system→light→dark→system（逐轮断言 setting/mode/帧色）。
+        let rounds: [(ThemeSetting, Option<ThemeMode>, Option<u32>); 3] = [
+            (ThemeSetting::Light, Some(ThemeMode::Light), Some(0xff_ffff)),
+            (ThemeSetting::Dark, Some(ThemeMode::Dark), Some(0x1e_1e_1e)),
+            (ThemeSetting::System, None, None), // mode 随 OS 外观，不断言
+        ];
+        for (want_setting, want_mode, want_bg) in rounds {
+            cx.update_window(handle, |_, window, cx| window.press("enter", cx))
+                .expect("enter");
+            cx.run_until_parked();
+            cx.update(|cx| term.update(cx, |term, cx| term.pump_ui_events(cx)));
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .expect("render");
+            let got = cx.update(|cx| (ThemeState::get(cx).setting, Theme::global(cx).mode));
+            assert_eq!(got.0, want_setting, "循环到 {want_setting:?}");
+            if let Some(m) = want_mode {
+                assert_eq!(got.1, m, "kit mode 随设置");
+            }
+            if let Some(bg) = want_bg {
+                assert_eq!(super::probe_chat_bg(), bg, "帧色探针随表");
+            }
+        }
+
+        // A3：文件字节全程不变；浮层保持（Toggle 语义）。
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(before, after, "不写 settings.json");
+        assert!(
+            cx.update(|cx| term.read(cx).state.app.overlay.is_some()),
+            "浮层保持打开"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 选择热生效：切 dark 后消息区底/输入边框/工具卡三面取深色表（task3.2）。
+    ///
+    /// 功能: tool_call fixture 开窗 → 固定 Light 渲染断言三面浅色 → 切
+    ///       Dark 应用 → 渲染断言三面深色（cycle→Theme::change→refresh
+    ///       →render 同帧链路的色彩面）；
+    /// 输入: 开窗测试会话 + 三支帧色探针；
+    /// 输出: 断言通过（chat/边框/卡底 三面浅深两套值）。
+    #[gpui_kit::test]
+    fn switching_to_dark_repaints_panels_border_and_card(cx: &mut TestAppContext) {
+        use crate::gpui_agent::theme::{ThemeSetting, ThemeState, apply};
+        let (handle, term) = open_focused(cx, "tool_call");
+        cx.update(|cx| term.update(cx, |term, _| feed_fixture(term, "tool_call")));
+        let probes = || {
+            (
+                super::probe_chat_bg(),
+                super::probe_input_border(),
+                super::probe_card_bg(),
+            )
+        };
+        // 固定 Light：白底 / 纯黑边 / 浅成功卡（pi light 同源）。
+        cx.update(|cx| {
+            ThemeState::set(cx, ThemeSetting::Light);
+            apply(cx);
+        });
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render light");
+        assert_eq!(
+            probes(),
+            (0xff_ffff, 0x00_00_00, 0xde_e9_e1),
+            "浅色三面"
+        );
+        // 切 Dark：深底 / pi dark 边框 / 深成功卡（pi dark 同源）。
+        cx.update(|cx| {
+            ThemeState::set(cx, ThemeSetting::Dark);
+            apply(cx);
+        });
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render dark");
+        assert_eq!(
+            probes(),
+            (0x1e_1e_1e, 0x5f_a8_cc, 0x25_41_31),
+            "深色三面"
+        );
+    }
+
+    /// 聚焦加粗规则不变（task4.1）：常态 1px、聚焦 2px，两模式同规。
+    ///
+    /// 功能: 真值表断言 + render 消费同一真源（`input_border_width`）；
+    /// 输入: 无（纯函数）；
+    /// 输出: 断言通过。
+    #[test]
+    fn input_border_width_rule_unchanged() {
+        assert_eq!(super::input_border_width(false), 1, "常态 1px");
+        assert_eq!(super::input_border_width(true), 2, "聚焦加粗 2px");
+    }
+
     /// 浮层下滚轮被遮罩阻断（task 6.2；spec: 浮层下滚轮忽略）。
     ///
     /// 功能: 对照组——无浮层时滚轮推进回看锚点；实验组——浮层打开后同
@@ -3597,6 +4024,7 @@ done
                     auto_retry: None,
                     double_esc: None,
                     model: None,
+                    theme_row: true,
                 });
             });
         });
@@ -3619,6 +4047,7 @@ done
                     auto_retry: None,
                     double_esc: Some("tree".into()),
                     model: Some("prov/m1".into()),
+                    theme_row: true,
                 });
             });
         });
@@ -5070,19 +5499,76 @@ done
         assert!(msg.contains("+new-fallback"), "降级 + 行: {msg:?}");
     }
 
-    /// Fg 段 → 深底卡片提亮色（task 2.4）：diff 红/绿/青三色逐一映射。
+    /// Fg 段 → 卡片提亮色（task 2.4 + 1.2 双表）：diff 红/绿/青按 mode 取表。
     ///
-    /// 输入: [`SegRole::Fg`] 携带的三种 diff 前景色；
-    /// 输出: 断言通过（`seg_visual` 首项 = CARD_FG_* 提亮色）。
+    /// 输入: [`SegRole::Fg`] 携带的三种 diff 前景色 + 浅色表；
+    /// 输出: 断言通过（`seg_visual` 首项 = 浅色表 pi 同源提亮色）。
     #[test]
     fn seg_visual_fg_diff_colors_map_on_card() {
-        use super::{SegRole, palette, seg_visual};
-        let (red, _, _) = seg_visual(SegRole::Fg(Color::Red));
-        let (green, _, _) = seg_visual(SegRole::Fg(Color::Green));
-        let (cyan, _, _) = seg_visual(SegRole::Fg(Color::Cyan));
-        assert_eq!(red, palette::CARD_FG_RED.into(), "diff - 红");
-        assert_eq!(green, palette::CARD_FG_GREEN.into(), "diff + 绿");
-        assert_eq!(cyan, palette::CARD_FG_CYAN.into(), "@@ 青");
+        use super::{Hsla, SegRole, palette, seg_visual};
+        let pal = palette::for_dark(false);
+        let (red, _, _) = seg_visual(SegRole::Fg(Color::Red), pal);
+        let (green, _, _) = seg_visual(SegRole::Fg(Color::Green), pal);
+        let (cyan, _, _) = seg_visual(SegRole::Fg(Color::Cyan), pal);
+        let rgb = |h: Hsla| {
+            let c: gpui_kit::Rgba = h.into();
+            (
+                (c.r * 255.0).round() as u8,
+                (c.g * 255.0).round() as u8,
+                (c.b * 255.0).round() as u8,
+            )
+        };
+        assert_eq!(rgb(red), (0xc8, 0x25, 0x3d), "diff - 红");
+        assert_eq!(rgb(green), (0x33, 0x7e, 0x58), "diff + 绿");
+        assert_eq!(rgb(cyan), (0x00, 0x97, 0xa7), "@@ 青");
+    }
+
+    /// 工具卡面板底随 mode 三态取表（task1.3 接线验证，无 TTY）。
+    ///
+    /// 输入: Running/Ended(成功)/Ended(失败) × 浅深两表；
+    /// 输出: 断言通过（三态分别命中各表对应值）。
+    #[test]
+    fn card_panel_bg_follows_mode_three_states() {
+        use super::{ToolStatus, card_panel_bg, palette};
+        let light = palette::for_dark(false);
+        let dark = palette::for_dark(true);
+        let rgb = |c: gpui_kit::Rgba| {
+            (
+                (c.r * 255.0).round() as u8,
+                (c.g * 255.0).round() as u8,
+                (c.b * 255.0).round() as u8,
+            )
+        };
+        assert_eq!(
+            rgb(card_panel_bg(&ToolStatus::Running, false, light)),
+            (0xe4, 0xe5, 0xe6),
+            "浅 Running"
+        );
+        assert_eq!(
+            rgb(card_panel_bg(&ToolStatus::Ended, false, light)),
+            (0xde, 0xe9, 0xe1),
+            "浅 成功"
+        );
+        assert_eq!(
+            rgb(card_panel_bg(&ToolStatus::Ended, true, light)),
+            (0xee, 0xe2, 0xe1),
+            "浅 失败"
+        );
+        assert_eq!(
+            rgb(card_panel_bg(&ToolStatus::Running, false, dark)),
+            (0x34, 0x38, 0x3a),
+            "深 Running"
+        );
+        assert_eq!(
+            rgb(card_panel_bg(&ToolStatus::Ended, false, dark)),
+            (0x25, 0x41, 0x31),
+            "深 成功"
+        );
+        assert_eq!(
+            rgb(card_panel_bg(&ToolStatus::Ended, true, dark)),
+            (0x5b, 0x28, 0x2a),
+            "深 失败"
+        );
     }
 
     /// 通知行消费共享 `notice_model`（task 2.5）：`[kind]` 前缀并入文本，

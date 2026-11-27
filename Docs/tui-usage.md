@@ -240,11 +240,21 @@ PI_GPUI_RENDER_PROBE=1 cargo run --bin pi-shell-gpui --features gpui-support
 
 窗口形态要点（`add-gpui-support`，与 ratatui 路径并存）：
 
-- 独立窗口固定浅色模式（`add-gpui-overlays`）：启动即
-  `Theme::change(ThemeMode::Light)`、不订阅系统外观；面板/文字色收拢于
-  `gpui_agent` 的调色板常量（完整主题系统为后续 change）。
-- 输入区形态（`simplify-gpui-input-chrome`）：白底（与消息区同底）+ 纯黑
-  直角边框——常态 1px、聚焦加粗 2px；`Textarea` 加 `appearance(false)`
+- 独立窗口主题三模式（`add-gpui-theme-modes`）：`light | dark | system`
+  三态，默认 **system**——启动按 OS 外观解析、运行中随系统外观热切换
+  （`observe_window_appearance` 订阅，回调仅 system 态动作）；`/settings`
+  浮层新增 `theme` 行循环选择（system → light → dark），**只改内存态
+  不落盘**（重启回默认 system；与 doubleEsc 行回写文件的行为不同，pi
+  `settings.json` 的 `theme` 键由主项目持久化，本仓不读不写）。配色 =
+  双调色板：语义 token 与 pi `light.json`/`dark.json` 同源预计算（pi-tui
+  同算法），面板底自有（浅色现值 / 深色手调）；**工具卡随模式取色**
+  （浅色浅卡深字——替换早期白面板+深卡混血，为 pi 同源新基准）；滚动条
+  track/thumb 覆写为 pi 值；内建控件随 kit Theme 同 mode 切换。已知边界：
+  pi auto（`light/dark` 配对）与自定义主题名不解析；syntect 语法主题两
+  模式同用 `base16-ocean.dark`。
+- 输入区形态（`simplify-gpui-input-chrome`）：白底（与消息区同底）+ 直角
+  边框——**浅色纯黑、深色浅色系（pi dark 同源）**；常态 1px、聚焦加粗 2px；
+  `Textarea` 加 `appearance(false)`
   剥除 kit 内建底色/圆角/聚焦光环，编辑语义仍由内建编辑器自理。
 - 渲染优先用 gpui-kit 内建控件：消息区 = 内建虚拟滚动 + 内建 markdown
   （代码高亮随 kit 特性），输入区 = 内建 TextArea（auto_grow 1..6 行、

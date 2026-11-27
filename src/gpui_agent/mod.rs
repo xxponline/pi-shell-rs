@@ -12,4 +12,5 @@ pub mod input;
 pub mod overlay;
 pub mod scroll;
 pub mod terminal;
+pub mod theme;
 pub mod window;

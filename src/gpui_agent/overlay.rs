@@ -365,6 +365,7 @@ fn describe(overlay: &Overlay, app: &AppState, cx: &App) -> (String, Vec<Div>) {
             auto_retry,
             double_esc,
             model,
+            theme_row,
             ..
         } => {
             let title = " Settings（简化） ".to_string();
@@ -376,7 +377,7 @@ fn describe(overlay: &Overlay, app: &AppState, cx: &App) -> (String, Vec<Div>) {
                     Some(false) => "off".to_string(),
                     None => "—".to_string(),
                 };
-                vec![
+                let mut rows = vec![
                     opt_row(
                         format!("  autoCompact        {}", onoff(auto_compaction)),
                         *cursor == 0,
@@ -395,15 +396,28 @@ fn describe(overlay: &Overlay, app: &AppState, cx: &App) -> (String, Vec<Div>) {
                         *cursor == 2,
                         cx,
                     ),
-                    row(
-                        format!("  model              {}", model.as_deref().unwrap_or("—")),
-                        cx.theme().muted_foreground,
-                    ),
-                    note_row(
-                        "  enter 切换开关 · esc 关闭（简化版，详见 Docs/slash-commands.md）",
+                ];
+                if *theme_row {
+                    // Theme 行（task3.1，仅 GPUI 表面）：值读内存态 ThemeState，
+                    // enter 经共享 apply_settings 回流 ThemeCycle；不写文件。
+                    rows.push(opt_row(
+                        format!(
+                            "  theme              {}",
+                            crate::gpui_agent::theme::ThemeState::get(cx).setting.label()
+                        ),
+                        *cursor == 3,
                         cx,
-                    ),
-                ]
+                    ));
+                }
+                rows.push(row(
+                    format!("  model              {}", model.as_deref().unwrap_or("—")),
+                    cx.theme().muted_foreground,
+                ));
+                rows.push(note_row(
+                    "  enter 切换开关 · esc 关闭（简化版，详见 Docs/slash-commands.md）",
+                    cx,
+                ));
+                rows
             };
             (title, rows)
         }

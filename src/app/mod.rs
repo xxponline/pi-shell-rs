@@ -227,6 +227,18 @@ pub struct App {
     /// `EmbedConfig.theme` 启动注入、`UiEvent::Theme` 运行时切换；
     /// standalone 恒为默认（R8 不动默认外观）。
     theme: crate::app::theme::TuiTheme,
+    /// 渲染表面（GPUI 初始化时标记；决定 /settings 是否含 Theme 行）。
+    surface: SurfaceKind,
+}
+
+/// 渲染表面标记（共享层只认标记、不认 GPUI 类型；`/settings` 行集判据）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SurfaceKind {
+    /// 终端 TUI（默认：无 Theme 行，行为与既往逐字节一致）。
+    #[default]
+    Tui,
+    /// GPUI 独立窗口（含 Theme 行；循环经 `UiEvent::ThemeCycle` 回流）。
+    Gpui,
 }
 
 /// 默认构造：等价 [`App::new`]。
@@ -288,7 +300,28 @@ impl App {
             sinks: TerminalSinks::default(),
             layout_cache: Default::default(),
             theme: crate::app::theme::TuiTheme::default(),
+            surface: SurfaceKind::Tui,
         }
+    }
+
+    /// 覆盖设置文件路径（仅测试缝：GPUI e2e 注入临时文件做字节比对；
+    /// 生产不调用——默认走 `settings_path()` 解析的全局 settings.json）。
+    ///
+    /// 输入: path — 新的设置文件路径；
+    /// 输出: 无返回；副作用为 `settings_path` 覆盖生效
+    #[cfg(test)]
+    // 仅 GPUI 测试缝消费；列 A 无调用方，allow 去掉 lib-test 死码告警。
+    #[allow(dead_code)]
+    pub(crate) fn override_settings_path(&mut self, path: std::path::PathBuf) {
+        self.settings_path = Some(path);
+    }
+
+    /// 标记渲染表面（GPUI 组件初始化时调用；additive，TUI 默认不变）。
+    ///
+    /// 输入: surface — 表面种类；
+    /// 输出: 无返回；副作用为 `App.surface` 更新（影响 `/settings` 行集）
+    pub fn set_surface(&mut self, surface: SurfaceKind) {
+        self.surface = surface;
     }
 
     /// 向诊断日志追加一行 `kind detail`；未开启或写失败时静默忽略。
@@ -615,6 +648,10 @@ impl App {
                         self.log_event("theme", &theme.syntax_theme);
                         self.set_theme(theme);
                         need_draw = true;
+                    }
+                    Ok(UiEvent::ThemeCycle) => {
+                        // TUI 无 Theme 行（surface=Tui 不开该行），事件不可达；
+                        // 空臂保 match 完备（实际应用在 GPUI 组件泵侧）。
                     }
                     // Idle timeout：无状态变化不重绘；但运行中工具需要每秒走字
                     //（design D3，判定抽为纯函数便于单测）。
@@ -2220,6 +2257,8 @@ impl App {
             auto_retry: None,
             double_esc,
             model: None,
+            // Theme 行仅 GPUI 表面开（TUI 无主题能力，行为不变）。
+            theme_row: self.surface == SurfaceKind::Gpui,
         });
         Self::spawn_async(
             commander,
@@ -2247,6 +2286,7 @@ impl App {
             auto_compaction,
             auto_retry,
             double_esc,
+            theme_row,
             ..
         } = overlay
         else {
@@ -2298,6 +2338,12 @@ impl App {
                             Some(settings_io::read_double_escape_action(&path).as_str().to_string());
                     }
                 }
+            }
+            3 if *theme_row => {
+                // Theme 行（GPUI 专属）：循环请求回流 GPUI 泵应用；
+                // A3 不落盘——本处不写 settings.json。
+                let _ = report_tx.send(UiEvent::ThemeCycle);
+                self.log_event("slash", "settings theme cycle");
             }
             _ => {}
         }
@@ -7852,6 +7898,7 @@ done
             auto_retry: None,
             double_esc: Some("fork".into()),
             model: Some("openai/gpt-5.4".into()),
+            theme_row: false,
         });
 
         // 渲染断言：浮层含 doubleEsc 行与当前值
@@ -7942,6 +7989,85 @@ done
             "{broken",
             "损坏文件不被覆盖"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&cdir);
+    }
+
+    /// Theme 行（GPUI 表面）：enter 发 ThemeCycle 且不写 settings.json
+    /// （task3.1；A3 不落盘）。
+    ///
+    /// 功能: Gpui 表面开 /settings 断言 theme_row=true → Down×3 到 Theme
+    ///       行 → Enter 断言收到 `UiEvent::ThemeCycle`、文件字节不变、浮层
+    ///       保持；对照默认（TUI）表面 theme_row=false 且 Down×4 夹取在 2；
+    /// 输入: 临时 settings 文件 + recording commander；
+    /// 输出: 断言通过。
+    #[test]
+    fn settings_theme_row_cycles_event_without_file_write() {
+        let dir = std::env::temp_dir().join(format!("theme-row-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{"theme":"system"}"#).unwrap();
+
+        let (client, cdir, _log) =
+            recording_commander("theme-row", r#"{"steering":[],"followUp":[]}"#);
+        let commander = client.command_sender();
+        let (tx, rx) = std::sync::mpsc::channel::<UiEvent>();
+
+        // GPUI 表面：行集含 Theme 行。
+        let mut app = App::new();
+        app.set_surface(SurfaceKind::Gpui);
+        app.settings_path = Some(path.clone());
+        app.open_settings(&commander, &tx);
+        let ev = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("SettingsState");
+        if let UiEvent::AsyncData { kind, seq, data } = ev {
+            app.handle_async_data(kind, seq, &data);
+        }
+        match &app.overlay {
+            Some(Overlay::Settings { theme_row, .. }) => {
+                assert!(*theme_row, "GPUI 表面开 Theme 行");
+            }
+            other => panic!("应为 Settings 浮层: {other:?}"),
+        }
+
+        let before = std::fs::read(&path).unwrap();
+        for _ in 0..3 {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &commander, &tx);
+        }
+        match &app.overlay {
+            Some(Overlay::Settings { cursor, .. }) => assert_eq!(*cursor, 3, "可达 Theme 行"),
+            other => panic!("应为 Settings 浮层: {other:?}"),
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commander, &tx);
+        let ev = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("ThemeCycle");
+        assert!(matches!(ev, UiEvent::ThemeCycle), "收到 ThemeCycle: {ev:?}");
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(before, after, "A3 不写 settings.json（字节不变）");
+        assert!(app.overlay.is_some(), "Toggle 语义浮层保持");
+
+        // 对照：默认（TUI）表面不开 Theme 行，Down×4 夹取在 2。
+        let mut tui = App::new();
+        let (tx2, rx2) = std::sync::mpsc::channel::<UiEvent>();
+        tui.open_settings(&commander, &tx2);
+        let ev = rx2.recv_timeout(std::time::Duration::from_secs(5)).expect("SettingsState");
+        if let UiEvent::AsyncData { kind, seq, data } = ev {
+            tui.handle_async_data(kind, seq, &data);
+        }
+        match &tui.overlay {
+            Some(Overlay::Settings { theme_row, .. }) => {
+                assert!(!*theme_row, "TUI 表面默认关 Theme 行");
+            }
+            other => panic!("应为 Settings 浮层: {other:?}"),
+        }
+        for _ in 0..4 {
+            tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &commander, &tx2);
+        }
+        match &tui.overlay {
+            Some(Overlay::Settings { cursor, .. }) => {
+                assert_eq!(*cursor, 2, "TUI 夹取在 doubleEsc 行（行为不变）");
+            }
+            other => panic!("应为 Settings 浮层: {other:?}"),
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&cdir);

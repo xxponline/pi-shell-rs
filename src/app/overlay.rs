@@ -95,6 +95,8 @@ pub enum Overlay {
         double_esc: Option<String>,
         /// 当前模型（只读）。
         model: Option<String>,
+        /// 是否含 Theme 行（仅 GPUI 表面为 true；TUI 恒 false、行为不变）。
+        theme_row: bool,
     },
     /// 信任决策浮层（/trust；current=当前 cwd 的信任记录）。
     Trust {
@@ -309,7 +311,7 @@ pub fn overlay_key(o: &mut Overlay, key: KeyEvent) -> OverlayOutcome {
             }
         }
         Overlay::Settings {
-            cursor, loading, ..
+            cursor, loading, theme_row, ..
         } => {
             if *loading {
                 return match key.code {
@@ -324,7 +326,8 @@ pub fn overlay_key(o: &mut Overlay, key: KeyEvent) -> OverlayOutcome {
                     OverlayOutcome::Handled
                 }
                 KeyCode::Down => {
-                    *cursor = (*cursor + 1).min(2); // 三行可切换（模型/提示行只读）
+                    // GPUI 多 Theme 行（cursor 3）；TUI 恒 2 行（模型/提示只读）。
+                    *cursor = (*cursor + 1).min(if *theme_row { 3 } else { 2 });
                     OverlayOutcome::Handled
                 }
                 KeyCode::Enter => OverlayOutcome::Toggle(*cursor),
@@ -1405,6 +1408,45 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Theme 行可达性由 theme_row 门控（task3.1；TUI 恒 false 行为不变）。
+    ///
+    /// 功能: theme_row=true 连按 Down×4 游标停在 3；false 停在 2；
+    /// 输入: 构造的 Settings 浮层 + Down 键；
+    /// 输出: 断言通过。
+    #[test]
+    fn settings_theme_row_gates_cursor() {
+        let mk = |theme_row: bool| Overlay::Settings {
+            cursor: 0,
+            loading: false,
+            seq: 1,
+            auto_compaction: None,
+            auto_retry: None,
+            double_esc: None,
+            model: None,
+            theme_row,
+        };
+        let mut gpui = mk(true);
+        for _ in 0..4 {
+            assert!(matches!(
+                overlay_key(&mut gpui, key(KeyCode::Down)),
+                OverlayOutcome::Handled
+            ));
+        }
+        let Overlay::Settings { cursor, .. } = &gpui else {
+            panic!("应为 Settings");
+        };
+        assert_eq!(*cursor, 3, "GPUI 表面可达 Theme 行");
+
+        let mut tui = mk(false);
+        for _ in 0..4 {
+            let _ = overlay_key(&mut tui, key(KeyCode::Down));
+        }
+        let Overlay::Settings { cursor, .. } = &tui else {
+            panic!("应为 Settings");
+        };
+        assert_eq!(*cursor, 2, "TUI 表面夹取在 doubleEsc 行");
     }
 
     #[test]

@@ -48,6 +48,9 @@ pub enum UiEvent {
     SendFailed(String),
     /// `clear_queue` 的返回数据（alt+up 取回排队消息，主线程回填输入框）。
     RestoreQueued(serde_json::Value),
+    /// `/settings` Theme 行循环请求（GPUI 专属行经共享 apply_settings 回流；
+    /// A3 不落盘——GPUI 泵循环 `ThemeSetting` 并应用，TUI 无此行不可达）。
+    ThemeCycle,
     /// 成功类提示（如"✓ 会话已删除"），显示为绿色通知。
     Info(String),
     /// /model 参数无精确匹配时回退打开模型选择器。
