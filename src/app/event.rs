@@ -51,6 +51,14 @@ pub enum UiEvent {
     /// `/settings` Theme 行循环请求（GPUI 专属行经共享 apply_settings 回流；
     /// A3 不落盘——GPUI 泵循环 `ThemeSetting` 并应用，TUI 无此行不可达）。
     ThemeCycle,
+    /// edit 执行前预览回填（align-edit-diff-rendering；app 层独立线程读
+    /// 文件计算——Ok=行模型（存 `Vec<DiffRow>` 而非文本，避免上下文行以
+    /// `-` 开头的再解析歧义）、Err=错误文案；迟到回填按 toolId 幂等丢弃，
+    /// 见 `App::apply_edit_preview`）。
+    EditPreview {
+        tool_id: String,
+        result: Result<Vec<crate::app::tools::DiffRow>, String>,
+    },
     /// 成功类提示（如"✓ 会话已删除"），显示为绿色通知。
     Info(String),
     /// /model 参数无精确匹配时回退打开模型选择器。

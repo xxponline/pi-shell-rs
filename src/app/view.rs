@@ -68,6 +68,7 @@ pub fn render(
     state: &mut SessionState,
     ui: &ViewUi<'_>,
     cache: &mut LayoutCache,
+    previews: Option<&crate::app::PreviewCtx<'_>>,
 ) -> (ChatScroll, Vec<crate::app::wrap::Hit>, ratatui::layout::Rect) {
     let area = frame.area();
     let queue = queue_lines(state, ui.local_queue);
@@ -104,6 +105,7 @@ pub fn render(
         ui.scrollbar,
         &ui.theme,
         cache,
+        previews,
     );
     if queue_h > 0 {
         frame.render_widget(
@@ -369,6 +371,7 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, state: &Session
 ///   tool_expanded — 单卡展开覆盖表（None=无覆盖，design D1）
 ///   thinking_overrides — thinking 单块覆盖（None=无覆盖，design D3）
 ///   cache — 条目级布局缓存（design D1/D2/D7；refresh + 分块借出）
+///   previews — edit 预览上下文（task3.3；None=无预览，测试/oracle 路径）
 /// 输出: `(吸收后的 ChatScroll, Vec<Hit>)`——前者为窗口首行/贴底判定/
 ///       视口高回写，后者为可点击内容绝对屏行命中区间（design D1/D2）；
 ///       副作用为在 area 上绘制消息区
@@ -386,6 +389,7 @@ fn render_chat(
     scrollbar: Option<crate::app::wrap::ScrollbarOverlay>,
     theme: &crate::app::theme::TuiTheme,
     cache: &mut LayoutCache,
+    previews: Option<&crate::app::PreviewCtx<'_>>,
 ) -> (ChatScroll, Vec<crate::app::wrap::Hit>) {
     let empty = std::collections::HashMap::new();
     let overrides = tool_expanded.unwrap_or(&empty);
@@ -395,7 +399,7 @@ fn render_chat(
     // 段由各模块内部计入，均落在布局段内）。
     let seg_t0 = std::time::Instant::now();
     // 条目级布局缓存（design D1/D2/D7）：增量重排 + 易失尾常新。
-    cache.refresh(state, flags, overrides, thinking, theme, area.width);
+    cache.refresh_ctx(state, flags, overrides, thinking, theme, area.width, previews);
     let seg_t1 = std::time::Instant::now();
     crate::app::render_probe::record_layout(seg_t1.duration_since(seg_t0).as_nanos() as u64);
     // 分块借出给 wrap（避免全文拼装克隆；与全量路径逐字节一致）。
@@ -638,7 +642,7 @@ mod render_tests {
         }
         CACHE.with(|c| {
             let mut state = state.clone();
-            super::render(frame, &mut state, ui, &mut c.borrow_mut())
+            super::render(frame, &mut state, ui, &mut c.borrow_mut(), None)
         })
     }
 

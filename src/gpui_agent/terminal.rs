@@ -26,7 +26,7 @@ use ratatui::style::{Color, Modifier, Style};
 use crate::app::theme::TuiTheme;
 use crate::app::{
     App as AppState, GridLine, Seg, SegRole, UiEvent, bash_entry_model, notice_model,
-    thinking_seqs, thinking_visible, tool_card_model,
+    thinking_seqs, thinking_visible, tool_card_model_ctx,
 };
 use crate::gpui_agent::actor::RpcSession;
 use crate::gpui_agent::scroll::{ScrollMetrics, jump_target, page_down_target, page_up_target};
@@ -957,6 +957,11 @@ impl GPUIAgentTerminal {
                 // 重绘由 Theme::change 的 refresh_windows 驱动。
                 crate::gpui_agent::theme::cycle_and_apply(cx);
             }
+            UiEvent::EditPreview { tool_id, result } => {
+                // edit 预览回填（align-edit-diff-rendering task3.1）。
+                // 借用自 &UiEvent：载荷克隆落表。
+                self.state.app.apply_edit_preview(tool_id, result.clone());
+            }
             UiEvent::OpenModelSelect => {
                 self.state.app.notice = Some((
                     "未找到匹配模型（GPUI P0 无选择器，请带精确参数）".to_string(),
@@ -1747,7 +1752,7 @@ fn thinking_block(text: &str, ctx: &EntryCtx, seq: usize, pal: &'static palette:
         });
     let mut block = block.test_support();
     for row in &rows {
-        block = block.child(segs_row(row, pal));
+        block = block.child(segs_row(row, pal, pal.chat_bg));
     }
     // 观测/点击壳外套一层普通容器保持 Div 返回类型（同 tool_card）。
     div().flex().flex_col().child(block)
@@ -1791,8 +1796,16 @@ fn tool_card(
     let expanded = ctx.app.tool_expanded_effective(id);
     // read/write 正文预览的语法主题走共享 TuiTheme 默认（syntax 不在本
     // change 的 spec 语义 token 清单内）；面板底随 mode 取表（task1.3）。
-    let model = tool_card_model(name, args_json, tool, expanded, &TuiTheme::default());
-    let panel = card_panel_bg(&tool.status, tool.is_error, pal);
+    // 预览态（task3.3）：Error → 红底头行（spec）；Ready → 卡体换预览行。
+    let pctx = ctx.app.preview_ctx();
+    let preview = pctx.map.get(id);
+    let model =
+        tool_card_model_ctx(name, args_json, tool, expanded, &TuiTheme::default(), preview);
+    let panel = if matches!(preview, Some(crate::app::EditPreviewState::Error(_))) {
+        pal.card_bg_err
+    } else {
+        card_panel_bg(&tool.status, tool.is_error, pal)
+    };
     // 测试探针（task3.2）：记录最近渲染的卡面板底色（仅 test 构建）。
     #[cfg(test)]
     PROBE_CARD_BG.with(|c| c.set(pack_rgb(panel)));
@@ -1819,24 +1832,24 @@ fn tool_card(
     }
     let mut card = card.test_support();
     // 头行（状态相关，恒显）。
-    card = card.child(segs_row(&model.head, pal));
+    card = card.child(segs_row(&model.head, pal, panel));
     // 折叠面（预览 + 提示行）仅折叠态作为常显子节点；展开面正文经内建
     // Collapsible 挂载（open=生效态：不打开即不挂载、不占位，design D2）。
     card = card.when(!expanded, |c| {
-        let mut c = c.child(segs_col(&model.body, pal));
+        let mut c = c.child(segs_col(&model.body, pal, panel));
         if let Some(hint) = &model.hint {
-            c = c.child(segs_row(std::slice::from_ref(hint), pal));
+            c = c.child(segs_row(std::slice::from_ref(hint), pal, panel));
         }
         c
     });
     card = card.child(
         Collapsible::new()
             .open(expanded)
-            .content(segs_col(&model.body, pal)),
+            .content(segs_col(&model.body, pal, panel)),
     );
     // 受保护尾部（exit 状态行/截断警告）恒显。
     for row in &model.tail {
-        card = card.child(segs_row(row, pal));
+        card = card.child(segs_row(row, pal, panel));
     }
     // 观测/点击壳外再套一层普通容器以保持 Div 返回类型；flex_col 维持
     // 卡片整行拉伸（与直接挂在条目列同宽，布局无损）。
@@ -1848,7 +1861,7 @@ fn tool_card(
 /// 输入: segs — 单行语义段（头行/正文行/提示行/尾部行）；
 ///       pal — 当前 mode 调色板（段色随模式取表）；
 /// 输出: 行元素（空行以单个空格保行高；test_text 记录整行文本供快照断言）
-fn segs_row(segs: &[Seg], pal: &'static palette::Palette) -> Div {
+fn segs_row(segs: &[Seg], pal: &'static palette::Palette, row_bg: gpui_kit::Rgba) -> Div {
     let full: String = segs.iter().map(|s| s.text.as_str()).collect();
     let mut text = String::new();
     let mut runs: Vec<TextRun> = Vec::new();
@@ -1858,7 +1871,14 @@ fn segs_row(segs: &[Seg], pal: &'static palette::Palette) -> Div {
         }
         let start = text.len();
         text.push_str(&seg.text);
-        let (color, weight, style) = seg_visual(seg.role, pal);
+        let (mut color, weight, style) = seg_visual(seg.role, pal);
+        let mut background = None;
+        if let SegRole::InverseFg(_) = seg.role {
+            // 反视频：行色与行底对调（终端 SGR7 等价；design D4 修正——
+            // Seg 桥经 InverseFg 角色把反视频语义带到这里）。
+            background = Some(color);
+            color = row_bg.into();
+        }
         runs.push(TextRun {
             len: text.len() - start,
             font: Font {
@@ -1867,6 +1887,7 @@ fn segs_row(segs: &[Seg], pal: &'static palette::Palette) -> Div {
                 ..Font::default()
             },
             color,
+            background_color: background,
             ..Default::default()
         });
     }
@@ -1885,10 +1906,10 @@ fn segs_row(segs: &[Seg], pal: &'static palette::Palette) -> Div {
 /// 输入: rows — 行段序列（模型 body 面：展开全文或折叠预览）；
 ///       pal — 当前 mode 调色板（下传逐行）；
 /// 输出: flex_col 容器（逐行 [`segs_row`]；空序列给空列）。
-fn segs_col(rows: &[Vec<Seg>], pal: &'static palette::Palette) -> Div {
+fn segs_col(rows: &[Vec<Seg>], pal: &'static palette::Palette, row_bg: gpui_kit::Rgba) -> Div {
     let mut col = div().flex().flex_col();
     for row in rows {
-        col = col.child(segs_row(row, pal));
+        col = col.child(segs_row(row, pal, row_bg));
     }
     col
 }
@@ -1913,6 +1934,8 @@ fn seg_visual(role: SegRole, pal: &'static palette::Palette) -> (Hsla, FontWeigh
         SegRole::Timer | SegRole::Hint => (pal.card_dim.into(), regular, normal),
         SegRole::Body => (pal.tool_preview_text.into(), regular, normal),
         SegRole::Fg(c) => (fg_on_card(c, pal), regular, normal),
+        // 反视频变更词：基础色=行色，segs_row 再与行底对调（design D4）。
+        SegRole::InverseFg(c) => (to_hsla(c), regular, normal),
         // —— 消息区 ——
         SegRole::NoticeError => (pal.notice_error.into(), bold, normal),
         SegRole::NoticeRetry => (pal.notice_retry.into(), regular, normal),
@@ -1953,7 +1976,7 @@ fn notice_row(kind: &str, text: &str, index: usize, pal: &'static palette::Palet
     div()
         .px_2()
         .py_1()
-        .child(segs_row(&notice_model(kind, text), pal))
+        .child(segs_row(&notice_model(kind, text), pal, pal.chat_bg))
 }
 
 /// bash 条目（消费共享 `bash_entry_model`：命令行 + 尾部 500 行截断 +
@@ -1991,7 +2014,7 @@ fn bash_row(
         excluded,
         live,
     ) {
-        row = row.child(segs_row(&segs, pal));
+        row = row.child(segs_row(&segs, pal, pal.chat_bg));
     }
     row
 }
@@ -3229,6 +3252,48 @@ done
         assert_eq!(value(cx), "l1\nl2", "末行 Down 不改文本");
         assert_eq!(cursor(cx), (1, 2), "末行非浏览 Down 落行尾");
         assert!(!browsing(cx));
+    }
+
+    /// 3.3 GPUI 预览接线：Error → 红底卡 + 错误文案入卡体（task3.3；spec:
+    /// 预览错误态红底头行）。fixture 的 edit 卡改造成 Running 无结果态，
+    /// 模拟「结果未到、预览先行」窗口。
+    #[gpui_kit::test]
+    fn edit_preview_error_renders_red_card_gpui(cx: &mut TestAppContext) {
+        let (handle, term) = open_focused(cx, "edit-preview-gpui");
+        // 流式工具块四步建（transcript 同款）→ Running 无结果的预览窗口态
+        let events = [
+            serde_json::json!({"type":"message_start","message":{"role":"assistant","content":[]}}),
+            serde_json::json!({"type":"message_update","assistantMessageEvent":{"type":"toolcall_start","contentIndex":0,"id":"t9","toolName":"edit"}}),
+            serde_json::json!({"type":"message_update","assistantMessageEvent":{"type":"toolcall_delta","contentIndex":0,"delta":"{\"file_path\":\"/x\",\"oldText\":\"a\",\"newText\":\"b\"}"}}),
+            serde_json::json!({"type":"tool_execution_start","toolCallId":"t9","toolName":"edit",
+                "args":{"file_path":"/x","oldText":"a","newText":"b"}}),
+        ];
+        cx.update(|cx| {
+            term.update(cx, |t, _| {
+                for raw in &events {
+                    t.state.reduce(
+                        &ClientEvent::Event(raw.clone()),
+                        &t.commander,
+                        &t.ui_tx,
+                    );
+                }
+                // 注入 Error 预览 → 渲染
+                t.state
+                    .app
+                    .edit_previews
+                    .insert("t9".into(), crate::app::EditPreviewState::Error("preview-boom".into()));
+                t.state.app.edit_preview_rev += 1;
+            })
+        });
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render");
+        cx.run_until_parked();
+
+        // 卡体错误文案 + 红底探针（浅色表 card_bg_err = 0xEEE2E1）
+        let msg = msg_texts(cx, handle);
+        assert!(msg.contains("preview-boom"), "错误文案入卡: {msg:?}");
+        let bg = super::probe_card_bg();
+        assert_eq!(bg, 0xee_e2_e1, "错误态红底卡（浅色表 card_bg_err）");
     }
 
     /// GPUI 内容变更退出浏览、程序化回写不退（task4.2；spec: 内容变更退出）。

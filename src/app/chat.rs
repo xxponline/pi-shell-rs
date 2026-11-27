@@ -11,6 +11,8 @@ use pi_shell_rs::session::{Block, Entry, SessionState, ToolExecution, ToolStatus
 use crate::app::theme::TuiTheme;
 use crate::app::wrap::HitKind;
 
+use super::{EditPreviewState, PreviewCtx};
+
 /// 渲染偏好标志（App 级 UI 状态，经键位切换）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RenderFlags {
@@ -76,6 +78,7 @@ pub fn chat_lines_themed(
             &mut thinking_seq,
             &mut msg_seq,
             theme,
+            None,
         );
         lines.extend(el);
         meta.extend(em);
@@ -88,6 +91,7 @@ pub fn chat_lines_themed(
         thinking_overrides,
         &mut thinking_seq,
         theme,
+        None,
     );
     lines.extend(il);
     meta.extend(im);
@@ -104,9 +108,11 @@ pub fn chat_lines_themed(
 ///
 /// 输入: entry — transcript 条目；flags/overrides/thinking_overrides/theme —
 ///       同 [`chat_lines_themed`]；thinking_seq/msg_seq — 全局序号游标
-///       （入口值 = 该条目基值，函数内推进，出口 = 下一条目基值）
+///       （入口值 = 该条目基值，函数内推进，出口 = 下一条目基值）；
+///       previews — edit 预览上下文（task3.3；None=无预览）
 /// 输出: `(该条目的逻辑行, 逐行命中 meta)`——两者等长，命中种属携带
 ///       **全局**序号（以入口游标为基渲染）；错误情形：无
+#[allow(clippy::too_many_arguments)] // previews 穿参（task3.3）+ append_blocks 同款
 pub(crate) fn layout_entry(
     entry: &Entry,
     flags: RenderFlags,
@@ -115,6 +121,7 @@ pub(crate) fn layout_entry(
     thinking_seq: &mut usize,
     msg_seq: &mut usize,
     theme: &TuiTheme,
+    previews: Option<&PreviewCtx<'_>>,
 ) -> (Vec<Line<'static>>, Vec<Vec<HitKind>>) {
     let mut lines = Vec::new();
     let mut meta: Vec<Vec<HitKind>> = Vec::new();
@@ -133,6 +140,7 @@ pub(crate) fn layout_entry(
                 thinking_overrides,
                 thinking_seq,
                 theme,
+                previews,
             );
         }
         Entry::Notice { kind, text } => {
@@ -183,6 +191,7 @@ pub(crate) fn layout_inflight(
     thinking_overrides: &std::collections::HashMap<usize, bool>,
     thinking_seq: &mut usize,
     theme: &TuiTheme,
+    previews: Option<&PreviewCtx<'_>>,
 ) -> (Vec<Line<'static>>, Vec<Vec<HitKind>>) {
     let mut lines = Vec::new();
     let mut meta: Vec<Vec<HitKind>> = Vec::new();
@@ -196,6 +205,7 @@ pub(crate) fn layout_inflight(
             thinking_overrides,
             thinking_seq,
             theme,
+            previews,
         );
     }
     meta.resize(lines.len(), Vec::new());
@@ -408,7 +418,8 @@ pub(crate) fn notice_model(kind: &str, text: &str) -> Vec<crate::app::tools::Seg
 /// 输入: out/meta — 行与逐行命中标识收集器（design D1）；blocks — 内容块；
 ///       flags — 渲染偏好；overrides — 单卡工具覆盖；thinking_overrides —
 ///       thinking 单块覆盖；thinking_seq — 全局 thinking 序号游标
-///       （无条件递增、跨调用穿透，design D2）
+///       （无条件递增、跨调用穿透，design D2）；previews — edit 预览
+///       上下文（task3.3；None=无预览，测试/oracle 路径）
 /// 输出: 无返回值；副作用为向 out/meta 追加（流式尾槽分槽构建也走
 ///       本入口，与全量 oracle 同源，design D1）
 #[allow(clippy::too_many_arguments)]
@@ -421,6 +432,7 @@ pub(crate) fn append_blocks(
     thinking_overrides: &std::collections::HashMap<usize, bool>,
     thinking_seq: &mut usize,
     theme: &TuiTheme,
+    previews: Option<&PreviewCtx<'_>>,
 ) {
     // 序号分配先行（共享规则 thinking_seqs，design D2：无条件递增、
     // 含空块、跨调用穿透——出口游标回写由本函数完成）。
@@ -456,10 +468,22 @@ pub(crate) fn append_blocks(
                 // 跟随全局 flags.expand_tools，design D1）；背景面板按状态
                 // 着色（design D5），状态文字/圆点保留（spec #16）。
                 let expanded = *overrides.get(id).unwrap_or(&flags.expand_tools);
-                let bg = tool_panel_bg(tool, theme);
-                for mut line in
-                    crate::app::tools::tool_lines_themed(name, args_json, tool, expanded, theme)
-                {
+                // 预览态（task3.3）：Error → 红底头行（spec）；Ready → 卡体
+                // 换预览行（edit_body 内优先级：结果 diff 仍最高）。
+                let preview = previews.and_then(|p| p.map.get(id));
+                let bg = if matches!(preview, Some(EditPreviewState::Error(_))) {
+                    theme.tool_error_bg
+                } else {
+                    tool_panel_bg(tool, theme)
+                };
+                for mut line in crate::app::tools::tool_lines_themed_ctx(
+                    name,
+                    args_json,
+                    tool,
+                    expanded,
+                    theme,
+                    preview,
+                ) {
                     line.style = Style::default().bg(bg);
                     out.push(line);
                 }
@@ -1097,6 +1121,54 @@ mod tests {
     #[test]
     fn notice_model_prefix_and_roles() {
         use crate::app::tools::SegRole;
+        // 3.3 预览错误态 → 红底头行（task3.3；spec: 错误态红底）。
+        {
+            use std::collections::HashMap;
+            let theme = TuiTheme::default();
+            let block = Block::ToolCall {
+                id: "prev-err".into(),
+                name: "edit".into(),
+                args_json: r#"{"file_path":"/x","oldText":"a","newText":"b"}"#.into(),
+                tool: ToolExecution {
+                    status: ToolStatus::Running,
+                    ..Default::default()
+                },
+            };
+            let mut map = HashMap::new();
+            map.insert(
+                "prev-err".to_string(),
+                EditPreviewState::Error("boom".into()),
+            );
+            let ctx = PreviewCtx {
+                map: &map,
+                rev: 1,
+            };
+            let mut out = Vec::new();
+            let mut meta = Vec::new();
+            append_blocks(
+                &mut out,
+                &mut meta,
+                std::slice::from_ref(&block),
+                RenderFlags::default(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &mut 0usize,
+                &theme,
+                Some(&ctx),
+            );
+            let text = out
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("boom"), "错误文案在场: {text}");
+            assert!(
+                out.iter().all(|l| l.style.bg == Some(theme.tool_error_bg)),
+                "错误态红底头行: {:?}",
+                out.iter().map(|l| l.style.bg).collect::<Vec<_>>()
+            );
+        }
+
         let err = notice_model("error", "400 bad");
         assert_eq!(err.len(), 1);
         assert_eq!(err[0].text, "[error] 400 bad");

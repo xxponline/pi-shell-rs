@@ -25,7 +25,7 @@ mod terminal;
 pub mod embed;
 pub mod theme;
 pub mod virtual_terminal;
-mod tools;
+pub mod tools; // GPUI/跨模块经 crate::app::tools 直取（task3.3 穿参）
 pub(crate) mod view; // GPUI 复用补全窗口常量等（add-gpui-overlays D4：仅加法）
 mod wrap;
 
@@ -52,7 +52,7 @@ pub use crate::app::wrap::{GridLine, GridSeg};
 pub(crate) use chat::{bash_entry_model, notice_model, thinking_seqs, thinking_visible};
 /// GPUI 工具卡中性模型与段类型（与 TUI 同源，additive 导出）。
 #[cfg(feature = "gpui-support")]
-pub(crate) use tools::{Seg, SegRole, tool_card_model};
+pub(crate) use tools::{Seg, SegRole, tool_card_model_ctx};
 use crate::app::overlay::{overlay_key, Overlay, OverlayOutcome};
 pub(crate) use crate::app::terminal::{TerminalGuard, TerminalSinks};
 
@@ -129,6 +129,81 @@ enum PathOpen {
     Applied,
     /// 无路径 token / 零候选 → 无操作。
     None,
+}
+
+/// 预览输入（task3.2）：目标路径 + 有序 (old, new) 编辑对。
+struct PreviewInput {
+    path: String,
+    edits: Vec<(String, String)>,
+}
+
+/// 从 edit 参数提取预览输入（pi `getRenderablePreviewInput` 同款门控：
+/// `path`/`file_path` 二选一；`edits[]` 数组或 `oldText/newText` 单对）。
+///
+/// 输入: args — 工具参数 JSON；
+/// 输出: Some(预览输入) / None（参数不齐或非字符串）
+fn preview_input(args: &serde_json::Value) -> Option<PreviewInput> {
+    let path = args
+        .get("path")
+        .or_else(|| args.get("file_path"))
+        .and_then(|v| v.as_str())?
+        .to_string();
+    if let Some(edits) = args.get("edits").and_then(|v| v.as_array())
+        && !edits.is_empty()
+        && edits.iter().all(|e| {
+            e.get("oldText").and_then(|v| v.as_str()).is_some()
+                && e.get("newText").and_then(|v| v.as_str()).is_some()
+        })
+    {
+        return Some(PreviewInput {
+            path,
+            edits: edits
+                .iter()
+                .map(|e| {
+                    (
+                        e["oldText"].as_str().unwrap_or_default().to_string(),
+                        e["newText"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect(),
+        });
+    }
+    let old = args.get("oldText").and_then(|v| v.as_str())?;
+    let new = args.get("newText").and_then(|v| v.as_str())?;
+    Some(PreviewInput {
+        path,
+        edits: vec![(old.to_string(), new.to_string())],
+    })
+}
+
+/// 计算 edit 执行前预览（task3.2；独立线程执行——design D5/D6）。
+///
+/// 功能: 读目标文件（相对路径拼 cwd；读失败/非 UTF8 → Err）→ 逐对应用
+///       编辑（oldText 不包含 → Err 错误文案，spec「oldText 不匹配」；
+///       包含 → replace）→ `line_diff_rows(改前, 改后)` 得行模型；
+/// 输入: input — 预览输入（路径 + 编辑对）；
+/// 输出: Ok(行模型) / Err(错误文案)——经 `UiEvent::EditPreview` 回填
+fn compute_edit_preview(input: &PreviewInput) -> Result<Vec<tools::DiffRow>, String> {
+    let path = {
+        let p = std::path::Path::new(&input.path);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|e| format!("cwd unavailable: {e}"))?
+                .join(p)
+        }
+    };
+    let before =
+        std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", input.path))?;
+    let mut after = before.clone();
+    for (old, new) in &input.edits {
+        if !after.contains(old) {
+            return Err(format!("oldText not found in {}", input.path));
+        }
+        after = after.replace(old, new);
+    }
+    Ok(tools::line_diff_rows(&before, &after))
 }
 
 /// Tab 触发的斜杠命令上下文判定（对照 pi `isInSlashCommandContext && 无空格`）。
@@ -223,6 +298,11 @@ pub struct App {
     sinks: TerminalSinks,
     /// 条目级布局缓存（design D1/D2/D7）：渲染与选区文档共用，增量重排。
     layout_cache: crate::app::layout_cache::LayoutCache,
+    /// edit 执行前预览（task3.1；toolId → 预览态；load_messages 整体重建时
+    /// 清空）。`pub(crate)`：gpui 测试注入与跨模块读取（产线经 `preview_ctx`）。
+    pub(crate) edit_previews: HashMap<String, EditPreviewState>,
+    /// 预览变更序号（task3.3：入 LayoutKey，变迁即整键重建）。
+    pub(crate) edit_preview_rev: u64,
     /// 注入配色（宿主配色注入 design D5）：默认 = 深底现值；embed 经
     /// `EmbedConfig.theme` 启动注入、`UiEvent::Theme` 运行时切换；
     /// standalone 恒为默认（R8 不动默认外观）。
@@ -239,6 +319,27 @@ pub enum SurfaceKind {
     Tui,
     /// GPUI 独立窗口（含 Theme 行；循环经 `UiEvent::ThemeCycle` 回流）。
     Gpui,
+}
+
+/// edit 执行前预览态（align-edit-diff-rendering design D5；App 侧状态，
+/// 不进 session 层——session 不依赖终端与文件 IO）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum EditPreviewState {
+    /// 已触发、计算中（卡体维持 args 级 diff）。
+    Pending,
+    /// 预览就绪：行模型（-/+ 行 + 上下文，与结果 diff 同渲染器）。
+    Ready(Vec<tools::DiffRow>),
+    /// 预览错误（文件缺失 / oldText 不匹配）：错误文案。
+    Error(String),
+}
+
+/// 预览渲染上下文（task3.3：穿布局链的 `(map, rev)` 打包——rev 进
+/// `LayoutKey`，预览变迁即整键重建，免逐条目指纹失配）。
+pub struct PreviewCtx<'a> {
+    /// toolId → 预览态。
+    pub map: &'a HashMap<String, EditPreviewState>,
+    /// 变更序号（每次预览变迁 +1）。
+    pub rev: u64,
 }
 
 /// 默认构造：等价 [`App::new`]。
@@ -301,6 +402,21 @@ impl App {
             layout_cache: Default::default(),
             theme: crate::app::theme::TuiTheme::default(),
             surface: SurfaceKind::Tui,
+            edit_previews: HashMap::new(),
+            edit_preview_rev: 0,
+        }
+    }
+
+    /// 取预览渲染上下文（task3.3；gpui 模块跨隐私访问用——TUI 产线在
+    /// 同模块内联字段借用，不经此方法）。
+    ///
+    /// 输入: 无（读 self.edit_previews/rev）；
+    /// 输出: 当前预览上下文（map 引用 + 变更序号）
+    #[cfg(feature = "gpui-support")]
+    pub(crate) fn preview_ctx(&self) -> PreviewCtx<'_> {
+        PreviewCtx {
+            map: &self.edit_previews,
+            rev: self.edit_preview_rev,
         }
     }
 
@@ -553,6 +669,8 @@ impl App {
                         if raw.get("type").and_then(|t| t.as_str()) == Some("compaction_end") {
                             self.flush_compact_queue(commander, report_tx);
                         }
+                        // 预览触发/清理钩子（task3.1/3.2，与 GPUI 同源）。
+                        self.after_session_event(&raw, report_tx);
                         need_draw = true;
                     }
                     Ok(UiEvent::AsyncData { kind, seq, data }) => {
@@ -652,6 +770,11 @@ impl App {
                     Ok(UiEvent::ThemeCycle) => {
                         // TUI 无 Theme 行（surface=Tui 不开该行），事件不可达；
                         // 空臂保 match 完备（实际应用在 GPUI 组件泵侧）。
+                    }
+                    Ok(UiEvent::EditPreview { tool_id, result }) => {
+                        // 预览回填（task3.1）：落表后重绘（Pending→Ready/Error）。
+                        self.apply_edit_preview(&tool_id, result);
+                        need_draw = true;
                     }
                     // Idle timeout：无状态变化不重绘；但运行中工具需要每秒走字
                     //（design D3，判定抽为纯函数便于单测）。
@@ -1409,6 +1532,87 @@ impl App {
             self.editor.end();
         } else {
             self.editor.move_down();
+        }
+    }
+
+    /// 应用一条 edit 预览回填（task3.1；TUI 事件循环与 GPUI 泵共用）。
+    ///
+    /// 功能: 仅当该 toolId 仍在预览表（Pending）时落表——结果已到或会话
+    ///       重建后的迟到回填直接丢弃（design D5 幂等竞态防护）；
+    /// 输入: tool_id — 工具调用 id；result — Ok 预览 diff / Err 错误文案；
+    /// 输出: 无返回；副作用为状态更新（调用方负责 notify/need_draw 重绘）
+    pub(crate) fn apply_edit_preview(
+        &mut self,
+        tool_id: &str,
+        result: Result<Vec<tools::DiffRow>, String>,
+    ) {
+        if !self.edit_previews.contains_key(tool_id) {
+            return; // 迟到回填丢弃（id 已被结果到达/重建移除）
+        }
+        let state = match result {
+            Ok(rows) => EditPreviewState::Ready(rows),
+            Err(msg) => EditPreviewState::Error(msg),
+        };
+        self.edit_previews.insert(tool_id.to_string(), state);
+        self.edit_preview_rev += 1;
+    }
+
+    /// 触发 edit 执行前预览（task3.2；`after_session_event` 调用）。
+    ///
+    /// 功能: `tool_execution_start` 且 toolName=edit、参数齐全（`edits[]`
+    ///       或 `oldText/newText`，pi `getRenderablePreviewInput` 同款门控）
+    ///       → 置 Pending 并起独立线程读文件 + 算 diff（IO 不在事件/渲染
+    ///       线程，spec「不阻塞事件循环」），结果经 report_tx 回填；
+    /// 输入: raw — tool_execution_start 事件；report_tx — 回报通道；
+    /// 输出: 无返回；副作用为预览表置 Pending + 派生计算线程
+    fn begin_edit_preview(&mut self, raw: &serde_json::Value, report_tx: &Sender<UiEvent>) {
+        if raw.get("toolName").and_then(|v| v.as_str()) != Some("edit") {
+            return;
+        }
+        let Some(id) = raw.get("toolCallId").and_then(|v| v.as_str()) else {
+            return;
+        };
+        let args = raw.get("args").cloned().unwrap_or(serde_json::Value::Null);
+        let Some(input) = preview_input(&args) else {
+            return; // 参数未齐（pi 门控同款）
+        };
+        if self.edit_previews.contains_key(id) {
+            return; // 重复 start 幂等
+        }
+        self.edit_previews.insert(id.to_string(), EditPreviewState::Pending);
+        let tool_id = id.to_string();
+        let tx = report_tx.clone();
+        std::thread::spawn(move || {
+            let result = compute_edit_preview(&input);
+            let _ = tx.send(UiEvent::EditPreview { tool_id, result });
+        });
+    }
+
+    /// 会话事件归约后钩子（task3.1/3.2；TUI `UiEvent::Rpc` 臂与 GPUI
+    /// `apply_core_event` 双路径共用，保持两前端语义一致）。
+    ///
+    /// 功能: `tool_execution_end` → 移除该 toolId 预览（结果 diff 接管
+    ///       渲染，spec「结果到达替换」）；edit `tool_execution_start`
+    ///       且参数齐全 → 置 Pending 并异步计算预览（task3.2 触发点）；
+    /// 输入: raw — pi 事件 JSON；report_tx — 回报通道（预览回填经此）；
+    /// 输出: 无返回；副作用为预览表更新 / 派生计算线程
+    pub(crate) fn after_session_event(
+        &mut self,
+        raw: &serde_json::Value,
+        report_tx: &Sender<UiEvent>,
+    ) {
+        match raw.get("type").and_then(|t| t.as_str()) {
+            Some("tool_execution_end") => {
+                if let Some(id) = raw.get("toolCallId").and_then(|v| v.as_str())
+                    && self.edit_previews.remove(id).is_some()
+                {
+                    self.edit_preview_rev += 1;
+                }
+            }
+            Some("tool_execution_start") => {
+                self.begin_edit_preview(raw, report_tx);
+            }
+            _ => {}
         }
     }
 
@@ -2588,6 +2792,8 @@ impl App {
         if raw.get("type").and_then(|t| t.as_str()) == Some("compaction_end") {
             self.flush_compact_queue(commander, report_tx);
         }
+        // 预览触发/清理钩子（task3.1/3.2，与 TUI UiEvent::Rpc 臂同源）。
+        self.after_session_event(raw, report_tx);
     }
 
     /// 状态行左段内容（GPUI 前端渲染入口，task 5.3）：与 ratatui
@@ -4119,6 +4325,11 @@ impl App {
                 // 输入历史整体重建（design D3：本处为 transcript 唯一整体
                 // 重写点，单点覆盖启动/切会话/new/fork/树导航/import）。
                 self.rebuild_input_history();
+                // 预览态同点清空（spec: 会话重建清空——不串到新会话卡片）。
+                if !self.edit_previews.is_empty() {
+                    self.edit_previews.clear();
+                    self.edit_preview_rev += 1;
+                }
                 // 会话重建/切换链应答（design D5 主路径）：整段 transcript
                 // 被替换，滚动恢复贴底跟随——钉住态切到更长会话时 clamp
                 // 救不了（top 不越界、不恢复跟随），必须显式重置。
@@ -4380,7 +4591,18 @@ impl App {
             let probe_ui_ns = std::cell::Cell::new(0u64);
             terminal.draw(|frame| {
                 let ui_t0 = std::time::Instant::now();
-                fb.set(view::render(frame, &mut self.state, &ui, &mut self.layout_cache));
+                // 预览上下文与 state/cache 字段级不相交借用（task3.3）。
+                let previews = PreviewCtx {
+                    map: &self.edit_previews,
+                    rev: self.edit_preview_rev,
+                };
+                fb.set(view::render(
+                    frame,
+                    &mut self.state,
+                    &ui,
+                    &mut self.layout_cache,
+                    Some(&previews),
+                ));
                 // 选区反视频（add-select-to-copy design D3：paint 后 buffer
                 // 后处理——pi ANSI [7m 等价，样式保留仅 fg/bg 互换）。
                 if let Some((s, e, top, area)) = paint_sel {
@@ -4422,7 +4644,18 @@ impl App {
             }
         } else {
             terminal.draw(|frame| {
-                fb.set(view::render(frame, &mut self.state, &ui, &mut self.layout_cache));
+                // 预览上下文与 state/cache 字段级不相交借用（task3.3）。
+                let previews = PreviewCtx {
+                    map: &self.edit_previews,
+                    rev: self.edit_preview_rev,
+                };
+                fb.set(view::render(
+                    frame,
+                    &mut self.state,
+                    &ui,
+                    &mut self.layout_cache,
+                    Some(&previews),
+                ));
                 if let Some((s, e, top, area)) = paint_sel {
                     view::paint_selection(frame.buffer_mut(), s, e, top, area);
                 }
@@ -8016,7 +8249,7 @@ done
                     overlay: app.overlay.as_ref(),
                     ..Default::default()
                 };
-                crate::app::view::render(frame, &mut state, &ui, &mut cache);
+                crate::app::view::render(frame, &mut state, &ui, &mut cache, None);
             })
             .unwrap();
         let buf = terminal.backend().buffer();
@@ -8324,6 +8557,133 @@ done
         app.handle_async_data(AsyncKind::Messages, 3, &payload);
         assert!(!app.editor.history_browsing(), "重建复位浏览态");
         assert_eq!(app.editor.text(), "q2", "浏览文本留驻");
+    }
+
+    /// edit 预览状态机（task3.1）：迟到回填丢弃、结果到达移除、重建清空。
+    #[test]
+    fn edit_preview_state_machine_and_lifecycle() {
+        let mut app = App::new();
+        // 无 Pending 的迟到回填 → 丢弃
+        app.apply_edit_preview("t1", Ok(vec![]));
+        assert!(app.edit_previews.is_empty(), "无 Pending 的迟到回填丢弃");
+
+        // Pending → Ready / Error
+        app.edit_previews.insert("t1".into(), EditPreviewState::Pending);
+        app.apply_edit_preview("t1", Ok(vec![tools::DiffRow::Context("x".into())]));
+        assert_eq!(
+            app.edit_previews.get("t1"),
+            Some(&EditPreviewState::Ready(vec![tools::DiffRow::Context("x".into())])),
+            "Ok 落 Ready"
+        );
+        app.edit_previews.insert("t2".into(), EditPreviewState::Pending);
+        app.apply_edit_preview("t2", Err("missing".into()));
+        assert_eq!(
+            app.edit_previews.get("t2"),
+            Some(&EditPreviewState::Error("missing".into())),
+            "Err 落 Error"
+        );
+
+        // 结果到达（tool_execution_end 钩子）→ 仅移除该 id
+        let (tx, _rx) = std::sync::mpsc::channel::<UiEvent>();
+        app.after_session_event(
+            &serde_json::json!({"type":"tool_execution_end","toolCallId":"t1"}),
+            &tx,
+        );
+        assert!(!app.edit_previews.contains_key("t1"), "结果到达移除预览");
+        assert!(app.edit_previews.contains_key("t2"), "其它 id 保留");
+
+        // 会话整体重建 → 清空（spec: 会话重建清空）
+        app.edit_previews.insert("t3".into(), EditPreviewState::Pending);
+        app.handle_async_data(AsyncKind::Messages, 1, &serde_json::json!({"messages":[]}));
+        assert!(app.edit_previews.is_empty(), "重建清空预览态");
+    }
+
+    /// 预览触发门控与 worker 计算（task3.2）：非 edit/参数不齐不触发；
+    /// edit → Pending + 线程回填 Ready/Err（文件缺失、oldText 不匹配）。
+    #[test]
+    fn edit_preview_trigger_gating_and_compute() {
+        let mut app = App::new();
+        let (tx, rx) = std::sync::mpsc::channel::<UiEvent>();
+
+        // 非 edit 工具不触发
+        app.after_session_event(
+            &serde_json::json!({"type":"tool_execution_start","toolCallId":"b1","toolName":"bash","args":{}}),
+            &tx,
+        );
+        assert!(app.edit_previews.is_empty(), "非 edit 不触发");
+        // edit 但参数不齐（无 oldText/newText）不触发（pi 门控同款）
+        app.after_session_event(
+            &serde_json::json!({"type":"tool_execution_start","toolCallId":"e0","toolName":"edit","args":{"path":"/x"}}),
+            &tx,
+        );
+        assert!(app.edit_previews.is_empty(), "参数不齐不触发");
+
+        // 参数齐全 → Pending，线程回填 Ready（真实临时文件）
+        let dir = std::env::temp_dir().join(format!("edit-preview-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "hello world\n").unwrap();
+        let path = file.to_string_lossy().to_string();
+        app.after_session_event(
+            &serde_json::json!({"type":"tool_execution_start","toolCallId":"e1","toolName":"edit",
+                "args":{"path":path,"oldText":"world","newText":"rust"}}),
+            &tx,
+        );
+        assert_eq!(
+            app.edit_previews.get("e1"),
+            Some(&EditPreviewState::Pending),
+            "齐全 → Pending"
+        );
+        let ev = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("预览回填");
+        let (tool_id, result) = match ev {
+            UiEvent::EditPreview { tool_id, result } => (tool_id, result),
+            other => panic!("应为 EditPreview: {other:?}"),
+        };
+        assert_eq!(tool_id, "e1");
+        let rows = result.expect("应计算成功");
+        assert!(
+            rows.iter().any(|r| matches!(r, tools::DiffRow::Minus { .. }))
+                && rows.iter().any(|r| matches!(r, tools::DiffRow::Plus { .. })),
+            "行模型含 -/+ 行: {rows:?}"
+        );
+        app.apply_edit_preview(&tool_id, Ok(rows));
+        assert!(matches!(app.edit_previews.get("e1"), Some(EditPreviewState::Ready(_))));
+
+        // oldText 不匹配 → Err（Pending 先置、回填落 Error）
+        app.after_session_event(
+            &serde_json::json!({"type":"tool_execution_start","toolCallId":"e2","toolName":"edit",
+                "args":{"path":path,"oldText":"nope-not-there","newText":"x"}}),
+            &tx,
+        );
+        let ev = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("Err 回填");
+        match ev {
+            UiEvent::EditPreview { tool_id, result } => {
+                let err = result.expect_err("oldText 不匹配应 Err");
+                assert!(err.contains("oldText not found"), "{err}");
+                app.apply_edit_preview(&tool_id, Err(err));
+            }
+            other => panic!("应为 EditPreview: {other:?}"),
+        }
+        assert!(matches!(app.edit_previews.get("e2"), Some(EditPreviewState::Error(_))));
+
+        // 文件缺失 → Err cannot read
+        app.after_session_event(
+            &serde_json::json!({"type":"tool_execution_start","toolCallId":"e3","toolName":"edit",
+                "args":{"path":dir.join("missing.txt").to_string_lossy(),"oldText":"a","newText":"b"}}),
+            &tx,
+        );
+        let ev = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("缺失回填");
+        match ev {
+            UiEvent::EditPreview { tool_id, result } => {
+                let err = result.expect_err("文件缺失应 Err");
+                assert!(err.contains("cannot read"), "{err}");
+                app.apply_edit_preview(&tool_id, Err(err));
+            }
+            other => panic!("应为 EditPreview: {other:?}"),
+        }
+        assert!(matches!(app.edit_previews.get("e3"), Some(EditPreviewState::Error(_))));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── 双击 Esc（spec：双击 Esc 动作） ──

@@ -7,7 +7,8 @@
 
 use crate::app::theme::TuiTheme;
 use crate::app::{
-    App, bash_entry_model, notice_model, thinking_seqs, thinking_visible, tool_card_model,
+    App, bash_entry_model, notice_model, thinking_seqs, thinking_visible,
+    tool_card_model_ctx,
 };
 use crate::session::{Block, Entry};
 
@@ -173,8 +174,16 @@ pub(crate) fn estimated_entry_px(
                     } => {
                         // 卡 chrome：自带 `py_1` + 头行 + 折叠体(+提示) / 展开体 + 受保护尾。
                         let expanded = app.tool_expanded_effective(id);
-                        let model =
-                            tool_card_model(name, args_json, tool, expanded, &TuiTheme::default());
+                        // 预览行计入高度估算（task3.3：与渲染同源，防滚动比例偏差）。
+                        let pctx = app.preview_ctx();
+                        let model = tool_card_model_ctx(
+                            name,
+                            args_json,
+                            tool,
+                            expanded,
+                            &TuiTheme::default(),
+                            pctx.map.get(id),
+                        );
                         let rows = 1
                             + model.body.len()
                             + usize::from(model.hint.is_some())
@@ -383,6 +392,7 @@ mod tests {
     /// 工具卡 = pad +（头 + 折叠体 + 提示? + 受保护尾）网格行。
     #[test]
     fn estimator_tool_card_rows_follow_model() {
+        use crate::app::tools::tool_card_model;
         let app = App::new(); // 默认折叠
         let tool = ToolExecution {
             status: ToolStatus::Ended,

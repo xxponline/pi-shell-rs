@@ -5,6 +5,8 @@
 //! 缺失都降级，绝不 panic——pi 协议会演进，卡片不能脆。
 
 use ratatui::style::{Color, Modifier, Style};
+
+use super::EditPreviewState;
 use ratatui::text::{Line, Span};
 
 use pi_shell_rs::session::{ToolExecution, ToolStatus};
@@ -40,9 +42,24 @@ pub fn tool_lines_themed(
     expanded: bool,
     theme: &crate::app::theme::TuiTheme,
 ) -> Vec<Line<'static>> {
+    tool_lines_themed_ctx(name, args_json, tool, expanded, theme, None)
+}
+
+/// [`tool_lines_themed`] 预览版（task3.3）：edit 卡带执行前预览态。
+///
+/// 输入: 同 [`tool_lines_themed`]；preview — 该 toolId 的预览态；
+/// 输出: 同 [`tool_lines_themed`]
+pub fn tool_lines_themed_ctx(
+    name: &str,
+    args_json: &str,
+    tool: &ToolExecution,
+    expanded: bool,
+    theme: &crate::app::theme::TuiTheme,
+    preview: Option<&EditPreviewState>,
+) -> Vec<Line<'static>> {
     // 分段计量（render_probe）：工具卡渲染归因段。
     let probe_t0 = std::time::Instant::now();
-    let out = tool_lines_themed_inner(name, args_json, tool, expanded, theme);
+    let out = tool_lines_themed_inner(name, args_json, tool, expanded, theme, preview);
     crate::app::render_probe::record_toolcard(probe_t0.elapsed().as_nanos() as u64);
     out
 }
@@ -58,8 +75,9 @@ fn tool_lines_themed_inner(
     tool: &ToolExecution,
     expanded: bool,
     theme: &crate::app::theme::TuiTheme,
+    preview: Option<&EditPreviewState>,
 ) -> Vec<Line<'static>> {
-    let model = tool_card_model(name, args_json, tool, expanded, theme);
+    let model = tool_card_model_ctx(name, args_json, tool, expanded, theme, preview);
     let mut out = Vec::with_capacity(model.body.len() + model.tail.len() + 2);
     out.push(segs_to_line(&model.head));
     for row in &model.body {
@@ -113,6 +131,8 @@ fn seg_style(role: SegRole) -> Style {
             .fg(Color::DarkGray)
             .add_modifier(Modifier::ITALIC),
         SegRole::Fg(c) => Style::default().fg(c),
+        // 反视频变更词：终端 SGR7 真反视频（与 pi theme.inverse 同语义）。
+        SegRole::InverseFg(c) => Style::default().fg(c).add_modifier(Modifier::REVERSED),
     }
 }
 
@@ -614,28 +634,45 @@ fn format_size(bytes: u64) -> String {
 
 /// edit：details.diff 字符串按行着色（`-N` 红 / `+N` 绿 / `@@` 青）；
 /// 缺失时对 args 的 old/new 文本做行级 LCS 对比降级。
-fn edit_body(args: &Value, tool: &ToolExecution) -> Vec<Line<'static>> {
+fn edit_body(
+    args: &Value,
+    tool: &ToolExecution,
+    preview: Option<&EditPreviewState>,
+) -> Vec<Line<'static>> {
     let details = tool
         .result
         .as_ref()
         .and_then(|r| r.get("details"));
 
+    // 优先级（spec: 结果到达替换）：结果 diff > 预览 Ready/Error > args 降级。
     if let Some(diff) = details.and_then(|d| d.get("diff")).and_then(|d| d.as_str()) {
-        return diff
+        // 解析为共享行模型 → 渲染器统一做 1-1 行内分段（task2.1）。
+        let rows: Vec<DiffRow> = diff
             .lines()
-            .map(|l| {
-                let style = if l.starts_with('-') {
-                    Style::default().fg(Color::Red)
-                } else if l.starts_with('+') {
-                    Style::default().fg(Color::Green)
-                } else if l.starts_with("@@") {
-                    Style::default().fg(Color::Cyan)
-                } else {
-                    Style::default()
-                };
-                Line::from(Span::styled(l.to_string(), style))
+            .map(|l| match parse_diff_line(l) {
+                Some(('-', lead, content)) => DiffRow::Minus {
+                    lead: lead.to_string(),
+                    content: content.to_string(),
+                },
+                Some((_, lead, content)) => DiffRow::Plus {
+                    lead: lead.to_string(),
+                    content: content.to_string(),
+                },
+                None if l.starts_with("@@") => DiffRow::Hunk(l.to_string()),
+                None => DiffRow::Context(l.to_string()),
             })
             .collect();
+        return render_diff_rows(&rows);
+    }
+    match preview {
+        Some(EditPreviewState::Ready(rows)) => return render_diff_rows(rows),
+        Some(EditPreviewState::Error(msg)) => {
+            return vec![Line::from(Span::styled(
+                msg.clone(),
+                Style::default().fg(Color::Red),
+            ))];
+        }
+        Some(EditPreviewState::Pending) | None => {}
     }
 
     // 降级：args.oldString/newString 行级对比。
@@ -644,33 +681,306 @@ fn edit_body(args: &Value, tool: &ToolExecution) -> Vec<Line<'static>> {
     line_diff(old, new)
 }
 
+/// 行内分段单元（词级 diff 内部：文本 + 是否变更段；design D1）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Seg0 {
+    text: String,
+    changed: bool,
+}
+
+/// 词级分词：连续字母数字 = 词、连续空白 = 一段、标点各为一段
+/// （对齐 pi `diffWords` 的可读粒度；design D1——不追求逐字符同）。
+///
+/// 输入: s — 待分词文本；
+/// 输出: token 序列（非空）
+fn tokenize(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_alphanumeric() {
+            let mut w = String::from(c);
+            while let Some(&n) = chars.peek()
+                && n.is_alphanumeric()
+            {
+                w.push(n);
+                chars.next();
+            }
+            out.push(w);
+        } else if c.is_whitespace() {
+            let mut w = String::from(c);
+            while let Some(&n) = chars.peek()
+                && n.is_whitespace()
+            {
+                w.push(n);
+                chars.next();
+            }
+            out.push(w);
+        } else {
+            out.push(c.to_string());
+        }
+    }
+    out
+}
+
+/// 词级 LCS 对比 → 两侧分段（未变更 token 归 unchanged，变更归 changed）。
+///
+/// 输入: a/b — 已分词的旧/新 token 序列；
+/// 输出: (旧侧分段, 新侧分段)，按出现顺序合并同态相邻段
+fn lcs_words(a: &[String], b: &[String]) -> (Vec<Seg0>, Vec<Seg0>) {
+    let (n, m) = (a.len(), b.len());
+    let mut dp = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if a[i] == b[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    let mut old_out: Vec<Seg0> = Vec::new();
+    let mut new_out: Vec<Seg0> = Vec::new();
+    let push = |out: &mut Vec<Seg0>, text: &str, changed: bool| {
+        match out.last_mut() {
+            Some(last) if last.changed == changed => last.text.push_str(text),
+            _ => out.push(Seg0 {
+                text: text.to_string(),
+                changed,
+            }),
+        }
+    };
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < n && j < m {
+        if a[i] == b[j] {
+            push(&mut old_out, &a[i], false);
+            push(&mut new_out, &b[j], false);
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            push(&mut old_out, &a[i], true);
+            i += 1;
+        } else {
+            push(&mut new_out, &b[j], true);
+            j += 1;
+        }
+    }
+    for t in &a[i..] {
+        push(&mut old_out, t, true);
+    }
+    for t in &b[j..] {
+        push(&mut new_out, t, true);
+    }
+    (old_out, new_out)
+}
+
+/// 词级行内分段（pi `renderIntraLineDiff` 同源；design D1/D2）。
+///
+/// 功能: ① 剥离 old/new 共同前导空白并原样拼回（防首段插入吞缩进）；
+///       ② 词级 LCS 对剩余部分；③ 首个变更段若是纯空白则保留不染
+///       （pi 首段前导空白规则）；④ token 乘积超上限退化为不分段
+///       （changed=false，等同分段前的整行渲染，防大行卡顿）；
+/// 输入: old/new — 单行新旧文本；
+/// 输出: (旧侧分段, 新侧分段)
+fn intra_line_diff(old: &str, new: &str) -> (Vec<Seg0>, Vec<Seg0>) {
+    // 共同前导空白：逐位（字符）相同且均为空白才计入。
+    let mut indent_len = 0usize;
+    for (oc, nc) in old.chars().zip(new.chars()) {
+        if oc == nc && oc.is_whitespace() {
+            indent_len += oc.len_utf8();
+        } else {
+            break;
+        }
+    }
+    let indent = &old[..indent_len];
+    let old_rest = &old[indent_len..];
+    let new_rest = &new[indent_len..];
+
+    let a = tokenize(old_rest);
+    let b = tokenize(new_rest);
+    // 上限保护：退化为不分段（整行原样着色，与分段前行为一致）。
+    if a.len().saturating_mul(b.len()) > 160_000 {
+        return (
+            vec![Seg0 {
+                text: old.to_string(),
+                changed: false,
+            }],
+            vec![Seg0 {
+                text: new.to_string(),
+                changed: false,
+            }],
+        );
+    }
+    let (mut old_segs, mut new_segs) = lcs_words(&a, &b);
+
+    // pi 首段规则：首个变更段若是纯空白 → 保留不染（两侧各自判定）。
+    for segs in [&mut old_segs, &mut new_segs] {
+        if let Some(first) = segs.iter_mut().find(|s| s.changed)
+            && first.text.chars().all(|c| c.is_whitespace())
+        {
+            first.changed = false;
+        }
+    }
+    // 缩进原样拼回（两侧都以未变更段开头）。
+    if !indent.is_empty() {
+        for segs in [&mut old_segs, &mut new_segs] {
+            match segs.first_mut() {
+                Some(first) if !first.changed => first.text.insert_str(0, indent),
+                _ => segs.insert(
+                    0,
+                    Seg0 {
+                        text: indent.to_string(),
+                        changed: false,
+                    },
+                ),
+            }
+        }
+    }
+    (old_segs, new_segs)
+}
+
+/// diff 行模型（两路径共享；design D3——渲染侧统一做 1-1 行内分段）。
+/// 预览回填也以本型携带（design D5 修正：存行模型而非文本，避免上下文
+/// 行以 `-` 开头的再解析歧义）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum DiffRow {
+    /// `-` 行：lead 含前缀/行号/分隔空格，content 为正文。
+    Minus { lead: String, content: String },
+    /// `+` 行（同上）。
+    Plus { lead: String, content: String },
+    /// `@@` hunk 行（整行青色）。
+    Hunk(String),
+    /// 上下文/未变行（原样）。
+    Context(String),
+}
+
+/// 解析 pi diff 行为 (前缀, lead, content)；lead 含前缀 + 可选行号与
+/// 分隔空格；无行号时 lead 仅前缀字符；非 -/+ 行返回 None。
+///
+/// 输入: l — diff 原始行；
+/// 输出: Some((前缀, lead, content)) / None
+fn parse_diff_line(l: &str) -> Option<(char, &str, &str)> {
+    let first = l.chars().next()?;
+    if first != '-' && first != '+' {
+        return None;
+    }
+    let rest = &l[first.len_utf8()..];
+    let ws_len = rest.len() - rest.trim_start().len();
+    let after_ws = &rest[ws_len..];
+    let dig_len = after_ws.len() - after_ws.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    if dig_len > 0 {
+        let after_dig = &after_ws[dig_len..];
+        if let Some((sep_idx, sep)) = after_dig.char_indices().find(|(_, c)| c.is_whitespace()) {
+            let cut = first.len_utf8() + ws_len + dig_len + sep_idx + sep.len_utf8();
+            return Some((first, &l[..cut], &l[cut..]));
+        }
+    }
+    Some((first, &l[..first.len_utf8()], rest))
+}
+
+/// 1-1 行对 → 行内分段行（lead 未染 + 变更词反视频；task2.1）。
+fn intra_spans(lead: &str, segs: &[Seg0], color: Color) -> Line<'static> {
+    let mut spans = vec![Span::styled(lead.to_string(), Style::default().fg(color))];
+    for s in segs {
+        let mut style = Style::default().fg(color);
+        if s.changed {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        spans.push(Span::styled(s.text.clone(), style));
+    }
+    Line::from(spans)
+}
+
+/// 行模型 → 上屏行（pi renderDiff 同源规则：连续 - 块与紧随 + 块恰各 1 行
+/// → 行内分段；否则整行红/绿；上下文原样、@@ 青）。
+///
+/// 输入: rows — 行模型序列；
+/// 输出: 着色行序列
+fn render_diff_rows(rows: &[DiffRow]) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut i = 0;
+    while i < rows.len() {
+        if matches!(rows[i], DiffRow::Minus { .. }) {
+            let mut neg: Vec<(String, String)> = Vec::new();
+            let mut j = i;
+            while let Some(DiffRow::Minus { lead, content }) = rows.get(j) {
+                neg.push((lead.clone(), content.clone()));
+                j += 1;
+            }
+            let mut pos: Vec<(String, String)> = Vec::new();
+            while let Some(DiffRow::Plus { lead, content }) = rows.get(j) {
+                pos.push((lead.clone(), content.clone()));
+                j += 1;
+            }
+            if neg.len() == 1 && pos.len() == 1 {
+                let (old_segs, new_segs) = intra_line_diff(&neg[0].1, &pos[0].1);
+                out.push(intra_spans(&neg[0].0, &old_segs, Color::Red));
+                out.push(intra_spans(&pos[0].0, &new_segs, Color::Green));
+            } else {
+                for (lead, content) in neg {
+                    out.push(Line::from(Span::styled(
+                        format!("{lead}{content}"),
+                        Style::default().fg(Color::Red),
+                    )));
+                }
+                for (lead, content) in pos {
+                    out.push(Line::from(Span::styled(
+                        format!("{lead}{content}"),
+                        Style::default().fg(Color::Green),
+                    )));
+                }
+            }
+            i = j;
+            continue;
+        }
+        match &rows[i] {
+            DiffRow::Plus { lead, content } => out.push(Line::from(Span::styled(
+                format!("{lead}{content}"),
+                Style::default().fg(Color::Green),
+            ))),
+            DiffRow::Hunk(t) => out.push(Line::from(Span::styled(
+                t.clone(),
+                Style::default().fg(Color::Cyan),
+            ))),
+            DiffRow::Context(t) => out.push(Line::from(Span::raw(t.clone()))),
+            DiffRow::Minus { .. } => unreachable!(),
+        }
+        i += 1;
+    }
+    out
+}
+
 /// 行级 LCS 对比，产出 `-old`/`+new` 风格行（diff 降级路径）。
 ///
 /// 输入: old — 旧文本；new — 新文本（行数超 400 时降级为整块红绿）
 /// 输出: 带红绿样式的 diff 行
 fn line_diff(old: &str, new: &str) -> Vec<Line<'static>> {
+    render_diff_rows(&line_diff_rows(old, new))
+}
+
+/// 行级 LCS → 行模型（`line_diff` 与预览计算共用；task3.2 提取）。
+///
+/// 输入: old/new — 两段完整文本；
+/// 输出: 行模型序列（1-1 分段由渲染器统一处理）
+pub(crate) fn line_diff_rows(old: &str, new: &str) -> Vec<DiffRow> {
     let a: Vec<&str> = old.lines().collect();
     let b: Vec<&str> = new.lines().collect();
 
-    // 行数过大时不做 O(n*m)，直接整块对比。
+    // 行数过大时不做 O(n*m)，直接整块对比（渲染器对多行 run 也整行）。
     if a.len().saturating_mul(b.len()) > 160_000 {
-        let mut out: Vec<Line> = Vec::new();
-        for l in &a {
-            out.push(Line::from(Span::styled(
-                format!("-{l}"),
-                Style::default().fg(Color::Red),
-            )));
-        }
-        for l in &b {
-            out.push(Line::from(Span::styled(
-                format!("+{l}"),
-                Style::default().fg(Color::Green),
-            )));
-        }
-        return out;
+        return a
+            .iter()
+            .map(|l| DiffRow::Minus {
+                lead: "-".to_string(),
+                content: (*l).to_string(),
+            })
+            .chain(b.iter().map(|l| DiffRow::Plus {
+                lead: "+".to_string(),
+                content: (*l).to_string(),
+            }))
+            .collect();
     }
 
-    // 经典 LCS DP。
+    // 经典 LCS DP → 行模型。
     let (n, m) = (a.len(), b.len());
     let mut dp = vec![vec![0usize; m + 1]; n + 1];
     for i in (0..n).rev() {
@@ -683,39 +993,39 @@ fn line_diff(old: &str, new: &str) -> Vec<Line<'static>> {
         }
     }
     let (mut i, mut j) = (0usize, 0usize);
-    let mut out: Vec<Line> = Vec::new();
+    let mut rows: Vec<DiffRow> = Vec::new();
     while i < n && j < m {
         if a[i] == b[j] {
-            out.push(Line::from(Span::raw(a[i].to_string())));
+            rows.push(DiffRow::Context(a[i].to_string()));
             i += 1;
             j += 1;
         } else if dp[i + 1][j] >= dp[i][j + 1] {
-            out.push(Line::from(Span::styled(
-                format!("-{}", a[i]),
-                Style::default().fg(Color::Red),
-            )));
+            rows.push(DiffRow::Minus {
+                lead: "-".to_string(),
+                content: a[i].to_string(),
+            });
             i += 1;
         } else {
-            out.push(Line::from(Span::styled(
-                format!("+{}", b[j]),
-                Style::default().fg(Color::Green),
-            )));
+            rows.push(DiffRow::Plus {
+                lead: "+".to_string(),
+                content: b[j].to_string(),
+            });
             j += 1;
         }
     }
     for l in &a[i..] {
-        out.push(Line::from(Span::styled(
-            format!("-{l}"),
-            Style::default().fg(Color::Red),
-        )));
+        rows.push(DiffRow::Minus {
+            lead: "-".to_string(),
+            content: (*l).to_string(),
+        });
     }
     for l in &b[j..] {
-        out.push(Line::from(Span::styled(
-            format!("+{l}"),
-            Style::default().fg(Color::Green),
-        )));
+        rows.push(DiffRow::Plus {
+            lead: "+".to_string(),
+            content: (*l).to_string(),
+        });
     }
-    out
+    rows
 }
 
 /// write：优先 args.content 预览（写入内容），退回结果文本；按扩展名
@@ -834,6 +1144,9 @@ pub enum SegRole {
     Dim,
     /// 显式前景色透传（语法高亮 token、diff 行、exit 行、截断警告等）。
     Fg(Color),
+    /// 行内反视频变更词（fg=行色；TUI 加 REVERSED、GPUI 与行底对调——
+    /// align-edit-diff-rendering design D4：Seg 桥须携带反视频语义）。
+    InverseFg(Color),
 }
 
 /// 语义段：一段同角色文本（模型的最小着色单元）。
@@ -885,6 +1198,7 @@ pub struct ToolCardModel {
 ///       expanded — 展开态（跳过折叠与 compact 头行分类）；
 ///       theme — 注入配色（read/write 语法高亮取 syntax_theme）
 /// 输出: 语义模型；无结果时 body 为空、无提示行，不 panic
+#[allow(dead_code)] // 测试/oracle 包装（产线走 tool_card_model_ctx；task3.3）
 pub fn tool_card_model(
     name: &str,
     args_json: &str,
@@ -892,13 +1206,28 @@ pub fn tool_card_model(
     expanded: bool,
     theme: &crate::app::theme::TuiTheme,
 ) -> ToolCardModel {
+    tool_card_model_ctx(name, args_json, tool, expanded, theme, None)
+}
+
+/// [`tool_card_model`] 预览版（task3.3）：edit 卡带执行前预览态。
+///
+/// 输入: 同 [`tool_card_model`]；preview — 该 toolId 的预览态（None=无）；
+/// 输出: 同 [`tool_card_model`]
+pub fn tool_card_model_ctx(
+    name: &str,
+    args_json: &str,
+    tool: &ToolExecution,
+    expanded: bool,
+    theme: &crate::app::theme::TuiTheme,
+    preview: Option<&EditPreviewState>,
+) -> ToolCardModel {
     let args = serde_json::from_str::<Value>(args_json).unwrap_or(Value::Null);
     let head = head_segs(name, &args, tool, expanded);
 
     let body_lines = match name {
         "read" => read_body(&args, tool, theme),
         "bash" | "powershell" => bash_output(&args, tool),
-        "edit" => edit_body(&args, tool),
+        "edit" => edit_body(&args, tool, preview),
         "write" => write_body(&args, tool, theme),
         "grep" | "find" | "ls" => text_result_body(tool),
         _ => generic_body(&args, tool, expanded),
@@ -958,10 +1287,20 @@ fn lines_to_segs(lines: Vec<Line<'static>>) -> Vec<Vec<Seg>> {
         .map(|line| {
             line.spans
                 .into_iter()
-                .map(|s| Seg::new(s.content.to_string(), match s.style.fg {
-                    Some(c) => SegRole::Fg(c),
-                    None => SegRole::Body,
-                }))
+                .map(|s| {
+                    // 反视频修饰符须贯穿 Seg 桥（design D4 修正：否则两端全丢）。
+                    let role = if s.style.add_modifier.contains(Modifier::REVERSED)
+                        && let Some(c) = s.style.fg
+                    {
+                        SegRole::InverseFg(c)
+                    } else {
+                        match s.style.fg {
+                            Some(c) => SegRole::Fg(c),
+                            None => SegRole::Body,
+                        }
+                    };
+                    Seg::new(s.content.to_string(), role)
+                })
                 .collect()
         })
         .collect()
@@ -1541,6 +1880,260 @@ mod tests {
         assert!(text.contains("-beta"), "{text}");
         assert!(text.contains("+gamma"), "{text}");
         assert!(text.contains("alpha"), "未变行原样: {text}");
+    }
+
+    // ===== 行内高亮（align-edit-diff-rendering task 1.1/1.2）=====
+
+    /// 1.1 词级分段：单词替换只染该词、无变化全净、插入/删除对侧不动、
+    /// 超长行退化不分段（防卡）。
+    #[test]
+    fn intra_line_diff_word_segmentation() {
+        // 单词替换 → 仅该词 changed，其余合并为未变更段
+        let (o, n) = intra_line_diff("const x = 1;", "const y = 1;");
+        assert_eq!(
+            o.iter().map(|s| (s.text.as_str(), s.changed)).collect::<Vec<_>>(),
+            vec![("const ", false), ("x", true), (" = 1;", false)]
+        );
+        assert_eq!(
+            n.iter().map(|s| (s.text.as_str(), s.changed)).collect::<Vec<_>>(),
+            vec![("const ", false), ("y", true), (" = 1;", false)]
+        );
+
+        // 无变化 → 单段未变更
+        let (o, n) = intra_line_diff("same line", "same line");
+        assert_eq!(o, vec![Seg0 { text: "same line".into(), changed: false }]);
+        assert_eq!(n, vec![Seg0 { text: "same line".into(), changed: false }]);
+
+        // 插入词：旧侧全净、新侧变更段含新词
+        let (o, n) = intra_line_diff("a c", "a b c");
+        assert!(o.iter().all(|s| !s.changed), "旧侧应全净: {o:?}");
+        let new_changed: String = n.iter().filter(|s| s.changed).map(|s| s.text.as_str()).collect();
+        assert!(new_changed.contains('b'), "新侧变更含插入词: {n:?}");
+
+        // 删除词：新侧全净、旧侧变更段含被删词
+        let (o, n) = intra_line_diff("a b c", "a c");
+        assert!(n.iter().all(|s| !s.changed), "新侧应全净: {n:?}");
+        let old_changed: String = o.iter().filter(|s| s.changed).map(|s| s.text.as_str()).collect();
+        assert!(old_changed.contains('b'), "旧侧变更含删除词: {o:?}");
+
+        // 超长行退化：token 乘积超上限 → 单段不分段（不卡）
+        let words = |n: usize| (0..n).map(|i| format!("w{i} ")).collect::<String>();
+        let (o, n) = intra_line_diff(&words(450), &words(450));
+        assert_eq!(o.len(), 1, "退化为单段");
+        assert!(!o[0].changed, "退化不分段");
+        assert_eq!(n.len(), 1);
+    }
+
+    /// 1.2 pi 缩进与首段规则：共同缩进两侧原样未变更；新增前导空白
+    /// 首段不染（缩进插入不被标成变更）。
+    #[test]
+    fn intra_line_diff_indent_and_first_ws_rules() {
+        // 共同缩进：两侧首段 = 缩进且未变更
+        let (o, n) = intra_line_diff("    foo()", "    bar()");
+        assert_eq!(o[0].text, "    ");
+        assert!(!o[0].changed, "旧侧缩进不染");
+        assert_eq!(n[0].text, "    ");
+        assert!(!n[0].changed, "新侧缩进不染");
+        let o_changed: String = o.iter().filter(|s| s.changed).map(|s| s.text.as_str()).collect();
+        let n_changed: String = n.iter().filter(|s| s.changed).map(|s| s.text.as_str()).collect();
+        assert!(o_changed.contains("foo") && n_changed.contains("bar"), "变更词仍染");
+
+        // 新增前导空白：old 无缩进、new 加缩进 → 新侧首段（空白）不染
+        let (o, n) = intra_line_diff("value = 1", "    value = 2");
+        let first = n.first().expect("新侧非空");
+        assert!(first.text.chars().all(|c| c.is_whitespace()), "首段应为纯空白: {n:?}");
+        assert!(!first.changed, "首段空白不染（pi 首段规则）");
+        let o_changed: String = o.iter().filter(|s| s.changed).map(|s| s.text.as_str()).collect();
+        assert_eq!(o_changed.trim(), "1", "旧侧仅值变更: {o:?}");
+        let n_changed: String = n.iter().filter(|s| s.changed).map(|s| s.text.as_str()).collect();
+        assert_eq!(n_changed.trim(), "2", "新侧仅值变更: {n:?}");
+    }
+
+    /// 2.1 details.diff 的 1-1 行对 → 行内反视频；多行块整行；
+    /// 上下文原样、@@ 青（既有语义不回退）。
+    #[test]
+    fn edit_details_diff_pairs_single_line_with_reversed() {
+        let tool = ToolExecution {
+            status: ToolStatus::Ended,
+            is_error: false,
+            result: Some(serde_json::json!({
+                "content": [{"type":"text","text":"ok"}],
+                "details": {"diff": "-1 alpha beta\n+1 alpha gamma\n 2 keep\n@@ hunk here"}
+            })),
+            duration_ms: None,
+            ..Default::default()
+        };
+        let lines = tool_lines("edit", r#"{"file_path":"/x"}"#, &tool, true);
+        // 输出 = 头行 + diff 正文行
+        assert!(lines[0].spans.iter().any(|s| s.content.contains("edit")), "头行在首位");
+        let body = &lines[1..];
+
+        // 正文行0：-1 alpha beta —— lead 与未变词红、变更词红 + 反视频
+        let l0 = &body[0];
+        assert!(
+            l0.spans.iter().any(|s| {
+                s.content == "beta"
+                    && s.style.add_modifier.contains(Modifier::REVERSED)
+                    && s.style.fg == Some(Color::Red)
+            }),
+            "旧侧行内变更词反视频: {l0:?}"
+        );
+        assert!(
+            l0.spans.iter().any(|s| {
+                s.content.contains("alpha") && !s.style.add_modifier.contains(Modifier::REVERSED)
+            }),
+            "未变词不染反视频: {l0:?}"
+        );
+
+        // 行1：+1 alpha gamma —— 绿 + 反视频
+        let l1 = &body[1];
+        assert!(
+            l1.spans.iter().any(|s| {
+                s.content == "gamma"
+                    && s.style.add_modifier.contains(Modifier::REVERSED)
+                    && s.style.fg == Some(Color::Green)
+            }),
+            "新侧行内变更词反视频: {l1:?}"
+        );
+
+        // 上下文行原样（无 fg、无反视频）
+        let l2 = &body[2];
+        assert!(
+            l2.spans.iter().all(|s| s.style.fg.is_none()
+                && !s.style.add_modifier.contains(Modifier::REVERSED)),
+            "上下文行原样: {l2:?}"
+        );
+        // @@ 青色保留
+        let l3 = &body[3];
+        assert!(
+            l3.spans.iter().any(|s| s.style.fg == Some(Color::Cyan)),
+            "@@ 仍青: {l3:?}"
+        );
+
+        // 多行块 → 整行红绿、无反视频
+        let multi = ToolExecution {
+            status: ToolStatus::Ended,
+            is_error: false,
+            result: Some(serde_json::json!({
+                "content": [{"type":"text","text":"ok"}],
+                "details": {"diff": "-1 a\n-2 b\n+1 c\n+2 d"}
+            })),
+            duration_ms: None,
+            ..Default::default()
+        };
+        let lines = tool_lines("edit", r#"{"file_path":"/x"}"#, &multi, true);
+        let body = &lines[1..]; // 去头行
+        assert_eq!(body.len(), 4);
+        assert!(
+            body.iter().all(|l| l.spans.iter().all(|s| {
+                !s.style.add_modifier.contains(Modifier::REVERSED)
+            })),
+            "多行块整行不反视频"
+        );
+        assert!(body[0].spans.iter().any(|s| s.style.fg == Some(Color::Red)));
+        assert!(body[2].spans.iter().any(|s| s.style.fg == Some(Color::Green)));
+    }
+
+    /// 2.2 降级路径同染：单编辑对行内反视频、多行差异整行。
+    #[test]
+    fn line_diff_fallback_intra_and_multiline_whole() {
+        // 单编辑对（old/new 各一行未变 + 一行变）→ 变更词反视频
+        let tool = ToolExecution {
+            status: ToolStatus::Ended,
+            is_error: false,
+            result: Some(serde_json::json!({"content":[{"type":"text","text":"ok"}]})),
+            duration_ms: None,
+            ..Default::default()
+        };
+        let args = r#"{"file_path":"/x","oldString":"alpha beta","newString":"alpha gamma"}"#;
+        let lines = tool_lines("edit", args, &tool, true);
+        let minus = lines.iter().find(|l| l.spans.first().map(|s| s.content.starts_with('-')).unwrap_or(false)).expect("应有 - 行");
+        assert!(
+            minus.spans.iter().any(|s| {
+                s.content.contains("beta")
+                    && s.style.add_modifier.contains(Modifier::REVERSED)
+                    && s.style.fg == Some(Color::Red)
+            }),
+            "降级单对同染行内: {minus:?}"
+        );
+
+        // 多行差异 → 整行红绿、无反视频
+        let args = r#"{"file_path":"/x","oldString":"a\nb","newString":"c\nd"}"#;
+        let lines = tool_lines("edit", args, &tool, true);
+        assert!(
+            lines.iter().all(|l| l.spans.iter().all(|s| {
+                !s.style.add_modifier.contains(Modifier::REVERSED)
+            })),
+            "多行降级整行不反视频"
+        );
+        assert!(lines.iter().any(|l| l.spans.iter().any(|s| s.style.fg == Some(Color::Red))));
+        assert!(lines.iter().any(|l| l.spans.iter().any(|s| s.style.fg == Some(Color::Green))));
+    }
+
+    /// 3.3 预览渲染优先级与 Ready/Error 呈现（task3.3；spec: 结果替换、
+    /// 先行展示、错误文案）。
+    #[test]
+    fn edit_preview_priority_and_ready_rendering() {
+        // 结果 details 优先于预览（spec: 结果到达替换——渲染期同优先级）
+        let (name, args, tool) = fixture_tool_call("tool_edit", "edit");
+        let preview_rows = vec![DiffRow::Context("PREVIEW-LINE".to_string())];
+        let lines = tool_lines_themed_ctx(
+            &name,
+            &args,
+            &tool,
+            true,
+            &TuiTheme::default(),
+            Some(&EditPreviewState::Ready(preview_rows)),
+        );
+        let text = render(&lines);
+        assert!(text.contains("-1 FIXTURE-MARKER"), "结果 diff 在场: {text}");
+        assert!(!text.contains("PREVIEW-LINE"), "结果优先、预览不叠: {text}");
+
+        // 无结果 + Ready → 预览行呈现（1-1 对含行内反视频）
+        let running = ToolExecution {
+            status: ToolStatus::Running,
+            is_error: false,
+            result: None,
+            duration_ms: None,
+            ..Default::default()
+        };
+        let no_result_args = r#"{"file_path":"/x","oldText":"a","newText":"b"}"#;
+        let rows = line_diff_rows("alpha beta", "alpha gamma");
+        let lines = tool_lines_themed_ctx(
+            "edit",
+            no_result_args,
+            &running,
+            true,
+            &TuiTheme::default(),
+            Some(&EditPreviewState::Ready(rows)),
+        );
+        let text = render(&lines);
+        assert!(text.contains("alpha"), "预览行呈现: {text}");
+        assert!(
+            lines
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .any(|s| s.style.add_modifier.contains(Modifier::REVERSED)),
+            "预览 1-1 对含反视频"
+        );
+
+        // Error → 红色错误文案行
+        let lines = tool_lines_themed_ctx(
+            "edit",
+            no_result_args,
+            &running,
+            true,
+            &TuiTheme::default(),
+            Some(&EditPreviewState::Error("cannot read x".into())),
+        );
+        let text = render(&lines);
+        assert!(text.contains("cannot read x"), "错误文案在场: {text}");
+        assert!(
+            lines.iter().flat_map(|l| l.spans.iter()).any(|s| {
+                s.content.contains("cannot read") && s.style.fg == Some(Color::Red)
+            }),
+            "错误行红色"
+        );
     }
 
     #[test]

@@ -15,6 +15,8 @@ use crate::app::md_stream::StreamMemo;
 use crate::app::theme::TuiTheme;
 use crate::app::wrap::{self, HitKind};
 
+use super::PreviewCtx;
+
 /// 尾部常新窗口条数（design D4：tool_end 迟到乱序等尾部兜底）。
 const TAIL_WINDOW: usize = 2;
 
@@ -28,6 +30,8 @@ pub struct LayoutKey {
     flags: RenderFlags,
     /// 注入配色（烧入行样式，变化即整体重建）。
     theme: TuiTheme,
+    /// 预览变更序号（task3.3：预览变迁 → 整键重建，免逐条目指纹失配）。
+    preview_rev: u64,
 }
 
 /// 单条目布局产物（仅在自身内容或渲染键变化时重建）。
@@ -121,6 +125,7 @@ impl InflightSlot {
         thinking_seq: &mut usize,
         theme: &TuiTheme,
         width: u16,
+        previews: Option<&PreviewCtx<'_>>,
     ) {
         match self {
             InflightSlot::Text(memo) => {
@@ -146,6 +151,7 @@ impl InflightSlot {
                     thinking_overrides,
                     thinking_seq,
                     theme,
+                    previews,
                 );
                 *counts = lines
                     .iter()
@@ -391,6 +397,7 @@ impl Default for LayoutCache {
                 width: 0,
                 flags: RenderFlags::default(),
                 theme: TuiTheme::default(),
+                preview_rev: 0,
             },
             entries: Vec::new(),
             last_rev: 0,
@@ -426,11 +433,31 @@ impl LayoutCache {
         theme: &TuiTheme,
         width: u16,
     ) {
+        self.refresh_ctx(state, flags, overrides, thinking_overrides, theme, width, None);
+    }
+
+    /// [`refresh`] 预览版（task3.3）：`previews` 进布局键——预览变迁即
+    /// 整键重建；None = 无预览（测试/oracle 路径，等价旧 `refresh`）。
+    ///
+    /// 输入: 同 [`refresh`]；previews — edit 预览上下文；
+    /// 输出: 同 [`refresh`]
+    #[allow(clippy::too_many_arguments)] // previews 穿参（task3.3）
+    pub fn refresh_ctx(
+        &mut self,
+        state: &mut SessionState,
+        flags: RenderFlags,
+        overrides: &std::collections::HashMap<String, bool>,
+        thinking_overrides: &std::collections::HashMap<usize, bool>,
+        theme: &TuiTheme,
+        width: u16,
+        previews: Option<&PreviewCtx<'_>>,
+    ) {
         let width = width.max(1);
         let key = LayoutKey {
             width,
             flags,
             theme: theme.clone(),
+            preview_rev: previews.map_or(0, |p| p.rev),
         };
         let (rev, dirty) = state.take_dirty();
         // 对账（design D7 安全网）：rev 变而无脏 = 漏标 → 降级全量重建。
@@ -525,6 +552,7 @@ impl LayoutCache {
                 &mut tcur,
                 &mut mcur,
                 theme,
+                previews,
             );
             let wrapped_rows_per_line: Vec<u32> = {
                 // 分段计量（render_probe）：wrap 行数计数归因段。
@@ -591,6 +619,7 @@ impl LayoutCache {
                     &mut thinking_base,
                     theme,
                     width,
+                    previews,
                 );
             }
         }
@@ -750,6 +779,54 @@ mod tests {
             chat::chat_lines_themed(state, flags, overrides, thinking_overrides, theme);
         assert_eq!(cl, ol, "缓存行与全量路径必须逐字节相等");
         assert_eq!(cm, om, "缓存 meta（含全局序号）与全量路径必须逐号相等");
+    }
+
+    /// 3.3 预览变迁经布局键整键重建（task3.3：rev 入 LayoutKey）。
+    #[test]
+    fn preview_rev_rebuilds_cache() {
+        use std::collections::HashMap;
+        let mut cache = LayoutCache::default();
+        let mut state = SessionState::new();
+        // 流式工具块三步建（transcript 同款）：开消息 → toolcall_start/delta
+        // （建块 + 全量 args）→ tool_execution_start（apply_tool 只更新既有块）。
+        state.handle(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
+        state.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"toolcall_start","contentIndex":0,"id":"t9","toolName":"edit"}}));
+        state.handle(&json!({"type":"message_update","assistantMessageEvent":{"type":"toolcall_delta","contentIndex":0,"delta":"{\"file_path\":\"/x\",\"oldText\":\"a\",\"newText\":\"b\"}"}}));
+        state.handle(&json!({"type":"tool_execution_start","toolCallId":"t9","toolName":"edit",
+            "args":{"file_path":"/x","oldText":"a","newText":"b"}}));
+        let flags = RenderFlags::default();
+        let o = HashMap::new();
+        let t = HashMap::new();
+        let theme = TuiTheme::default();
+
+        // 预览 A：Ready（含可识别文本）
+        let mut map = HashMap::new();
+        let rows_a = crate::app::tools::line_diff_rows("alpha", "beta");
+        map.insert("t9".to_string(), crate::app::EditPreviewState::Ready(rows_a));
+        let ctx_a = crate::app::PreviewCtx { map: &map, rev: 1 };
+        cache.refresh_ctx(&mut state, flags, &o, &t, &theme, 80, Some(&ctx_a));
+        let text_a = flatten(&cache)
+            .0
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text_a.contains("beta"), "预览 A 呈现: {text_a}");
+
+        // 预览 B：换内容 + rev+1 → 键变化 → 整键重建 → 新文本呈现
+        let mut map = HashMap::new();
+        let rows_b = crate::app::tools::line_diff_rows("gamma", "delta");
+        map.insert("t9".to_string(), crate::app::EditPreviewState::Ready(rows_b));
+        let ctx_b = crate::app::PreviewCtx { map: &map, rev: 2 };
+        cache.refresh_ctx(&mut state, flags, &o, &t, &theme, 80, Some(&ctx_b));
+        let text_b = flatten(&cache)
+            .0
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text_b.contains("delta"), "rev 变化后新预览呈现: {text_b}");
+        assert!(!text_b.contains("beta"), "旧预览不残留: {text_b}");
     }
 
     /// 构造含 user / assistant（text+thinking）/ notice 的样例会话。
@@ -1414,7 +1491,7 @@ mod tests {
             let t0 = Instant::now();
             terminal
                 .draw(|frame| {
-                    let _ = crate::app::view::render(frame, &mut state, &ui, &mut cache);
+                    let _ = crate::app::view::render(frame, &mut state, &ui, &mut cache, None);
                 })
                 .unwrap();
             draw_best = draw_best.min(t0.elapsed().as_secs_f64() * 1e3);
@@ -1501,7 +1578,7 @@ mod tests {
             let t0 = Instant::now();
             terminal
                 .draw(|frame| {
-                    let _ = crate::app::view::render(frame, &mut state, &ui, &mut cache);
+                    let _ = crate::app::view::render(frame, &mut state, &ui, &mut cache, None);
                 })
                 .unwrap();
             draw_warm_best = draw_warm_best.min(t0.elapsed().as_secs_f64() * 1e3);
@@ -1559,7 +1636,7 @@ mod tests {
             cache.refresh(&mut state, flags, &o, &t, &theme, 100);
             terminal
                 .draw(|frame| {
-                    let _ = crate::app::view::render(frame, &mut state, &ui, &mut cache);
+                    let _ = crate::app::view::render(frame, &mut state, &ui, &mut cache, None);
                 })
                 .unwrap();
             for (i, d) in deltas.iter().enumerate() {
@@ -1571,7 +1648,7 @@ mod tests {
                 let t1 = Instant::now();
                 terminal
                     .draw(|frame| {
-                        let _ = crate::app::view::render(frame, &mut state, &ui, &mut cache);
+                        let _ = crate::app::view::render(frame, &mut state, &ui, &mut cache, None);
                     })
                     .unwrap();
                 let frame_ms = t1.elapsed().as_secs_f64() * 1e3;
@@ -1581,7 +1658,7 @@ mod tests {
                 let t2 = Instant::now();
                 terminal
                     .draw(|frame| {
-                        let _ = crate::app::view::render(frame, &mut state, &ui, &mut cache);
+                        let _ = crate::app::view::render(frame, &mut state, &ui, &mut cache, None);
                     })
                     .unwrap();
                 let draw_ms = t2.elapsed().as_secs_f64() * 1e3;
@@ -1631,7 +1708,7 @@ mod tests {
                 let t0 = Instant::now();
                 terminal
                     .draw(|frame| {
-                        let _ = crate::app::view::render(frame, &mut state, &ui, &mut cache);
+                        let _ = crate::app::view::render(frame, &mut state, &ui, &mut cache, None);
                     })
                     .unwrap();
                 land_ms = t0.elapsed().as_secs_f64() * 1e3;
@@ -1708,7 +1785,7 @@ mod tests {
             let t0 = Instant::now();
             terminal
                 .draw(|frame| {
-                    let _ = crate::app::view::render(frame, state, &ui, cache);
+                    let _ = crate::app::view::render(frame, state, &ui, cache, None);
                 })
                 .unwrap();
             (t0.elapsed().as_secs_f64() * 1e3, crate::app::render_probe::take())
@@ -1769,7 +1846,7 @@ mod tests {
                         cache: &mut crate::app::layout_cache::LayoutCache| {
             terminal
                 .draw(|frame| {
-                    let _ = crate::app::view::render(frame, state, &ui, cache);
+                    let _ = crate::app::view::render(frame, state, &ui, cache, None);
                 })
                 .unwrap();
         };
