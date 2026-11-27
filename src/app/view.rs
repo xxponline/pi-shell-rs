@@ -299,9 +299,11 @@ fn usage_spans(usage: &Usage) -> Vec<Span<'static>> {
 /// 状态行内容装配（纯函数，task 5.3——ratatui 与 GPUI 双前端共源）。
 ///
 /// 输入: state — 会话状态；notice — 瞬时提示（可空）；status_text —
-///       setStatus 附加文本（可空）；width — 区域宽度（提示截断用）；
+///       setStatus 状态段文本（可空，可含 ANSI 转义）；width — 区域宽度；
 /// 输出: 单条 ratatui 逻辑行（phase · 会话名 · thinking · model · 用量/
-///       费用 · 状态文本 · 提示；提示按 width 截断，整体由渲染端裁剪）。
+///       费用 · 状态文本 · 提示）。状态段经 ANSI 解析保色且零转义残留，
+///       并按剩余可见宽度截断（加省略标记）；提示按 width 截断；整体由
+///       渲染端裁剪。
 pub(crate) fn header_line(
     state: &SessionState,
     notice: Option<(&str, Color)>,
@@ -336,10 +338,16 @@ pub(crate) fn header_line(
         spans.push(Span::raw("  "));
     }
     if let Some(text) = status_text {
-        spans.push(Span::styled(
-            format!(" {text} "),
-            Style::default().fg(Color::Magenta),
-        ));
+        // 状态段：先按剩余可见宽度预算（design D4），再解析 ANSI 保色、
+        // 剔除转义残留，前后各留一列空格（沿用原 " {text} " 呼吸感）。
+        let used: usize = spans.iter().map(|s| s.width()).sum();
+        let remaining = (width as usize).saturating_sub(used);
+        if remaining > 0 {
+            let mut segs = vec![Span::raw(" ")];
+            segs.extend(crate::app::ansi::parse_ansi_spans(text, Style::default()));
+            segs.push(Span::raw(" "));
+            spans.extend(truncate_spans(segs, remaining));
+        }
     }
     if let Some((text, color)) = notice {
         spans.push(Span::styled(
@@ -605,6 +613,54 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// 按可见宽度截断 Span 序列（design D4——纯函数，转义残留不占预算）。
+///
+/// 输入: spans — 已解析的样式段序列（内容可含任意可见文本）；max — 可用
+///       显示宽度（cell 列数；0 = 不显示）。
+/// 输出: 截断后的段序列：总可见宽度 <= max；发生截断时在截断处追加省略
+///       标记 "…"（占 1 列，含在 max 内）并保留被截段的样式；无需截断时
+///       原样返回。零宽字符（U+200B 等）宽度为 0，不占预算也不被计入。
+fn truncate_spans(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
+    if max == 0 {
+        return Vec::new();
+    }
+    let total: usize = spans.iter().map(|s| s.width()).sum();
+    if total <= max {
+        return spans;
+    }
+    let budget = max - 1; // 留一列给省略标记
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for span in spans {
+        let w = span.width();
+        if used + w <= budget {
+            used += w;
+            out.push(span);
+            continue;
+        }
+        // 放不下：取该段可见前缀补满预算，再接省略标记（沿用被截段样式）。
+        let remain = budget - used;
+        let mut taken = String::new();
+        let mut taken_w = 0usize;
+        for ch in span.content.chars() {
+            let cw = ch.width().unwrap_or(0);
+            if taken_w + cw > remain {
+                break;
+            }
+            taken_w += cw;
+            taken.push(ch);
+        }
+        if !taken.is_empty() {
+            out.push(Span::styled(taken, span.style));
+        }
+        out.push(Span::styled("…", span.style));
+        return out;
+    }
+    // total > max 保证循环内必命中截断分支；此处为零宽段边界的防御性收尾。
+    out.push(Span::styled("…", Style::default()));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,6 +673,119 @@ mod tests {
         assert_eq!(truncate("abcdef", 0), "");
         // CJK-safe: no panic, respects char boundaries
         assert_eq!(truncate("中文测试", 3), "中文…");
+    }
+
+    /// 拼接 header_line 全部片段的可见文本（断言用）。
+    fn header_visible(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.to_string()).collect()
+    }
+
+    #[test]
+    fn header_status_parses_ansi_without_residue_and_keeps_color() {
+        let state = SessionState::new();
+        let line = header_line(
+            &state,
+            None,
+            Some("\x1b[38;2;0;255;136m25.0 tok/s\x1b[0m"),
+            120,
+        );
+        let visible = header_visible(&line);
+        assert!(visible.contains("25.0 tok/s"), "{visible}");
+        assert!(!visible.contains("[38;2;"), "无转义残留: {visible}");
+        assert!(!visible.contains('\u{1b}'), "无 ESC 字节: {visible}");
+        assert!(
+            line.spans
+                .iter()
+                .any(|s| s.style.fg == Some(Color::Rgb(0, 255, 136))),
+            "真彩前景保留"
+        );
+        // 状态段不再整段套洋红
+        assert!(
+            !line.spans
+                .iter()
+                .any(|s| s.style.fg == Some(Color::Magenta) && s.content.contains("25.0")),
+            "数值段不应为洋红"
+        );
+    }
+
+    #[test]
+    fn header_status_truncates_by_visible_width() {
+        let state = SessionState::new();
+        // 可见文本很短但转义很长：不得因转义字符被提前截断（旧 bug）。
+        let long_esc = "\x1b[38;2;100;100;100m\u{1b}[2m";
+        let status = format!("{long_esc}ok\x1b[0m");
+        // width 紧到状态段只剩 8 列：仍应完整显示 "ok" 且无省略标记。
+        let used = header_line(&state, None, None, 100)
+            .spans
+            .iter()
+            .map(|s| s.width())
+            .sum::<usize>();
+        let width = (used + 8) as u16;
+        let line = header_line(&state, None, Some(&status), width);
+        let visible = header_visible(&line);
+        assert!(visible.contains("ok"), "{visible}");
+        assert!(!visible.contains('…'), "可见文本未超宽不应截断: {visible}");
+
+        // 超宽：截断发生在可见文本上，省略标记落在可见文本尾部。
+        let long = "x".repeat(80);
+        let status = format!("\x1b[38;2;0;255;136m{long}\x1b[0m");
+        let line = header_line(&state, None, Some(&status), width);
+        let visible = header_visible(&line);
+        assert!(visible.contains('…'), "超宽应有省略标记: {visible}");
+        let status_part = visible.split("cost").last().unwrap_or(&visible);
+        assert!(
+            status_part.chars().filter(|c| *c == 'x').count() < 80,
+            "可见文本被截断: {visible}"
+        );
+        let total: usize = line.spans.iter().map(|s| s.width()).sum();
+        assert!(total <= width as usize, "总宽不超额: {total} > {width}");
+    }
+
+    #[test]
+    fn header_status_zwsp_not_counted() {
+        let state = SessionState::new();
+        let line = header_line(&state, None, Some("a\u{200b}b"), 120);
+        let visible = header_visible(&line);
+        assert!(visible.contains("ab"), "{visible}");
+        assert!(!visible.contains('\u{200b}'), "ZWSP 被剔除: {visible:?}");
+        // ZWSP 不占宽度：可见 "ab" 段宽度为 2
+        let ab_width: usize = line
+            .spans
+            .iter()
+            .filter(|s| s.content.contains('a'))
+            .map(|s| s.width())
+            .sum();
+        assert!(ab_width >= 2, "{ab_width}");
+    }
+
+    #[test]
+    fn truncate_spans_respects_visible_width() {
+        // 无需截断：原样返回
+        let spans = vec![Span::raw("abc"), Span::raw("de")];
+        assert_eq!(truncate_spans(spans.clone(), 5).len(), 2);
+        // max=0：不显示
+        assert!(truncate_spans(spans.clone(), 0).is_empty());
+        // 截断：省略标记占 1 列，总可见宽 <= max，样式保留
+        let spans = vec![
+            Span::styled("abcdef", Style::default().fg(Color::Red)),
+            Span::raw("gh"),
+        ];
+        let out = truncate_spans(spans, 4);
+        let text: String = out.iter().map(|s| s.content.to_string()).collect();
+        let width: usize = out.iter().map(|s| s.width()).sum();
+        assert_eq!(text, "abc…", "budget = max-1 = 3，取满后接省略标记");
+        assert_eq!(width, 4);
+        assert_eq!(out[0].style.fg, Some(Color::Red), "被截段样式保留");
+        // 段间截断：前段整取、后段前缀补满 budget
+        let spans = vec![Span::raw("ab"), Span::raw("cdefgh")];
+        let out = truncate_spans(spans, 4);
+        let text: String = out.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(text, "abc…");
+        // CJK 宽字符不超额
+        let spans = vec![Span::raw("中文测试")];
+        let out = truncate_spans(spans, 3);
+        let width: usize = out.iter().map(|s| s.width()).sum();
+        assert!(width <= 3, "{width}");
     }
 }
 

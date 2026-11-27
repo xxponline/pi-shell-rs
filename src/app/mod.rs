@@ -5,6 +5,7 @@
 //! region layout: header / scrollable chat / input editor.
 
 pub mod autocomplete; // GPUI 前端复用补全纯函数（add-gpui-support D6：additive 导出）
+mod ansi; // 最小 SGR 解析（setStatus 状态文本 ANSI -> Span，fix-extension-status-rendering）
 mod chat;
 mod clipboard;
 pub mod commands; // GPUI 前端复用斜杠命令表与分发（同上）
@@ -39,7 +40,7 @@ use pi_shell_rs::rpc::{CommandSender, ResponsePolicy, RpcClient};
 use pi_shell_rs::session::{Entry, Phase, SessionState};
 use ratatui::style::Color;
 use ratatui::text::Line;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use crate::app::editor::EditorBuffer;
 use crate::app::event::AsyncKind;
@@ -253,8 +254,9 @@ pub struct App {
     /// 瞬时提示与颜色（error 红 / warning 黄 / info 默认色）。
     pub(crate) notice: Option<(String, Color)>,
     pub(crate) should_quit: bool,
-    /// setStatus 的状态行附加文本。
-    status_text: Option<String>,
+    /// setStatus 的状态格（statusKey -> 文本；BTreeMap 迭代序 = key 字母序，
+    /// 对齐 pi footer 的排序拼接；缺省 statusKey 落 "" 默认格）。
+    status_texts: BTreeMap<String, String>,
     /// setWidget 的编辑器上方行（空 = 隐藏）。
     widget_lines: Vec<String>,
     /// 当前浮层。
@@ -378,7 +380,7 @@ impl App {
             editor: EditorBuffer::new(),
             notice: None,
             should_quit: false,
-            status_text: None,
+            status_texts: BTreeMap::new(),
             widget_lines: Vec::new(),
             overlay: None,
             pending_overlays: VecDeque::new(),
@@ -2796,6 +2798,22 @@ impl App {
         self.after_session_event(raw, report_tx);
     }
 
+    /// 状态栏扩展状态段文本（design D2）：所有状态格按 key 字母序以空格
+    /// 拼接，对齐 pi footer 的 `sortedStatuses.join(" ")`。
+    ///
+    /// 输入: 无（读 self.status_texts）；
+    /// 输出: Some(拼接文本)（至少一格非空时）；全空（无格或全为空串）为 None。
+    fn status_text_joined(&self) -> Option<String> {
+        let joined = self
+            .status_texts
+            .values()
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if joined.is_empty() { None } else { Some(joined) }
+    }
+
     /// 状态行左段内容（GPUI 前端渲染入口，task 5.3）：与 ratatui
     /// `render_header` 同源的 `view::header_line` 装配 → 中性行 → 按列
     /// cell 截断（与 ratatui 视口裁剪同口径）；瞬时提示不入左段（由
@@ -2806,8 +2824,9 @@ impl App {
     ///       状态文本，超出 width 按 cell 截断）。
     #[cfg(feature = "gpui-support")] // 仅 GPUI 前端入口；默认构建不引入死代码
     pub(crate) fn status_grid_line(&self, width: u16) -> wrap::GridLine {
+        let status = self.status_text_joined();
         let line =
-            crate::app::view::header_line(&self.state, None, self.status_text.as_deref(), width);
+            crate::app::view::header_line(&self.state, None, status.as_deref(), width);
         let mut grid = wrap::GridLine::from(&line);
         wrap::truncate_grid_width(&mut grid, width as usize);
         grid
@@ -4044,10 +4063,21 @@ impl App {
                 self.notice = Some((str_field("message"), color));
             }
             "setStatus" => {
-                self.status_text = raw
-                    .get("statusText")
+                // statusKey 分格（design D2）：有 key 写/清该格，缺 key 落
+                // "" 默认格；statusText 非字符串（null/缺失）只 remove 该格。
+                let key = raw
+                    .get("statusKey")
                     .and_then(|v| v.as_str())
-                    .map(String::from);
+                    .unwrap_or("")
+                    .to_string();
+                match raw.get("statusText").and_then(|v| v.as_str()) {
+                    Some(text) => {
+                        self.status_texts.insert(key, text.to_string());
+                    }
+                    None => {
+                        self.status_texts.remove(&key);
+                    }
+                }
             }
             "setWidget" => {
                 self.widget_lines = match raw.get("widgetLines") {
@@ -4536,12 +4566,13 @@ impl App {
         io::Error: From<B::Error>,
     {
         let input_text = self.editor.text();
+        let status_text = self.status_text_joined();
         let ui = view::ViewUi {
             input: &input_text,
             input_lines: self.editor.lines().len(),
             input_cursor: Some((self.editor.row(), self.editor.col())),
             notice: self.notice.as_ref().map(|(t, c)| (t.as_str(), *c)),
-            status_text: self.status_text.as_deref(),
+            status_text: status_text.as_deref(),
             widget_lines: &self.widget_lines,
             flags: crate::app::chat::RenderFlags {
                 show_thinking: self.show_thinking,
@@ -6134,12 +6165,12 @@ mod input_tests {
         app.handle_extension_request(&serde_json::json!({
             "type":"extension_ui_request","id":"st","method":"setStatus","statusText":"busy"
         }));
-        assert_eq!(app.status_text.as_deref(), Some("busy"));
+        assert_eq!(app.status_text_joined().as_deref(), Some("busy"));
 
         app.handle_extension_request(&serde_json::json!({
             "type":"extension_ui_request","id":"st2","method":"setStatus","statusText":null
         }));
-        assert_eq!(app.status_text, None);
+        assert_eq!(app.status_text_joined(), None);
 
         app.handle_extension_request(&serde_json::json!({
             "type":"extension_ui_request","id":"w","method":"setWidget",
@@ -6169,6 +6200,55 @@ mod input_tests {
             app.overlay,
             Some(crate::app::overlay::Overlay::ExtConfirm { .. })
         ));
+    }
+
+    #[test]
+    fn status_key_slots_coexist_and_clear_independently() {
+        let mut app = App::new();
+        // key=a 写入
+        app.handle_extension_request(&serde_json::json!({
+            "type":"extension_ui_request","id":"s1","method":"setStatus",
+            "statusKey":"a","statusText":"AAA"
+        }));
+        assert_eq!(app.status_text_joined().as_deref(), Some("AAA"));
+        // key=b 并存（不覆盖 a）
+        app.handle_extension_request(&serde_json::json!({
+            "type":"extension_ui_request","id":"s2","method":"setStatus",
+            "statusKey":"b","statusText":"BBB"
+        }));
+        assert_eq!(
+            app.status_text_joined().as_deref(),
+            Some("AAA BBB"),
+            "多格并存，按 key 字母序拼接"
+        );
+        // 清 a 只清 a，b 保留
+        app.handle_extension_request(&serde_json::json!({
+            "type":"extension_ui_request","id":"s3","method":"setStatus",
+            "statusKey":"a","statusText":null
+        }));
+        assert_eq!(app.status_text_joined().as_deref(), Some("BBB"));
+        // 缺省 statusKey 落默认格（""），与已知 key 并存、排序在前
+        app.handle_extension_request(&serde_json::json!({
+            "type":"extension_ui_request","id":"s4","method":"setStatus",
+            "statusText":"busy"
+        }));
+        assert_eq!(
+            app.status_text_joined().as_deref(),
+            Some("busy BBB"),
+            "默认格空 key 排最前"
+        );
+        // 默认格独立清除
+        app.handle_extension_request(&serde_json::json!({
+            "type":"extension_ui_request","id":"s5","method":"setStatus",
+            "statusText":null
+        }));
+        assert_eq!(app.status_text_joined().as_deref(), Some("BBB"));
+        // 全清 → None（状态段隐藏）
+        app.handle_extension_request(&serde_json::json!({
+            "type":"extension_ui_request","id":"s6","method":"setStatus",
+            "statusKey":"b","statusText":null
+        }));
+        assert_eq!(app.status_text_joined(), None);
     }
 
     #[test]
